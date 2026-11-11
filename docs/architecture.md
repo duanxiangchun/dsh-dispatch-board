@@ -271,31 +271,60 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 
 ---
 
-## 5. Client 半要求
+## 5. Client 半要求（右侧栏放置）
 
-### 5.1 槽位
+看板住在**右侧栏**（官方 `@deepseek-ai/dsh-client-ui-sidebar-right` 的 tab 体系），不是左侧菜单面板。
+左侧 `sidebar.panellist` / `main` 两个注册已删除——用户明确要求放在右侧栏。
+
+### 5.0 右栏集成契约（0.2.2-rc.1 实测）
+
+| 用途 | API |
+| --- | --- |
+| 声明 tab 类型（静态） | `ctx.inject(['sidebarRightTabs'], s => s.effect(() => s.sidebarRightTabs.register({ id, kind, priority:'extension', title: () => string, guide:[…] })))` |
+| tab 正文 | `ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name:'sidebar.right.pane.tab', key: <定义 id> }, Body))`；`Body` 收到 slot 级 `useTabInfo` prop |
+| tab chip | `sidebar.right.pane.tab.title` 同 key 注册；不注册则用打开时捕获的标题 |
+| 打开 tab | `ctx.inject(['sidebarRight'], s => handle = s.sidebarRight)` → `handle.openTab(kind)` |
+| 会话 header 入口 | `ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({ name:'conversation.session.header.actions', id:'taskboard', order:40, label }, HeaderAction))`（list 槽） |
+
+- 本插件：`TAB_TYPE_ID='dsh-taskboard'`（= tab 系统身份，也是正文/title 的 key），`TAB_KIND='taskboard'`（openTab 参数）。
+- `useTabInfo()` 返回 `{ sidebar:{expanded, fullscreen}, panel:{id,isFloating}, tab:{title,visible,navigation,actions,…} }`。
+- 右栏服务缺失时（非 web-app 部署）插件不崩：header 按钮保留但点击只在 console 警告，body/title 注册由 `slots.inject` 自然等待。
+- 引导页入口：类型的 `guide` 数组给右栏引导页贡献一张卡片（`{ id, order, title, description, icon }`），
+  点它即 `openTab(kind)`。
+
+### 5.1 槽位汇总
 
 | 槽位 | 注册参数 | 内容 |
 | --- | --- | --- |
-| `sidebar.panellist` | `{ name:'sidebar.panellist', id:'taskboard', order:25, label: () => t('panel.label'), locale }` | 侧栏面板图标（原创看板 SVG，跟随 currentColor）。**带 `todo+doing` 数量角标**（>0 时显示，>99 显示 99+） |
-| `main` | `{ name:'main', key:'taskboard', locale }` | 完整看板页（见 5.2） |
+| `conversation.session.header.actions` | `{ name, id:'taskboard', order:40, label: () => t('panel.label') }` | 会话 header 右侧的看板按钮（`.tb-headbtn`），带 `todo` 数量角标（`.tb-badge`，>99 显示 99+，6s 刷新） |
+| `sidebar.right.pane.tab` | `{ name, key:'dsh-taskboard' }` | 看板正文 `BoardTab` |
+| `sidebar.right.pane.tab.title` | `{ name, key:'dsh-taskboard' }` | chip：看板 glyph + 标题 |
 
 > `label` 必须是 thunk（`string | (() => string)`），语言切换后无需重注册。
 
-### 5.2 看板页
+### 5.2 看板面板布局
 
-自上而下：
+| 条件 | 布局 |
+| --- | --- |
+| `useTabInfo().sidebar.fullscreen === true` 或实测宽度 ≥ **900px** | 四列网格 `.tb-board`（待开始/进行中/已完成/已归档 横排） |
+| 宽度 560–900px | 两列网格 `.tb-board[data-layout="medium"]`（2×2） |
+| 更窄（普通右栏） | 纵向 lane `.tb-lanes`：四个状态区块依次堆叠，根节点 `data-layout="narrow"` |
+
+宽度用 `ResizeObserver` 量（`ResizeObserver` 不可用时按窄栏渲染，测试环境即此路径）。
+窄栏下隐藏：footer 的数据路径/说明（只留版本号）、轮询间隔标签、上次派发信息（`.tb-optional`）。
+
+自上而下内容（两种布局共用）：
 
 1. **头部**：标题「任务看板」+ 副标题（轮询状态：`每 15s 轮询 · 上次 12:03:11` 或 `轮询已暂停`）+
-   「立即刷新」按钮 + 轮询开关（switch）+ 间隔选择（5s/15s/30s/60s）。
+   「立即刷新」按钮 + 轮询开关 + 间隔选择（5s/15s/30s/60s）。
    - `Snapshot.preset.broken` 非空 → 红色 banner 显示挂载诊断；
    - `Snapshot.preset.installed === false` → 黄色 banner 显示原因（没有 agentPresets 服务 / 名单里没有本模式）。
 2. **新建任务行**：输入框（Enter 提交）+ 备注展开（可选）+ 「添加到待开始」按钮；
-   会话选择器（`agents[]`，默认当前会话，可切换「自动（最近活跃）」）。
-3. **四列看板**：`待开始`（蓝）/ `进行中`（黄）/ `已完成`（绿）/ `已归档`（灰）。
-   - 每列头部：列名 + 计数 + 列内快捷动作（待开始：`全部派发`；已完成：`全部归档`）。
-   - 卡片：标题、备注（两行截断，hover title 展开）、状态徽标、`#t-3`、相对时间（`3 分钟前`）、
-     assignee、result（已完成时显示）、`lastError`（红色小字，状态变更时自动清空）。
+   会话选择器（`agents[]`，默认「自动（最近活跃）」）。
+3. **看板主体**（布局见上）：待开始（蓝）/ 进行中（黄）/ 已完成（绿）/ 已归档（灰）。
+   - 每块头部：列名 + 计数 + 快捷动作（待开始：`全部派发`；已完成：`全部归档`）。
+   - 卡片：标题、备注（两行截断，hover title 展开）、`#t-3`、相对时间、assignee、result、
+     `lastError`（红色小字，状态变更时自动清空）。
    - 「派发给」下拉：`标题（或 id 尾 8 位） · running? · 模式名`，避免多个无标题会话分不清。
    - 卡片动作（按状态）：
      - todo：`开始`（→doing）、`立即派发`（`dispatch-now`）、`编辑`、`删除`
@@ -303,10 +332,8 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
      - done：`归档`（→archived）、`返工`（→doing）
      - archived：`重新打开`（→todo）、`删除`
    - 编辑用行内表单（标题 + 备注），保存调 `update-task`。
-   - 空列显示空态文案（如「没有待开始的任务。加一条，主 Agent 会自动派发。」）。
-4. **页脚**：数据文件路径（`boardPath`，小字） + 「看板数据存储在本机」说明 + 版本号。
-
-响应式：≥1100px 四列；700–1100px 两列网格；<700px 单列（顺序保持 待开始→进行中→已完成→已归档）。
+   - 空块显示空态文案（如「没有待开始的任务。加一条，主 Agent 会自动派发。」）。
+4. **页脚**：宽栏显示数据文件路径 + 「看板数据存储在本机」 + 版本号；窄栏只显示版本号。
 
 ### 5.3 数据与交互
 
@@ -361,8 +388,9 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
    `[taskboard] 派单模式已就绪：派单看板模式(taskboard-dispatch) / …·执行者(taskboard-worker)`。
 3. HTTP 探针（`.dev/verify-rpc.mjs <baseUrl>`）：snapshot / add-task / update-task / dispatch-now /
    set-config / archive-done / install-preset 全通；错误分支（bad id、非法 status、空 title）返回对应错误码。
-4. Playwright：侧栏出现看板图标 → 点开 → 四列渲染 → 加任务出现在待开始 → 切换轮询开关/间隔 →
-   编辑/开始/完成/归档/删除各走一遍 → 刷新页面状态保持。
+4. Playwright（右侧栏）：会话 header 出现「任务看板」按钮（带角标）→ 点击 → 右栏打开看板 tab →
+   窄栏四个纵向 lane 渲染 → 加任务出现在待开始 → 切换轮询开关/间隔 → 编辑/开始/完成/归档/删除各走一遍 →
+   全屏/加宽到 ≥680px 切四列 → 刷新页面状态保持 → 左侧菜单没有看板项。
 5. 端到端派单（真实模型，验证核心价值）：任务加进待开始 → 轮询投递 → 主 Agent 改 doing 并派子 Agent →
    子 Agent 完成后主 Agent 审核并把任务改成 done → 看板显示 result。**这是本插件唯一不可省的验收项。**
 6. 预设：`Snapshot.preset.installed === true` 且两个模式 `broken` 为空；模式选择器出现
@@ -376,7 +404,8 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 
 | 风险 | 缓解 |
 | --- | --- |
-| 0.2.2-rc.1 的 `sidebar.panellist` / `main` slot props 与文档示例不完全一致 | client-scout 已从在跑的 dsh-ollama-statistical 取证；仍以运行结果为准，先做最小图标冒烟 |
+| 右栏 tab 契约（tab 类型/keyed 正文/`useTabInfo`）与官方示例不一致 | 已从安装包源码取证（`sidebar-right/lib/types/client/*`、`sidebar-right` 自身与 `ui-deliverables`/`ui-sidebar-files` 的注册实现），e2e 用真实页面复核 |
+| 用户环境没启用右侧栏（非 web-app 部署 / 关闭了 ui-sidebar-right） | 服务缺失时插件不崩：header 按钮点击只在 console 警告；body 注册由 slots.inject 等待 |
 | 第三方 bundle 声明 preset 的行为与官方是否一致（无官方先例） | 已在 0.2.2-rc.1 实测：两条声明行都出现在 `agentPresets.list()`，`broken` 为空；`dsh --dump-config` 可见两行 |
 | `agent.followup()` 的 UserMessage 手工构造被会话解码器拒绝（source.kind 未知） | 用 `{kind:'user'}` 构造，不发明新 kind；e2e 必须验证「重启后会话可恢复」 |
 | 轮询把用户手动对话打断 | 只在 idle 投递；每轮最多 1 条；冷却 + 上限 |
@@ -386,6 +415,9 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 
 ## 9. 变更记录
 
-- v0.1.0（首个版本）：四列看板 + 轮询派单 + 两个模式声明（dispatch / worker）+ 三个模型工具。
+- v0.1.0（首个版本）：看板 + 轮询派单 + 两个模式声明（dispatch / worker）+ 三个模型工具。
   预设机制已按 0.2.2 的 bundle-patch 声明式实现（`presets/taskboard.patch.yml`），不再写
   `$DSH_HOME/.agent-presets` 目录。
+- v0.1.0 修订：看板从左侧面板（`sidebar.panellist` + `main`）迁到**右侧栏 tab**
+  （`sidebarRightTabs` + `sidebar.right.pane.tab`），入口按钮放会话 header；窄栏纵向 lane、
+  宽栏/全屏四列；左侧菜单不再有看板项。

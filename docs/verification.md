@@ -37,6 +37,25 @@ transcript-worker-af04b22a: header.agentPreset=taskboard-worker, header.parentSe
 文件证据: .dev/e2e/hello.txt = 6 字节 68 65 6c 6c 6f 0a（"hello\n"）
 ```
 
+## 2.1 右侧栏改版验证（verifier，Playwright）
+
+报告：`.dev/e2e/rightbar-report.md`｜截图：`.dev/e2e/shots/rb-*.png`
+
+需求变更：看板从「左侧菜单面板」迁到**右侧栏**。左侧 `sidebar.panellist`/`main` 已删除，
+改为右栏 tab 类型（`sidebarRightTabs` + `sidebar.right.pane.tab`）+ 会话 header 入口按钮。
+
+| # | 项目 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 1 | 会话 header 出现「任务看板」按钮（带待开始角标），点击后右栏打开看板 tab；默认宽 719px → medium 两列网格 | PASS | `rb-01-header-entry.png`、`rb-02-panel-default.png` |
+| 2 | 面板内新建/删除任务（先暂停轮询，避免触发真实派发） | PASS | `rb-03-task-added.png`、`rb-04-task-deleted.png` |
+| 3 | 三档布局：全屏 → wide 四列（381.75px×4）；退出 → medium 两列；拖窄到 398px → narrow 四个纵向 lane | PASS | `rb-05-fullscreen.png`、`rb-06-after-fullscreen.png`、`rb-07-narrow-lane.png` |
+| 4 | 右栏引导页出现「任务看板」入口卡片，点击可打开 | PASS | `rb-08-guide.png`、`rb-09-guide-open-board.png` |
+| 5 | 左侧菜单不再有看板入口（`.panelRow` 只有 插件 / 自动化任务 / 更多） | PASS | `rb-report.md` |
+| 6 | console 无报错（三轮浏览器会话 total=0/errors=[]/warnings=[]/pageerror=0） | PASS | `rb-console.json` |
+
+> 探针卫生：`.dev/verify-rpc.mjs` 现在会在跑之前 `set-config pollEnabled:false`、finally 恢复，
+> 避免 add-task → dispatch-now → delete-task 被轮询当成真任务派给主 Agent（幽灵任务）。
+
 ## 3. 复跑方式
 
 ```powershell

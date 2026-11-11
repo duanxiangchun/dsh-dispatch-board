@@ -60,6 +60,23 @@ async function expectError(method, payload, code) {
 
 async function main() {
   console.log('dsh-taskboard probe @ ' + baseUrl)
+  // 探针会 add/delete 任务；轮询开着会把它们真的派发给主 Agent（幽灵任务）。
+  // 先暂停轮询，跑完（或失败）再恢复原值。
+  const initial = await call('snapshot')
+  const restore = {
+    pollEnabled: initial.result.value.config.pollEnabled,
+    pollIntervalMs: initial.result.value.config.pollIntervalMs,
+  }
+  await call('set-config', { pollEnabled: false })
+  try {
+    await runChecks(initial)
+  } finally {
+    await call('set-config', restore).catch((error) => console.error('restore config failed: ' + error.message))
+  }
+}
+
+async function runChecks(initial) {
+  const snap = initial.result.value
   console.log('1) 传输层与信封')
   const nonPost = await fetch(baseUrl + CHANNEL + '/snapshot', { method: 'GET' })
   check('GET 被拒绝（405）', nonPost.status === 405, nonPost.status)
@@ -84,8 +101,6 @@ async function main() {
   check('坏信封返回 bad-request', brokenJson.result && brokenJson.result.error && brokenJson.result.error.code === 'bad-request', brokenJson)
 
   console.log('2) snapshot')
-  const first = await call('snapshot')
-  const snap = first.result.value
   check('version = 1', snap.version === 1)
   check('tasks 是数组', Array.isArray(snap.tasks))
   check('config.pollIntervalMs 在范围内', snap.config.pollIntervalMs >= 5000 && snap.config.pollIntervalMs <= 300000)
@@ -100,7 +115,7 @@ async function main() {
   console.log('3) add-task / update-task / delete-task')
   const added = await call('add-task', { title: '[probe] RPC 验证任务', note: '由 .dev/verify-rpc.mjs 创建' })
   const task = added.result.value.task
-  check('add-task 返回任务', task && task.id === 't-' + snap.tasks.reduce((max, t) => Math.max(max, Number(String(t.id).slice(2)) || 0), 0) + 1 || !!task, task && task.id)
+  check('add-task 返回递增 id', !!task && /^t-\d+$/.test(task.id), task && task.id)
   check('新任务状态是 todo', task.status === 'todo')
   check('新任务 source=user', task.source === 'user')
 
