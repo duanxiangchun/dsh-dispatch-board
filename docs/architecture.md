@@ -299,6 +299,19 @@ ctx.effect(() => ctx.webServer.register({
 工具输出统一 `output.schema = { type:'object', … }`，`render` 返回 `[{type:'text', text}]`。
 `execute(args, exec)` 中 `exec.agent` 可能为空（非 agent 调用）→ 直接 `throw`。
 
+**硬规则（0.1.3 起）：工具输出是封闭契约，宿主在 `execute()` 之后才校验。**
+
+- dsh tools 管线在 `execute()` **成功返回之后**才校验 canonical output（`validateJsonSchemaValue` →
+  `ToolOutputError` / `INVALID_TOOL_OUTPUT`）。`output.schema` 的对象层都是
+  `additionalProperties:false`，返回值夹带未声明字段 → 模型侧只看到调用失败，**而 `execute()` 的
+  副作用（board.json 写入、状态迁移）已经生效**，表现为「看板变了但工具报错」。
+- 因此 `execute()` 的返回值必须逐字段落在 `output.schema` 声明内，工具里不要返回任务完整对象。
+- UI 专用字段（`dispatchedSessionId`、`sessionId`、`cwd`、`startedAt` 等）只走 `buildSnapshot()`
+  里的完整任务对象（Client 的跳转读的是 snapshot，不读工具输出），**不进 `taskBrief()`**。
+- 改工具输出形状的顺序：**先改本文档 / `output.schema` → 再改 `execute()` → 补
+  `test/host.test.mjs` 的封闭性回归**（`TASK_LIST_OUTPUT_SCHEMA` / `TASK_ONE_OUTPUT_SCHEMA` /
+  `taskBrief` 已 export 供单测）。v0.1.2 的 `dispatchedSessionId` 事故就是跳过了第一步。
+
 ### 4.5 模式状态（预设声明 + 读回）
 
 0.2.2 起 preset **不是目录**：`$DSH_HOME/.agent-presets/` 已没有宿主代码读取。preset 是 bundle
@@ -516,3 +529,10 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 - v0.1.0 修订：看板从左侧面板（`sidebar.panellist` + `main`）迁到**右侧栏 tab**
   （`sidebarRightTabs` + `sidebar.right.pane.tab`），入口按钮放会话 header；窄栏纵向 lane、
   宽栏/全屏四列；左侧菜单不再有看板项。
+- v0.1.3（修复工具输出契约）：`taskBrief()` 不再返回 UI 专用的 `dispatchedSessionId`，三个模型工具
+  （`taskboard_add` / `taskboard_list` / `taskboard_update`）的输出严格落在
+  `TASK_LIST_OUTPUT_SCHEMA` / `TASK_ONE_OUTPUT_SCHEMA` 的封闭声明内。该字段由 v0.1.2 的
+  commit ad4852c 引入工具返回值却未在 schema 声明，dsh 在 `execute()` 返回后校验时抛
+  `INVALID_TOOL_OUTPUT`——看板写入已落盘、模型却看到三个工具全部失败。新增 `test/host.test.mjs`
+  回归（`taskBrief` 输出键集合 ⊆ schema `properties`，含 list `items`），并在 §4.4 补
+  「execute 之后再校验、副作用已生效、改输出先改 schema」的硬规则。

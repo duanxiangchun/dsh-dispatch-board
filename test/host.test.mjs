@@ -7,6 +7,8 @@ import { join } from 'node:path'
 import {
   BoardError,
   STATUSES,
+  TASK_LIST_OUTPUT_SCHEMA,
+  TASK_ONE_OUTPUT_SCHEMA,
   addTask,
   applyTaskUpdate,
   archiveDoneTasks,
@@ -37,9 +39,49 @@ import {
   tick,
   resolveTargetAgent,
   selectDispatchCandidate,
+  taskBrief,
 } from '../lib/index.js'
 
 const NOW = Date.parse('2026-11-11T02:00:00.000Z')
+
+/**
+ * 迷你 JSON Schema 校验器：只覆盖 lib/index.js 工具 output.schema 用到的子集
+ * （type / additionalProperties / required / properties / items / enum）。
+ * 工具输出契约是封闭的（对象层 additionalProperties:false），用它断言
+ * taskBrief() 不会带出 schema 未声明的字段。返回问题列表，空数组 = 符合。
+ */
+function schemaProblems(value, schema, path = 'value') {
+  if (!schema || typeof schema !== 'object') return []
+  if (schema.type === 'object') {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      return [path + ' 应为 object']
+    }
+    const problems = []
+    const properties = schema.properties || {}
+    for (const key of schema.required || []) {
+      if (!(key in value)) problems.push(path + '.' + key + ' 是必填字段')
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (!Object.prototype.hasOwnProperty.call(properties, key)) {
+        if (schema.additionalProperties === false) {
+          problems.push(path + '.' + key + ' 未在 schema 声明（additionalProperties:false）')
+        }
+        continue
+      }
+      problems.push(...schemaProblems(child, properties[key], path + '.' + key))
+    }
+    return problems
+  }
+  if (schema.type === 'array') {
+    if (!Array.isArray(value)) return [path + ' 应为 array']
+    return value.flatMap((item, index) => schemaProblems(item, schema.items || {}, path + '[' + index + ']'))
+  }
+  if (schema.type === 'string' && typeof value !== 'string') return [path + ' 应为 string']
+  if (schema.type === 'integer' && !Number.isInteger(value)) return [path + ' 应为 integer']
+  if (schema.type === 'boolean' && typeof value !== 'boolean') return [path + ' 应为 boolean']
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) return [path + ' 不在 enum 内：' + String(value)]
+  return []
+}
 
 function boardWith(...titles) {
   const state = createEmptyBoard()
@@ -821,4 +863,58 @@ test('new dispatch mode creates the conversation inside the task workspace group
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('taskBrief output stays inside the closed tool output schemas', () => {
+  // 回归：0.1.2 的 taskBrief 返回了 UI 专用的 dispatchedSessionId，但它不在
+  // TASK_LIST_OUTPUT_SCHEMA / TASK_ONE_OUTPUT_SCHEMA（additionalProperties:false）里。
+  // dsh 在 execute() 成功返回之后才校验 canonical output，于是看板写入已生效、三个工具却全部报
+  // INVALID_TOOL_OUTPUT。这里用「带全部 UI/snapshot 字段的完整任务」喂 taskBrief：
+  // 任何未声明字段漏进工具输出都必须让本测试失败。
+  const fullTask = {
+    id: 't-42',
+    title: '修复工具输出契约',
+    status: 'doing',
+    note: '验收：测试通过',
+    assignee: 'fixer',
+    result: '进行中',
+    updatedAt: new Date(NOW).toISOString(),
+    // 以下字段只属于 board.json / buildSnapshot()，不得进入工具输出
+    dispatchedSessionId: 'session-42',
+    sessionId: 'session-42',
+    cwd: 'C:\\work\\demo',
+    source: 'agent',
+    workspaceId: 'w-demo',
+    createdAt: new Date(NOW - 1000).toISOString(),
+    startedAt: new Date(NOW - 500).toISOString(),
+    finishedAt: null,
+    archivedAt: null,
+    notifiedAt: new Date(NOW).toISOString(),
+    notificationCount: 2,
+    lastError: 'keep me',
+  }
+
+  const brief = taskBrief(fullTask)
+  const declared = TASK_ONE_OUTPUT_SCHEMA.properties.task.properties
+
+  // 键集合 ⊆ schema 声明的 properties；旧代码会在这里挂（dispatchedSessionId 未声明）
+  assert.deepEqual(Object.keys(brief).sort(), ['assignee', 'id', 'note', 'result', 'status', 'title', 'updatedAt'])
+  for (const key of Object.keys(brief)) {
+    assert.ok(Object.prototype.hasOwnProperty.call(declared, key), 'taskBrief 返回了 schema 未声明的字段：' + key)
+  }
+  assert.equal('dispatchedSessionId' in brief, false, 'taskBrief 不得返回 UI 专用的 dispatchedSessionId')
+
+  // 单任务输出（taskboard_add / taskboard_update）与列表输出（taskboard_list，含 items）
+  assert.deepEqual(schemaProblems({ task: brief }, TASK_ONE_OUTPUT_SCHEMA), [])
+  assert.deepEqual(schemaProblems({ count: 1, tasks: [brief] }, TASK_LIST_OUTPUT_SCHEMA), [])
+  assert.deepEqual(schemaProblems({ count: 0, tasks: [] }, TASK_LIST_OUTPUT_SCHEMA), [])
+
+  // 反向自检：校验器必须真的能抓到未声明字段，否则上面的断言会退化成 no-op
+  const leaked = { ...brief, dispatchedSessionId: 'session-42' }
+  assert.deepEqual(schemaProblems({ task: leaked }, TASK_ONE_OUTPUT_SCHEMA), [
+    'value.task.dispatchedSessionId 未在 schema 声明（additionalProperties:false）',
+  ])
+  assert.deepEqual(schemaProblems({ count: 1, tasks: [leaked] }, TASK_LIST_OUTPUT_SCHEMA), [
+    'value.tasks[0].dispatchedSessionId 未在 schema 声明（additionalProperties:false）',
+  ])
 })
