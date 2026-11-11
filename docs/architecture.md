@@ -308,7 +308,7 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 | 视图 | 位置 | 范围 | 新建任务 |
 | --- | --- | --- | --- |
 | **本工作区看板** | 右侧栏 tab（`sidebarRightTabs` + `sidebar.right.pane.tab`）+ 会话 header 入口按钮 | `task.cwd === 当前会话工作区` **或** `task.sessionId === 当前会话` 的任务（后者兜住 cwd 为空的旧任务/早期任务，避免「任务凭空消失」）；另有「未绑定工作区的任务」提示指向平台看板 | 默认绑定当前对话/工作区（sessionId 交给宿主解析 cwd） |
-| **平台任务看板** | 左侧栏面板（`sidebar.panellist` + `main` 整页） | 全部任务（含 `cwd=null` 的老任务），每张卡带工作区 tag，可按工作区过滤 | **必须选工作区**（下拉来自 `snapshot.workspaces`），传 `cwd`、不传 sessionId |
+| **任务看板（全部工作区）** | 左侧栏面板（`sidebar.panellist` + `main` 整页） | 全部任务（含 `cwd=null` 的老任务），每张卡带工作区 tag，可按工作区过滤 | **必须选工作区**（下拉来自 `snapshot.workspaces`），传 `cwd`、不传 sessionId |
 
 两个视图共用同一套卡片/列组件与 RPC；左栏面板图标带 `todo+doing` 角标。
 
@@ -335,7 +335,7 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 | `conversation.session.header.actions` | `{ name, id:'taskboard', order:40, label: () => t('panel.label') }` | 会话 header 右侧的看板按钮（`.tb-headbtn`），带本工作区 `todo` 数量角标（`.tb-badge`，>99 显示 99+，6s 刷新） |
 | `sidebar.right.pane.tab` | `{ name, key:'dsh-taskboard' }` | 本工作区看板正文 `BoardTab` |
 | `sidebar.right.pane.tab.title` | `{ name, key:'dsh-taskboard' }` | chip：看板 glyph + 标题 |
-| `sidebar.panellist` | `{ name:'sidebar.panellist', id:'taskboard-platform', order:25, label: () => t('platform.label'), locale }` | 左侧栏「平台任务看板」图标，带 `todo+doing` 角标 |
+| `sidebar.panellist` | `{ name:'sidebar.panellist', id:'taskboard-platform', order:25, label: () => t('platform.label'), locale }` | 左侧栏「任务看板」图标（全部工作区），带 `todo+doing` 角标 |
 | `main` | `{ name:'main', key:'taskboard-platform', locale }` | 平台任务看板整页 `PlatformBoard` |
 
 > `label` 必须是 thunk（`string | (() => string)`），语言切换后无需重注册。
@@ -344,7 +344,7 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 
 自上而下：
 
-1. **头部**：标题「平台任务看板」+ 副标题（`共 N 条 · 轮询状态`）+ 立即刷新 + 轮询开关 + 间隔选择 +
+1. **头部**：标题「任务看板」+ 副标题（`共 N 条 · 轮询状态`）+ 立即刷新 + 轮询开关 + 间隔选择 +
    一键归档已完成；preset 异常 banner；页脚（数据文件路径 + 版本）。
 2. **新建行**：标题输入（Enter 提交）+ 备注展开 + **工作区选择（必选）**：
    下拉 `placeholder = 选择工作区`，options 来自 `snapshot.workspaces`（title，空则路径尾段）；

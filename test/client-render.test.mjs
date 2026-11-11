@@ -947,7 +947,7 @@ test('PlatformPanelIcon：todo+doing 角标 + 6s 轮询 snapshot', async () => {
   const { tree, instance } = await renderComponent(Icon, { size: 18 })
 
   assert.ok(hasClass(tree, 'tb-icon'))
-  assert.match(String(tree.props.title), /平台任务看板/)
+  assert.match(String(tree.props.title), /任务看板/)
   assert.match(String(tree.props.title), /3 条待处理/)
 
   const svg = collect(tree).find((node) => node.type === 'svg')
@@ -972,7 +972,7 @@ test('PlatformPanelIcon：RPC 失败时不崩、不显示角标', async () => {
   })
   const result = await renderComponent(harness.componentOf('sidebar.panellist'), { size: 20 })
   assert.equal(nodesWithClass(result.tree, 'tb-badge').length, 0)
-  assert.equal(result.tree.props.title, '平台任务看板')
+  assert.equal(result.tree.props.title, '任务看板')
   const svg = collect(result.tree).find((node) => node.type === 'svg')
   assert.equal(svg.props.width, 20)
 })
@@ -988,7 +988,7 @@ test('PlatformBoard：默认显示全部工作区任务，卡片带工作区 tag
   assert.ok(hasClass(tree, 'tb-page'))
   assert.ok(hasClass(tree, 'tb-platform'))
   assert.equal(tree.props['data-layout'], 'wide')
-  assert.ok(includesText(tree, '平台任务看板'))
+  assert.ok(includesText(tree, '任务看板'))
   assert.ok(includesText(tree, '共 5 条'), 'header shows the total task count')
 
   assert.equal(nodesWithClass(tree, 'tb-col').length, 4)

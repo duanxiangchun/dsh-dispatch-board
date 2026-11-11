@@ -292,14 +292,14 @@ test('apply 注册右栏 tab 类型 + 右栏三处入口 + 左侧栏平台看板
   assert.equal(platformIcon.options.id, 'taskboard-platform')
   assert.equal(platformIcon.options.order, 25)
   assert.equal(typeof platformIcon.options.label, 'function')
-  assert.equal(platformIcon.options.label(), '平台任务看板')
+  assert.equal(platformIcon.options.label(), '任务看板')
   assert.equal(platformIcon.options.locale, 'taskboard')
   assert.equal(typeof platformIcon.component, 'function')
 
   const platformPage = harness.registrations[4]
   assert.equal(platformPage.options.key, 'taskboard-platform')
   assert.equal(typeof platformPage.options.label, 'function')
-  assert.equal(platformPage.options.label(), '平台任务看板')
+  assert.equal(platformPage.options.label(), '任务看板')
   assert.equal(platformPage.options.locale, 'taskboard')
   assert.equal(typeof platformPage.component, 'function')
   // 平台看板的 slot key 与入口 icon 的 id 必须一致，点击图标才能切到页面
