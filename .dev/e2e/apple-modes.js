@@ -1,0 +1,37 @@
+const { chromium } = require('playwright');
+const TARGET = process.env.TARGET_URL;
+const OUT = process.env.OUT_DIR;
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  let ctx = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
+  let page = await ctx.newPage();
+  await page.goto(TARGET, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(6000);
+  await page.getByText('任务看板', { exact: true }).first().click();
+  await page.waitForTimeout(2200);
+  await page.setViewportSize({ width: 760, height: 980 });
+  await page.waitForTimeout(900);
+  console.log('NARROW layout = ' + await page.evaluate(() => { const p = document.querySelector('.tb-page'); return p ? p.getAttribute('data-layout') + '/' + p.getAttribute('data-narrow') : 'none'; }));
+  await page.screenshot({ path: OUT + '/shots/apple-narrow.png' });
+  await page.locator('.tb-card').first().locator('.tb-card-title').click();
+  await page.waitForTimeout(700);
+  await page.screenshot({ path: OUT + '/shots/apple-narrow-detail.png' });
+  await ctx.close();
+  ctx = await browser.newContext({ viewport: { width: 1400, height: 950 }, colorScheme: 'dark' });
+  page = await ctx.newPage();
+  await page.goto(TARGET, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(6000);
+  await page.getByText('任务看板', { exact: true }).first().click();
+  await page.waitForTimeout(2200);
+  const info = await page.evaluate(() => {
+    const p = document.querySelector('.tb-page');
+    const card = document.querySelector('.tb-card');
+    return { pageBg: p ? getComputedStyle(p).backgroundColor : null, cardBg: card ? getComputedStyle(card).backgroundColor : null, bodyClass: document.body.className };
+  });
+  console.log('DARK ' + JSON.stringify(info));
+  await page.screenshot({ path: OUT + '/shots/apple-dark.png' });
+  await page.locator('.tb-card').first().locator('.tb-card-title').click();
+  await page.waitForTimeout(700);
+  await page.screenshot({ path: OUT + '/shots/apple-dark-detail.png' });
+  await browser.close();
+})().catch(e => { console.error('FATAL ' + (e && e.stack || e)); process.exit(1); });

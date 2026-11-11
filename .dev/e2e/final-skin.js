@@ -1,0 +1,25 @@
+const { chromium } = require('playwright');
+const TARGET = process.env.TARGET_URL;
+const OUT = process.env.OUT_DIR;
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const ctx = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
+  const page = await ctx.newPage();
+  await page.goto(TARGET, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(6000);
+  await page.getByText('任务看板', { exact: true }).first().click();
+  await page.waitForTimeout(2400);
+  await page.screenshot({ path: OUT + '/shots/final-board.png' });
+  const cols = await page.evaluate(() => { const b = document.querySelector('.tb-board'); return b ? getComputedStyle(b).gridTemplateColumns : null; });
+  console.log('WIDE cols = ' + cols);
+  await page.locator('.tb-card').first().locator('.tb-card-title').click();
+  await page.waitForTimeout(800);
+  await page.screenshot({ path: OUT + '/shots/final-detail.png' });
+  await page.keyboard.press('Escape');
+  await page.setViewportSize({ width: 760, height: 1000 });
+  await page.waitForTimeout(900);
+  const cols2 = await page.evaluate(() => { const b = document.querySelector('.tb-board'); return b ? getComputedStyle(b).gridTemplateColumns : null; });
+  console.log('NARROW cols = ' + cols2);
+  await page.screenshot({ path: OUT + '/shots/final-narrow.png' });
+  await browser.close();
+})().catch(e => { console.error('FATAL ' + (e && e.stack || e)); process.exit(1); });
