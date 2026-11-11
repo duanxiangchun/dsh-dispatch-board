@@ -110,6 +110,18 @@ transcript-worker-af04b22a: header.agentPreset=taskboard-worker, header.parentSe
 | 5 | 工作区过滤（全部 2 / plinto 1 / 日常问答 1），tag 与 cwd 一致 | PASS | `dual-06-filter-all.png`、`dual-06-filter.png` |
 | 6 | 右栏建任务在平台看板可见（数据同源），console 零错 | PASS | `dual-07-right-add.png`、`dual-07-both.png` |
 
+## 2.6 右栏看板「不显示任务」修复
+
+用户反馈：平台看板正常，右侧小看板空白。根因：右栏过滤只认 `task.cwd === 本工作区`，
+而旧任务/本对话早期任务 `cwd=null`，被过滤掉且无任何提示。
+
+修复：
+- 右栏过滤改为 `cwd 匹配本工作区` **或** `sessionId === 当前会话`（本对话创建的任务不会消失）；
+- 工作区未知（历史会话）时只按 `sessionId` 兜底，不再整块空白；
+- 头部加「另有 N 条任务没有绑定工作区…在左侧栏平台任务看板可见」提示。
+
+验证：`.dev/e2e/rightboard-fix-report.md`。
+
 ## 3. 复跑方式
 
 ```powershell

@@ -302,7 +302,7 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 
 | 视图 | 位置 | 范围 | 新建任务 |
 | --- | --- | --- | --- |
-| **本工作区看板** | 右侧栏 tab（`sidebarRightTabs` + `sidebar.right.pane.tab`）+ 会话 header 入口按钮 | 只显示 `task.cwd === 当前会话工作区` 的任务 | 默认绑定当前对话/工作区（sessionId 交给宿主解析 cwd） |
+| **本工作区看板** | 右侧栏 tab（`sidebarRightTabs` + `sidebar.right.pane.tab`）+ 会话 header 入口按钮 | `task.cwd === 当前会话工作区` **或** `task.sessionId === 当前会话` 的任务（后者兜住 cwd 为空的旧任务/早期任务，避免「任务凭空消失」）；另有「未绑定工作区的任务」提示指向平台看板 | 默认绑定当前对话/工作区（sessionId 交给宿主解析 cwd） |
 | **平台任务看板** | 左侧栏面板（`sidebar.panellist` + `main` 整页） | 全部任务（含 `cwd=null` 的老任务），每张卡带工作区 tag，可按工作区过滤 | **必须选工作区**（下拉来自 `snapshot.workspaces`），传 `cwd`、不传 sessionId |
 
 两个视图共用同一套卡片/列组件与 RPC；左栏面板图标带 `todo+doing` 角标。
@@ -370,7 +370,7 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
    - `Snapshot.preset.installed === false` → 黄色 banner 显示原因（没有 agentPresets 服务 / 名单里没有本模式）。
 2. **新建任务行**：输入框（Enter 提交）+ 备注展开（可选）+ 「添加到待开始」按钮；
    下方一行只有「加备注」链接和一句提示——**没有「派发给」选择器**（派发全自动，产品决策）：
-   - 本会话在 `agents[]` 里能查到 cwd → 「…任务会回到本对话执行（工作区：name）。」
+   - 本会话在 `agents[]` 里能查到 cwd（或 `session-info` 兜底）→ 「…任务会回到本对话执行（工作区：name）。」
    - 查不到（冷会话/历史会话）→ 挂载时调一次 `session-info` 拿 cwd，同样显示工作区；
    - 实在拿不到 → 通用文案「…你只管加任务和看结论。」
    新建时把 `props.sessionId` 一并交给 `add-task`，决定这条任务的归属。
