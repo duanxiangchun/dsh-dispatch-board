@@ -25,6 +25,7 @@ import {
   isLoopbackRequest,
   normalizeBoard,
   normalizeConfig,
+  normalizeConfig as normalizeConfigAlias,
   reloadBoardIfStale,
   notifyCooldownMs,
   parseRpcEnvelope,
@@ -681,5 +682,89 @@ test('boardPath honors DSH_TASKBOARD_PATH so test instances do not share the rea
   } finally {
     if (previous === undefined) delete process.env.DSH_TASKBOARD_PATH
     else process.env.DSH_TASKBOARD_PATH = previous
+  }
+})
+test('normalizeConfig defaults dispatchMode to new and validates values', () => {
+  assert.equal(normalizeConfig({}).dispatchMode, 'new')
+  assert.equal(normalizeConfig({ dispatchMode: 'creator' }).dispatchMode, 'creator')
+  assert.equal(normalizeConfig({ dispatchMode: 'auto' }).dispatchMode, 'auto')
+  assert.equal(normalizeConfig({ dispatchMode: 'bogus' }).dispatchMode, 'new')
+})
+
+test('tick in new mode creates a fresh dispatcher conversation for the task', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-newmode-'))
+  try {
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({ pollEnabled: true, dispatchMode: 'new' })
+    const task = addTask(state, { title: 'new mode task', cwd: 'C:\\work\\demo' }, NOW)
+
+    const delivered = []
+    const createdAgent = {
+      id: 'session-created',
+      status: 'idle',
+      session: { id: 'session-created', header: { cwd: 'C:\\work\\demo' } },
+      followup: (message) => delivered.push(message),
+    }
+    const createCalls = []
+    const controller = {
+      create: async (request) => {
+        createCalls.push(request)
+        return { sessionId: 'session-created', agentPreset: 'taskboard-dispatch' }
+      },
+      resolveAgent: async () => ({ agent: createdAgent }),
+    }
+    const agents = { get: (id) => (id === 'session-created' ? createdAgent : undefined), roots: () => [] }
+    const rt = {
+      ctx: { get: (name) => (name === 'agents' ? agents : name === 'sessionController' ? controller : undefined) },
+      state,
+      filePath: join(dir, 'board.json'),
+      poll: { running: true, lastRunAt: null, lastDispatchAt: null, lastDispatchSessionId: null, lastSkipReason: null },
+      reviveFailures: new Map(),
+    }
+
+    const result = await tick(rt, {})
+    assert.equal(result.dispatched, true)
+    assert.equal(result.sessionId, 'session-created')
+    assert.equal(createCalls.length, 1)
+    assert.equal(createCalls[0].cwd, 'C:\\work\\demo')
+    assert.equal(createCalls[0].agentPreset, 'taskboard-dispatch')
+    assert.equal(delivered.length, 1)
+    assert.equal(task.status, 'doing')
+    assert.equal(task.dispatchedSessionId, 'session-created')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('tick in creator mode never creates a new conversation', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-creatormode-'))
+  try {
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({ pollEnabled: true, dispatchMode: 'creator' })
+    addTask(state, { title: 'creator mode task', sessionId: 'creator-1' }, NOW)
+    const delivered = []
+    const creator = {
+      id: 'creator-1',
+      status: 'idle',
+      session: { id: 'creator-1', header: {} },
+      followup: (message) => delivered.push(message),
+    }
+    let createCalls = 0
+    const controller = { create: async () => { createCalls += 1; return { sessionId: 'x' } } }
+    const agents = { get: (id) => (id === 'creator-1' ? creator : undefined), roots: () => [creator] }
+    const rt = {
+      ctx: { get: (name) => (name === 'agents' ? agents : name === 'sessionController' ? controller : undefined) },
+      state,
+      filePath: join(dir, 'board.json'),
+      poll: { running: true, lastRunAt: null, lastDispatchAt: null, lastDispatchSessionId: null, lastSkipReason: null },
+      reviveFailures: new Map(),
+    }
+    const result = await tick(rt, {})
+    assert.equal(result.dispatched, true)
+    assert.equal(result.sessionId, 'creator-1')
+    assert.equal(createCalls, 0)
+    assert.equal(delivered.length, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })

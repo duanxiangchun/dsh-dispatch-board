@@ -72,7 +72,17 @@ README.md               Lead：安装 / 使用 / 排障
 
 ### 1.4 目标 Agent 解析
 
-**全自动，不需要用户选会话**；同时**任务绑定创建它的对话与工作区**。解析顺序：
+**不需要用户选会话**，但**派发去处可选**（看板顶部「派发到」，`config.dispatchMode`，默认 `new`）：
+
+| 模式 | 行为 |
+| --- | --- |
+| `new`（默认） | 在任务所属工作区**新建一个派单模式的对话**（`sessionController.create({cwd, agentPreset:'taskboard-dispatch'})`），任务投给它——任务不会挤进别人的对话 |
+| `creator` | 派回**创建它的那个对话**（现在的语义：忙则等、冷会话尝试唤醒、唤醒不了就等） |
+| `auto` | 忽略创建者，按「同工作区空闲 → 派单模式空闲 → 任意空闲」挑一个会话 |
+
+`new` 模式失败（没有 sessionController、解析不到工作区、预设不可用）会自动退回 `auto` 的挑法，不丢任务。
+
+任务同时**绑定创建它的对话与工作区**。解析顺序：
 
 1. 任务带 `sessionId`（从某个对话的右栏加的）且该会话在线：
    - 会话空闲 → **派回创建它的那个对话**（`creator-session`），子 Agent 在同一个工作区里干活；
@@ -179,7 +189,7 @@ Content-Type: application/json
 | `update-task` | `{id, status?, title?, note?, result?, assignee?, lastError?}` | `{task}` | 局部更新；非法状态迁移 → `conflict` |
 | `delete-task` | `{id}` | `{deleted:true,id}` | 物理删除（仅限 UI 手动） |
 | `dispatch-now` | `{id}` | `{dispatched, sessionId, task}` | 立即投递一次（不等轮询、无视冷却） |
-| `set-config` | `{pollEnabled?, pollIntervalMs?}` | `{config}` | 开关/间隔 |
+| `set-config` | `{pollEnabled?, pollIntervalMs?, dispatchMode?}` | `{config}` | 开关 / 间隔 / 派发去处（`new` / `creator` / `auto`） |
 | `archive-done` | `{}` | `{archived:n}` | 一键把全部 `done` 归档 |
 | `session-info` | `{sessionId}` | `{sessionId, cwd}` | 给 client 兜底：冷会话（历史会话）不在 `agents[]` 里时也能拿到工作区，用于提示文案 |
 | `install-preset` | `{}` | `PresetStatus + {action:'none'}` | **兼容端点**：0.2.2 起模式随 bundle patch 声明，这里只强制刷新 registry 状态 |

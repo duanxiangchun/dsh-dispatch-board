@@ -866,11 +866,16 @@ test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boar
   assert.ok(includesText(tree, '看板数据保存在本机'))
   assert.ok(includesText(tree, 'v0.1.0'))
 
-  // 「派发给」选择器已被产品删除；本页只剩轮询间隔选择器
+  // 「派发给」（按会话选目标）已被删除；现在只有轮询间隔 + 派发方式（新对话/回发起/空闲）两个选择器
   const selects = collect(tree).filter((node) => node.type === 'select')
-  assert.equal(selects.length, 1, 'only the poll-interval select remains')
-  assert.equal(selects[0].props['aria-label'], undefined)
-  assert.ok(!includesText(tree, '派发给'), 'dispatch-target selector must be gone')
+  assert.equal(selects.length, 2, 'poll-interval + dispatch-mode selects')
+  const dispatchSelect = selects.find((node) => node.props['aria-label'] === '派发到')
+  assert.ok(dispatchSelect, 'dispatch-mode select must render')
+  const modeValues = collect(dispatchSelect)
+    .filter((node) => node.type === 'option')
+    .map((node) => node.props.value)
+  assert.deepEqual(modeValues, ['new', 'creator', 'auto'])
+  assert.ok(!includesText(tree, '派发给'), 'the old per-session dispatch-target selector must be gone')
   assert.ok(includesText(tree, '加进「待开始」后由主 Agent 自动接手'), 'composer shows the auto hint')
 })
 
