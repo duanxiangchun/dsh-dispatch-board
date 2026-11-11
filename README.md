@@ -1,5 +1,7 @@
 # dsh-dispatch-board —— 派单看板 + 派单模式
 
+[![npm](https://img.shields.io/npm/v/dsh-dispatch-board)](https://www.npmjs.com/package/dsh-dispatch-board) [![CI](https://github.com/duanxiangchun/dsh-dispatch-board/actions/workflows/ci.yml/badge.svg)](https://github.com/duanxiangchun/dsh-dispatch-board/actions/workflows/ci.yml)
+
 给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）用的插件，解决一个具体问题：
 
 > 包名：`dsh-dispatch-board`（npm / GitHub 同名）。内部运行时标识仍是 `taskboard`（存储目录 `~/.dsh/storages/dsh-taskboard/`、RPC 路由 `/taskboard`、预设 id `taskboard-*`、工具 `taskboard_*`），这样老安装和已有看板数据不会失效。
@@ -41,6 +43,14 @@
   急着处理可以点「立即派发」改派。
 - **新「模式」：派单看板模式**。插件包自带两个模式声明（不写盘、不需要额外安装步骤），
   在模式选择器里选「派单看板模式」，主 Agent 就按派单口径工作（不写文件、不跑命令，一切派给子 Agent）。
+
+## npm 安装
+
+```powershell
+dsh plugin --profile web add dsh-dispatch-board
+```
+
+npm: https://www.npmjs.com/package/dsh-dispatch-board · GitHub Release 由 tag `v*` 触发流水线自动发布。
 
 ## 安装
 
