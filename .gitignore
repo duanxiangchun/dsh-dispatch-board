@@ -2,3 +2,10 @@ node_modules/
 .dev/e2e/shots/
 *.log
 .DS_Store
+
+# 临时调试产物（token/cookie 转储、日志解压、本地验证脚本输出）
+.dev/e2e/tmp-*
+.dev/e2e/*.ps1
+.dev/e2e/shots/
+.npm-*
+*.tgz
