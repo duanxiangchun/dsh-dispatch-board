@@ -1194,3 +1194,229 @@ test('BoardTab：snapshot 为空对象时降级渲染（四列空态，不抛异
   }
   assert.ok(includesText(tree, '每 15s 轮询'))
 })
+
+/* ══════════════════════════════════════════════════════════════
+ * 用例：任务详情浮层（两块看板共用 Detail）
+ * ══════════════════════════════════════════════════════════════ */
+
+function detailMask(tree) {
+  return collect(tree).find((node) => hasClass(node, 'tb-detail-mask')) || null
+}
+
+function detailBox(tree) {
+  const mask = detailMask(tree)
+  return mask ? collect(mask).find((node) => hasClass(node, 'tb-detail')) || null : null
+}
+
+function detailText(tree) {
+  const box = detailBox(tree)
+  return box ? textOf(box) : ''
+}
+
+function cardTitleNode(tree, title) {
+  return collect(tree).find((node) => hasClass(node, 'tb-card-titlebtn') && textOf(node) === title) || null
+}
+
+async function openDetailByTitle(instance, tree, title) {
+  const node = cardTitleNode(tree, title)
+  assert.ok(node, 'clickable card title for "' + title + '" must render')
+  node.props.onClick()
+  return instance.run()
+}
+
+function detailPrimaryButton(tree) {
+  const box = detailBox(tree)
+  assert.ok(box, 'detail overlay must be open')
+  const actions = collect(box).find((node) => hasClass(node, 'tb-detail-actions'))
+  assert.ok(actions, 'detail actions must render')
+  const button = buttons(actions).find((node) => classOf(node).includes('tb-btn-primary'))
+  assert.ok(button, 'detail primary action must render')
+  return button
+}
+
+function detailLabels(tree) {
+  const box = detailBox(tree)
+  assert.ok(box, 'detail overlay must be open')
+  const dts = collect(box).filter((node) => node.type === 'dt').map((node) => textOf(node))
+  const dds = collect(box).filter((node) => node.type === 'dd').map((node) => textOf(node))
+  return { dts, dds }
+}
+
+test('Detail：点卡片标题打开浮层，完整展示结论/备注/执行者/时间/id', async () => {
+  const longResult = '完整结论：' + '这段结论比较长，用来确认浮层不会截断文本。'.repeat(14)
+  const longNote = '备注：' + '验收标准包含多条检查点。'.repeat(6)
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 't-detail-1',
+        title: '打通宿主 RPC',
+        status: 'done',
+        cwd: WS_A,
+        note: longNote,
+        result: longResult,
+        assignee: 'main-agent-1',
+        notificationCount: 5,
+        source: 'agent',
+        createdAt: '2026-11-11T02:30:00.000Z',
+        updatedAt: '2026-11-11T03:10:00.000Z',
+        startedAt: '2026-11-11T02:40:00.000Z',
+        finishedAt: '2026-11-11T03:05:00.000Z',
+      },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), {
+    sessionId: SESSION_A,
+  })
+
+  const opened = await openDetailByTitle(instance, tree, '打通宿主 RPC')
+  assert.ok(detailMask(opened), 'mask must render')
+  const box = detailBox(opened)
+  assert.ok(box, 'detail panel must render')
+
+  // 标题 + 状态徽标
+  const heading = collect(box).find((node) => node.type === 'h2')
+  assert.ok(heading, 'detail title must render')
+  assert.equal(textOf(heading), '打通宿主 RPC')
+  const badge = nodesWithClass(box, 'tb-statusbadge')
+  assert.equal(badge.length, 1)
+  assert.equal(badge[0].props['data-status'], 'done')
+  assert.equal(textOf(badge[0]), '已完成')
+
+  // 完整结论 / 完整备注（不截断）
+  const detailTextAll = detailText(opened)
+  assert.ok(detailTextAll.includes(longResult), 'full result text must render untruncated')
+  assert.ok(detailTextAll.includes(longNote), 'full note text must render untruncated')
+  assert.ok(longResult.length > 200, 'fixture result is long enough to prove no truncation')
+
+  // 字段网格：状态/工作区/时间线/执行者/来源/提醒次数/id
+  const { dts, dds } = detailLabels(opened)
+  for (const label of ['状态', '工作区', '创建时间', '最后更新', '开始时间', '完成时间', '执行者 / 派给谁', '创建来源', '派发提醒次数', '任务 id']) {
+    assert.ok(dts.includes(label), 'missing detail field label: ' + label)
+  }
+  assert.ok(dds.includes('已完成'), 'status value must render')
+  assert.ok(dds.includes(WS_A), 'workspace path must render')
+  assert.ok(dds.includes('main-agent-1'), 'assignee must render')
+  assert.ok(dds.includes('5'), 'notification count must render')
+  assert.ok(dds.includes('t-detail-1'), 'task id must render')
+  assert.ok(dds.some((value) => value.includes('2026-11-11')), 'timeline dates must render')
+  assert.ok(detailTextAll.includes('主 Agent（模型工具）'), 'agent source must render')
+
+  // 卡片本身也能看到「详情」入口
+  assert.ok(buttonTexts(tree).includes('详情'), 'cards must expose a 详情 action')
+})
+
+test('Detail：done 但结论为空时显示 .tb-detail-muted 提示；未完成时显示待写提示', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      { id: 't-done-empty', title: '完成了但没写结论', status: 'done', cwd: WS_A, result: '', updatedAt: minutesAgo(3) },
+      { id: 't-todo-empty', title: '还没开始的任务', status: 'todo', cwd: WS_A, updatedAt: minutesAgo(4) },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), {
+    sessionId: SESSION_A,
+  })
+
+  const doneTree = await openDetailByTitle(instance, tree, '完成了但没写结论')
+  const muted = nodesWithClass(doneTree, 'tb-detail-muted')
+  assert.equal(muted.length, 1, 'empty result for a done task must use .tb-detail-muted')
+  assert.ok(includesText(muted[0], '任务已完成，但主 Agent 还没有写结论。'))
+  // 关闭后打开未完成任务：空结论走「待写」提示，不是 muted
+  const closeButton = buttons(doneTree).find((node) => node.props['aria-label'] === '关闭')
+  assert.ok(closeButton, 'detail must render a close button')
+  closeButton.props.onClick()
+  const closed = await instance.run()
+  assert.equal(detailMask(closed), null)
+  const todoTree = await openDetailByTitle(instance, closed, '还没开始的任务')
+  assert.equal(nodesWithClass(todoTree, 'tb-detail-muted').length, 0)
+  assert.ok(detailText(todoTree).includes('任务还没完成，完成后主 Agent 会把结论写在这里。'))
+})
+
+test('Detail：× / 关闭按钮 / 点遮罩三种方式都能关闭（仅 target===currentTarget 生效）', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), {
+    sessionId: SESSION_A,
+  })
+
+  // 1) × 关闭
+  let opened = await openDetailByTitle(instance, tree, '梳理看板数据模型')
+  const closeX = buttons(opened).find((node) => node.props['aria-label'] === '关闭')
+  assert.ok(closeX, 'detail must render an × close button')
+  closeX.props.onClick()
+  let next = await instance.run()
+  assert.equal(detailMask(next), null, '× must close the overlay')
+
+  // 2) 底部「关闭」按钮
+  opened = await openDetailByTitle(instance, next, '梳理看板数据模型')
+  const closeText = buttons(opened).find((node) => textOf(node).trim() === '关闭')
+  assert.ok(closeText, 'detail must render a text close button')
+  closeText.props.onClick()
+  next = await instance.run()
+  assert.equal(detailMask(next), null, 'close button must close the overlay')
+
+  // 3) 点遮罩：目标不是遮罩本身时保持打开
+  opened = await openDetailByTitle(instance, next, '梳理看板数据模型')
+  const mask = detailMask(opened)
+  mask.props.onClick({ target: {}, currentTarget: mask })
+  next = await instance.run()
+  assert.ok(detailMask(next), 'clicking inside the panel must not close the overlay')
+
+  // 4) 点遮罩：target === currentTarget 时关闭
+  const mask2 = detailMask(next)
+  mask2.props.onClick({ target: mask2, currentTarget: mask2 })
+  next = await instance.run()
+  assert.equal(detailMask(next), null, 'clicking the mask itself must close the overlay')
+})
+
+test('PlatformBoard：详情主操作按状态映射，点击后发 update-task 并关闭浮层', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  const cases = [
+    { title: '梳理看板数据模型', id: 't-1', action: '开始', status: 'doing' },
+    { title: '写客户端渲染冒烟测试', id: 't-3', action: '完成', status: 'done' },
+    { title: '打通宿主 RPC', id: 't-4', action: '归档', status: 'archived' },
+    { title: '归档过期的旧任务', id: 't-5', action: '重新打开', status: 'todo' },
+  ]
+
+  let current = tree
+  for (const item of cases) {
+    current = await openDetailByTitle(instance, current, item.title)
+    const primary = detailPrimaryButton(current)
+    assert.equal(textOf(primary).trim(), item.action, 'wrong primary action for ' + item.title)
+
+    const before = harness.rpcCalls.filter((call) => call.endpoint === 'update-task').length
+    primary.props.onClick()
+    const after = await instance.run()
+    assert.equal(detailMask(after), null, 'quick action must close the overlay')
+
+    const updates = harness.rpcCalls.filter((call) => call.endpoint === 'update-task')
+    assert.equal(updates.length, before + 1, 'quick action must call update-task exactly once')
+    assert.deepEqual(Object.assign({}, updates[updates.length - 1].payload), { id: item.id, status: item.status })
+    current = after
+  }
+})
+
+test('两块看板都能打开详情浮层（右栏点标题 / 平台点「详情」按钮）', async () => {
+  // 右栏：点卡片标题
+  const rightHarness = createHarness({ snapshot: makeSnapshot() })
+  const right = await renderNarrow(rightHarness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  const rightTree = await openDetailByTitle(right.instance, right.tree, '梳理看板数据模型')
+  assert.ok(detailBox(rightTree), 'right board detail must render')
+  const rightHeading = collect(detailBox(rightTree)).find((node) => node.type === 'h2')
+  assert.ok(rightHeading)
+  assert.equal(textOf(rightHeading), '梳理看板数据模型')
+
+  // 平台：点卡片动作里的「详情」按钮（标题之外的第二种入口）
+  const platformHarness = createHarness({ snapshot: makeSnapshot() })
+  const platform = await renderComponent(platformHarness.componentOf('main'), {})
+  const detailButtons = buttons(platform.tree).filter((node) => textOf(node).trim() === '详情')
+  assert.ok(detailButtons.length >= 5, 'every platform card must expose a 详情 button')
+  detailButtons[0].props.onClick()
+  const platformTree = await platform.instance.run()
+  assert.ok(detailBox(platformTree), 'platform board detail must render')
+  const platformHeading = collect(detailBox(platformTree)).find((node) => node.type === 'h2')
+  assert.ok(platformHeading)
+  assert.equal(textOf(platformHeading), '梳理看板数据模型', '详情 button opens the matching task')
+})
