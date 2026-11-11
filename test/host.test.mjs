@@ -31,6 +31,7 @@ import {
   parseRpcEnvelope,
   listWorkspaces,
   normalizePathForCompare,
+  workspaceIdForCwd,
   resolveSessionCwd,
   resolveSessionCwdViaQuery,
   tick,
@@ -764,6 +765,59 @@ test('tick in creator mode never creates a new conversation', async () => {
     assert.equal(result.sessionId, 'creator-1')
     assert.equal(createCalls, 0)
     assert.equal(delivered.length, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+test('workspaceIdForCwd matches paths with separators and case differences', () => {
+  const registry = {
+    list: () => [
+      { id: 'w-demo', path: 'C:\\Work\\Demo' },
+      { id: 'w-other', path: 'C:\\Work\\Other' },
+    ],
+  }
+  const ctx = { get: (name) => (name === 'workspaceRegistry' ? registry : undefined) }
+  assert.equal(workspaceIdForCwd(ctx, 'c:/work/demo/'), 'w-demo')
+  assert.equal(workspaceIdForCwd(ctx, 'C:\\Work\\Other'), 'w-other')
+  assert.equal(workspaceIdForCwd(ctx, 'C:\\nowhere'), '')
+  assert.equal(workspaceIdForCwd(ctx, ''), '')
+  assert.equal(workspaceIdForCwd({ get: () => undefined }, 'C:\\Work\\Demo'), '')
+})
+
+test('new dispatch mode creates the conversation inside the task workspace group', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-ws-create-'))
+  try {
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({ pollEnabled: true, dispatchMode: 'new' })
+    addTask(state, { title: 'workspace grouped task', cwd: 'c:/work/demo/' }, NOW)
+
+    const createCalls = []
+    const createdAgent = {
+      id: 'session-in-workspace',
+      status: 'idle',
+      session: { id: 'session-in-workspace', header: { cwd: 'C:\\Work\\Demo' } },
+      followup: () => {},
+    }
+    const controller = { create: async (request) => { createCalls.push(request); return { sessionId: 'session-in-workspace' } } }
+    const registry = { list: () => [{ id: 'w-demo', path: 'C:\\Work\\Demo' }] }
+    const agents = { get: (id) => (id === 'session-in-workspace' ? createdAgent : undefined), roots: () => [] }
+    const rt = {
+      ctx: {
+        get: (name) =>
+          name === 'agents' ? agents : name === 'sessionController' ? controller : name === 'workspaceRegistry' ? registry : undefined,
+      },
+      state,
+      filePath: join(dir, 'board.json'),
+      poll: { running: true, lastRunAt: null, lastDispatchAt: null, lastDispatchSessionId: null, lastSkipReason: null },
+      reviveFailures: new Map(),
+    }
+
+    const result = await tick(rt, {})
+    assert.equal(result.dispatched, true)
+    assert.equal(createCalls.length, 1)
+    assert.equal(createCalls[0].workspaceId, 'w-demo')
+    assert.equal(createCalls[0].cwd, undefined)
+    assert.equal(result.sessionId, 'session-in-workspace')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

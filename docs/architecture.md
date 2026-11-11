@@ -76,11 +76,12 @@ README.md               Lead：安装 / 使用 / 排障
 
 | 模式 | 行为 |
 | --- | --- |
-| `new`（默认） | 在任务所属工作区**新建一个派单模式的对话**（`sessionController.create({cwd, agentPreset:'taskboard-dispatch'})`），任务投给它——任务不会挤进别人的对话 |
+| `new`（默认） | 在任务所属工作区**新建一个派单模式的对话**，任务投给它——不会挤进别人的对话。创建时先用 `workspaceIdForCwd` 把 cwd 映射成工作区 id，走 `sessionController.create({workspaceId, agentPreset:'taskboard-dispatch'})`，**新对话会落在那条工作区的分组里**（而不是「未分组」）；映射不到工作区时退回 `{cwd}` |
 | `creator` | 派回**创建它的那个对话**（现在的语义：忙则等、冷会话尝试唤醒、唤醒不了就等） |
 | `auto` | 忽略创建者，按「同工作区空闲 → 派单模式空闲 → 任意空闲」挑一个会话 |
 
-`new` 模式失败（没有 sessionController、解析不到工作区、预设不可用）会自动退回 `auto` 的挑法，不丢任务。
+`new` 模式失败（没有 sessionController、解析不到工作区、工作区创建被拒、预设不可用）会自动退回 `auto` 的挑法，不丢任务。
+创建成功时还会把 `task.dispatchedSessionId` / `dispatchedSessionTitle` 记到任务上（详情里「执行对话」直接跳过去）。
 
 任务同时**绑定创建它的对话与工作区**。解析顺序：
 
