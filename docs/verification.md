@@ -1,0 +1,53 @@
+# 验证记录（v0.1.0）
+
+本文件记录 dsh-taskboard 1.0 交付前的真实设备验证。所有产物在 `.dev/e2e/`（脚本 + 截图 + transcript）。
+
+- 运行时：dsh 0.2.2-rc.1（全局安装 `%APPDATA%\npm\node_modules\@deepseek-ai\dsh`）
+- 测试 profile：`~/.dsh/profiles/taskboard`（`dsh --from-default-profile web` 生成后 `dsh plugin add` 本仓库）
+- 旁路实例：`http://127.0.0.1:3099`（不动用户在跑的 3080）
+- 模型：ollama `deepseek-v4.1-flash:1017`，权限 danger-full-access
+
+## 1. 自动化测试
+
+| 项 | 结果 |
+| --- | --- |
+| `node --check lib/index.js` / `lib/client.js` | PASS |
+| `node --test` | **40/40 PASS**（host 22 + client 4 + 渲染 14） |
+| `.dev/verify-rpc.mjs http://127.0.0.1:3099` | **33/33 PASS**（信封/全部端点/错误分支/loopback 拒绝） |
+
+## 2. 端到端验收（verifier，Playwright）
+
+报告：`.dev/e2e/report.md`｜截图：`.dev/e2e/shots/`
+
+| # | 项目 | 结果 | 关键证据 |
+| --- | --- | --- | --- |
+| 1 | 首页侧栏出现「任务看板」图标（带待开始角标） | PASS | `step1-home-sidebar.png` / `regress-badge.png` |
+| 2 | 看板页四列 + 新建输入框 + 轮询状态，列高撑满 | PASS | `step2-board-page.png` / `regress-board.png` |
+| 3 | UI 建任务 → 待开始卡片 + board.json 落盘 | PASS | `step3b-task-added.png` + board.json |
+| 4 | 模式选择器出现「派单看板模式」「派单看板模式 · 执行者」 | PASS | `step4b-mode-menu.png` |
+| 5 | **派单闭环**：轮询投递 → 主 Agent 置 doing → subagent(taskboard-worker) → 子 Agent 写文件 → 主 Agent read 复核 → done + result（**77 秒**） | PASS | `step5-01..03.png`、`step6-board-final.png`、`transcript-0a81.txt`、`transcript-worker-af04b22a.jsonl` |
+| 6 | 回归：派发给下拉带模式名、头部派发对象可读、角标出现/消失、console 无错 | PASS | `regress-target-select-value.png`、`regress-board-header.png`、`regress-console.json` |
+
+关键对账（e2e）：
+
+```
+board.json t-3: todo → poll.lastDispatchSessionId=session-0a81… → 会话出现【任务看板 · 待开始】
+transcript-0a81: taskboard_update(doing) → subagent(prompt=…) → read 复核 → taskboard_update(done, result)
+transcript-worker-af04b22a: header.agentPreset=taskboard-worker, header.parentSession=0a81…
+文件证据: .dev/e2e/hello.txt = 6 字节 68 65 6c 6c 6f 0a（"hello\n"）
+```
+
+## 3. 复跑方式
+
+```powershell
+cd C:\Users\duan\Code\dsh-taskboard
+node --test
+node .dev\verify-rpc.mjs http://127.0.0.1:3099
+# 端到端：.dev/e2e/ 下的 Playwright 脚本（step1~step6）按顺序跑，需 3099 实例在线
+```
+
+## 4. 已知限制
+
+- 自动派发优先选「派单看板模式」的空闲会话，没有才退化到任意空闲会话；没有在线会话时不派发（页面顶部显示跳过原因）。
+- 看板是单机单文件（`$DSH_HOME/storages/dsh-taskboard/board.json`），未做跨进程锁；同一 `$DSH_HOME` 下同时跑两个 dsh 实例会共享同一块看板。
+- 轮询投递的消息以普通 user 消息进入会话（`source.kind='user'`），transcript 里会像用户发言；这是为了会话日志一定可解码。

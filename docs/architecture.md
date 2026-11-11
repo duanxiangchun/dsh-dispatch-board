@@ -194,7 +194,9 @@ Content-Type: application/json
 ```
 
 `agents[].title`：会话头里的标题（未命名时为空串，client 回退到 sessionId 尾 8 位）。
-`agents[].preset`：`session.header.agentPreset`，client 用它在「派发给」下拉里附模式名。
+`agents[].preset`：**`ctx.get('agentPresets').presetForSession(agent.session)`**（Session 的 agentPreset 投影，
+反映创建后切换过的模式；`session.header.agentPreset` 只是创建时的值，实测新建派单模式会话后仍是 `standard`，不能用作判据）。
+client 用它在「派发给」下拉里附模式名。
 
 ### 3.3 错误码
 

@@ -748,3 +748,40 @@ test('BoardPage：snapshot 为空对象时降级渲染（四列空态，不抛�
   const code = collect(tree).find((node) => node.type === 'code')
   assert.equal(textOf(code), '')
 })
+test('BoardPage：派发给下拉带模式名与 id 尾 8 位', async () => {
+  const snapshot = makeSnapshot({
+    preset: {
+      installed: true,
+      path: 'bundle:presets/taskboard.patch.yml',
+      broken: '',
+      presets: [
+        { id: 'taskboard-dispatch', name: '派单看板模式', broken: '' },
+        { id: 'taskboard-worker', name: '派单看板模式 · 执行者', broken: '' },
+      ],
+    },
+    agents: [
+      {
+        sessionId: 'session-aaaaaaaa-bbbb-cccc-dddd-eeff00112233',
+        title: '',
+        status: 'idle',
+        preset: 'taskboard-dispatch',
+      },
+      { sessionId: 'session-11111111-2222-3333-4444-555566667777', title: '普通会话', status: 'running', preset: 'standard' },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+  const selects = collect(tree).filter((node) => node.type === 'select')
+  const targetSelect = selects[1]
+  const optionTexts = collect(targetSelect)
+    .filter((node) => node.type === 'option')
+    .map((node) => textOf(node))
+  assert.ok(
+    optionTexts.includes('00112233 · 派单看板模式'),
+    'untitled dispatcher session should show id tail + mode name, got: ' + JSON.stringify(optionTexts),
+  )
+  assert.ok(
+    optionTexts.includes('普通会话 · running'),
+    'standard-mode titled session keeps title/status and adds no unknown mode, got: ' + JSON.stringify(optionTexts),
+  )
+})

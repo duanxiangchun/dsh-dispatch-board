@@ -107,6 +107,7 @@ node --test
 
 - 契约（RPC 端点 / 任务状态机 / 快照字段 / 模式声明）：[`docs/architecture.md`](docs/architecture.md)
 - RPC 探针：`node .dev/verify-rpc.mjs http://127.0.0.1:3099`（33 项断言，含错误分支）
+- 验证记录（自动化 + 端到端闭环证据）：[`docs/verification.md`](docs/verification.md)
 - 浏览器端调查（slot / RPC / 主题变量）：[`docs/client-notes.md`](docs/client-notes.md)
 - Host 端调查：[`docs/host-notes.md`](docs/host-notes.md)
 - 预设调查：[`docs/preset-notes.md`](docs/preset-notes.md)
