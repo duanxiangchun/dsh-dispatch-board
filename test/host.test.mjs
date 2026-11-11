@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   BoardError,
@@ -23,6 +26,9 @@ import {
   normalizeConfig,
   notifyCooldownMs,
   parseRpcEnvelope,
+  resolveSessionCwd,
+  resolveSessionCwdViaQuery,
+  tick,
   resolveTargetAgent,
   selectDispatchCandidate,
 } from '../lib/index.js'
@@ -361,4 +367,201 @@ test('resolveTargetAgent prefers an idle dispatcher-mode session', () => {
   const fallback = resolveTargetAgent({ get: () => undefined, roots: () => [standard, busyDispatcher] })
   assert.equal(fallback.agent, standard)
   assert.equal(fallback.reason, 'recent-root')
+})
+test('resolveTargetAgent routes a task back to its creating conversation', () => {
+  const creator = { id: 'creator', status: 'idle' }
+  const other = { id: 'other', status: 'idle' }
+
+  const resolved = resolveTargetAgent({ get: (id) => (id === 'creator' ? creator : undefined), roots: () => [other] }, { sessionId: 'creator' })
+  assert.equal(resolved.agent, creator)
+  assert.equal(resolved.reason, 'creator-session')
+
+  // 创建它的对话正在跑：等它空下来，不改派别的会话
+  const busyCreator = { id: 'creator', status: 'running' }
+  const waiting = resolveTargetAgent({ get: () => busyCreator, roots: () => [other] }, { sessionId: 'creator' })
+  assert.equal(waiting.agent, null)
+  assert.equal(waiting.reason, 'creator-busy')
+
+  // 创建它的对话不在线：默认等它（不乱派到别的工作区），手动「立即派发」才退化
+  const waitingCold = resolveTargetAgent({ get: () => undefined, roots: () => [other] }, { sessionId: 'creator' })
+  assert.equal(waitingCold.agent, null)
+  assert.equal(waitingCold.reason, 'creator-cold')
+  const forced = resolveTargetAgent({ get: () => undefined, roots: () => [other] }, { sessionId: 'creator' }, () => '', { force: true })
+  assert.equal(forced.agent, other)
+  assert.equal(forced.reason, 'recent-root')
+
+  // 没有创建会话信息的任务走原来的自动挑法
+  assert.equal(resolveTargetAgent({ get: () => undefined, roots: () => [other] }, {}).agent, other)
+})
+
+test('resolveSessionCwd reads the live agent or the live session header', () => {
+  const header = { cwd: 'C:\\work\\demo' }
+  assert.equal(
+    resolveSessionCwd({ get: (name) => (name === 'agents' ? { get: () => ({ session: { header } }) } : undefined) }, 's1'),
+    'C:\\work\\demo',
+  )
+  assert.equal(
+    resolveSessionCwd({ get: (name) => (name === 'sessions' ? { get: () => ({ header }) } : undefined) }, 's1'),
+    'C:\\work\\demo',
+  )
+  assert.equal(resolveSessionCwd({ get: () => undefined }, 's1'), null)
+  assert.equal(resolveSessionCwd({ get: () => undefined }, ''), null)
+  assert.equal(resolveSessionCwd(undefined, 's1'), null)
+})
+test('tick dispatches around a busy creator instead of being blocked by it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-tick-'))
+  try {
+    const state = createEmptyBoard()
+    const busyTask = addTask(state, { title: 'busy creator task', sessionId: 'creator-busy' }, NOW)
+    const idleTask = addTask(state, { title: 'idle task' }, NOW + 1)
+
+    const delivered = []
+    const idleAgent = {
+      id: 'agent-idle',
+      status: 'idle',
+      session: { id: 'agent-idle', header: { cwd: 'C:\\work' } },
+      followup: (message) => delivered.push(message),
+    }
+    const busyAgent = {
+      id: 'creator-busy',
+      status: 'running',
+      session: { id: 'creator-busy', header: {} },
+      followup: () => {
+        throw new Error('must not dispatch to a running creator')
+      },
+    }
+    const agents = {
+      get: (id) => (id === 'creator-busy' ? busyAgent : undefined),
+      roots: () => [idleAgent],
+    }
+    const rt = {
+      ctx: { get: (name) => (name === 'agents' ? agents : undefined) },
+      state,
+      filePath: join(dir, 'board.json'),
+      poll: { running: true, lastRunAt: null, lastDispatchAt: null, lastDispatchSessionId: null, lastSkipReason: null },
+      timer: null,
+      polling: false,
+    }
+
+    const result = await tick(rt, {})
+    assert.equal(result.dispatched, true)
+    assert.equal(result.task.id, idleTask.id)
+    assert.equal(delivered.length, 1)
+    assert.match(delivered[0].content[0].text, /idle task/)
+    // 创建者忙的那条：不派，但留下可读原因，且通知次数不增加
+    assert.match(busyTask.lastError, /创建这条任务的对话正在运行/)
+    assert.equal(busyTask.notificationCount, 0)
+    assert.equal(idleTask.notificationCount, 1)
+    // 创建时没有 cwd 的任务，投递前从目标会话补上工作区
+    assert.equal(idleTask.cwd, 'C:\\work')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+test('resolveSessionCwdViaQuery finds a cold session cwd from sessionQuery', async () => {
+  const query = {
+    listSessions: async () => [
+      { header: { id: 's-cold', cwd: 'C:\\old\\place' } },
+      { header: { id: 's-other', cwd: 'C:\\other' } },
+    ],
+  }
+  assert.equal(await resolveSessionCwdViaQuery({ get: (name) => (name === 'sessionQuery' ? query : undefined) }, 's-cold'), 'C:\\old\\place')
+  assert.equal(await resolveSessionCwdViaQuery({ get: () => query && query }, 'missing'), null)
+  assert.equal(await resolveSessionCwdViaQuery({ get: () => undefined }, 's-cold'), null)
+  assert.equal(await resolveSessionCwdViaQuery({ get: () => ({ listSessions: async () => { throw new Error('boom') } }) }, 's-cold'), null)
+  assert.equal(await resolveSessionCwdViaQuery(undefined, 's-cold'), null)
+})
+test('tick revives a cold creator session so the task goes back to that conversation', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-revive-'))
+  try {
+    const state = createEmptyBoard()
+    const creatorId = 'session-cold'
+    addTask(state, { title: 'cold task', sessionId: creatorId }, NOW)
+
+    const delivered = []
+    let live
+    const revived = {
+      id: creatorId,
+      status: 'idle',
+      session: { id: creatorId, header: { cwd: 'C:\\cold\\ws' } },
+      followup: (message) => delivered.push(message),
+    }
+    const agents = {
+      get: (id) => (id === creatorId ? live : undefined),
+      roots: () => (live ? [live] : []),
+    }
+    let resolveCalls = 0
+    const controller = {
+      resolveAgent: async (id) => {
+        resolveCalls += 1
+        if (id !== creatorId) return { error: { code: 'session/not-found' } }
+        live = revived
+        return { agent: revived }
+      },
+    }
+    const rt = {
+      ctx: {
+        get: (name) => (name === 'agents' ? agents : name === 'sessionController' ? controller : undefined),
+      },
+      state,
+      filePath: join(dir, 'board.json'),
+      poll: { running: true, lastRunAt: null, lastDispatchAt: null, lastDispatchSessionId: null, lastSkipReason: null },
+      reviveFailures: new Map(),
+    }
+
+    const result = await tick(rt, {})
+    assert.equal(result.dispatched, true)
+    assert.equal(result.sessionId, creatorId)
+    assert.equal(resolveCalls, 1)
+    assert.equal(delivered.length, 1)
+    // 唤醒后补上目标会话的工作区
+    assert.equal(state.tasks[0].cwd, 'C:\\cold\\ws')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('tick caches a failed revive and falls back instead of retrying every tick', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-revive-fail-'))
+  try {
+    const state = createEmptyBoard()
+    addTask(state, { title: 'cold task', sessionId: 'session-gone' }, NOW)
+    const fallback = { id: 'idle-agent', status: 'idle', session: { id: 'idle-agent', header: {} }, followup: () => {} }
+    const agents = { get: () => undefined, roots: () => [fallback] }
+    let resolveCalls = 0
+    const controller = {
+      resolveAgent: async () => {
+        resolveCalls += 1
+        return { error: { code: 'session/not-found' } }
+      },
+    }
+    const rt = {
+      ctx: {
+        get: (name) => (name === 'agents' ? agents : name === 'sessionController' ? controller : undefined),
+      },
+      state,
+      filePath: join(dir, 'board.json'),
+      poll: { running: true, lastRunAt: null, lastDispatchAt: null, lastDispatchSessionId: null, lastSkipReason: null },
+      reviveFailures: new Map(),
+    }
+
+    // 第一次：唤醒失败 → 不派到别的工作区，留在 todo 并给出原因
+    const first = await tick(rt, {})
+    assert.equal(first.dispatched, false)
+    assert.equal(first.reason, 'creator-cold')
+    assert.equal(resolveCalls, 1)
+    assert.match(state.tasks[0].lastError, /还没激活/)
+
+    // 第二次 tick 仍在负缓存窗口内：不再重复唤醒
+    const second = await tick(rt, {})
+    assert.equal(second.dispatched, false)
+    assert.equal(resolveCalls, 1)
+
+    // 手动「立即派发」（force）才退化到空闲会话
+    const forced = await tick(rt, { taskId: state.tasks[0].id, force: true })
+    assert.equal(forced.dispatched, true)
+    assert.equal(forced.sessionId, 'idle-agent')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

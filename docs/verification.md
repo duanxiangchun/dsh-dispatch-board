@@ -61,9 +61,31 @@ transcript-worker-af04b22a: header.agentPreset=taskboard-worker, header.parentSe
 用户反馈「派发给很多余，完全就是主 Agent 全自动」。已按此调整：
 
 - 看板新建区删掉会话选择器，只留「加备注」+ 一句「加进『待开始』后由主 Agent 自动接手」；
-- 宿主 `resolveTargetAgent` 不再读 `task.sessionId`（它只作为「创建来源」元信息保留），
-  永远按「派单模式空闲会话 → 任意空闲会话」挑目标；
-- `add-task` RPC 不再使用 sessionId；单测相应改为「忽略 task.sessionId」。
+- 宿主 `resolveTargetAgent` 不再需要用户选会话，按「派单模式空闲会话 → 任意空闲会话」自动挑目标；
+- `add-task` RPC 不需要 sessionId；测试相应改为「无目标选择器也能派发」。
+
+## 2.3 工作区绑定（后续修订，回答「是不是当前对话的工作区」）
+
+原行为（本节之前）：看板全局、任务不记录工作区、派给「最近空闲会话」——**不保证**是你当前对话的工作区。
+现行为：右栏 tab 是 session scope，新建任务时把 `props.sessionId` 交给 `add-task`，宿主用
+`session.header.cwd` 解析出工作区写进 `task.cwd`：
+
+- 任务**优先派回创建它的对话**（`creator-session`），子 Agent 在同一工作区干活；
+- 创建它的对话**正忙** → 等（`creator-busy`），不改派；手动「立即派发」可排队；
+- 创建它的对话**是历史/冷会话** → 先尝试唤醒它（`sessionController.resolveAgent`，5 分钟失败负缓存）；
+  唤醒不了则任务**留在待开始**并显示 `creator-cold` 原因（不在别的工作区干活），
+  只有手动「立即派发」才退化到派单模式/任意空闲会话；
+- 一次轮询逐条试候选，忙会话不阻塞其它任务；
+- 冷会话的 `cwd` 用 `sessionQuery.listSessions()` 兜底解析，所以历史会话的提示/卡片也能显示工作区。
+
+验证：`.dev/e2e/workspace-binding-report.md`（6/6 PASS）。
+
+## 2.4 冷会话（历史会话）边界
+
+`.dev/e2e/cold-session-report.md`：冷会话加任务 → 卡片/数据带工作区（`sessionQuery` 兜底）、
+90s 保持待开始且显示 `creator-cold` 原因（不改派）、「立即派发」可强制改派并完成（3 PASS）；
+「在历史会话发消息激活后回派」未自动化覆盖（headless 提交消息不可靠），但该路径 = 正常
+`creator-session` 分支（2.3 已覆盖）。`session-info` 端点让冷会话的 composer 提示也能显示工作区。
 
 验证（verifier，`.dev/e2e/auto-dispatch-report.md`）：**4/4 PASS**
 

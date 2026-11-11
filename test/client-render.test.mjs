@@ -669,12 +669,18 @@ test('BoardTabTitle：优先用宿主 tab 标题，缺省/抛错时退回「任�
  * 用例：BoardTab —— 窄栏（默认，无 ResizeObserver）
  * ══════════════════════════════════════════════════════════════ */
 
-function renderNarrow(BoardTab) {
-  return renderComponent(BoardTab, { useTabInfo: () => ({ sidebar: { fullscreen: false } }) })
+function renderNarrow(BoardTab, extraProps = {}) {
+  return renderComponent(
+    BoardTab,
+    Object.assign({ useTabInfo: () => ({ sidebar: { fullscreen: false } }) }, extraProps),
+  )
 }
 
-function renderWide(BoardTab) {
-  return renderComponent(BoardTab, { useTabInfo: () => ({ sidebar: { fullscreen: true } }) })
+function renderWide(BoardTab, extraProps = {}) {
+  return renderComponent(
+    BoardTab,
+    Object.assign({ useTabInfo: () => ({ sidebar: { fullscreen: true } }) }, extraProps),
+  )
 }
 
 test('BoardTab（窄栏）：无 ResizeObserver 时用 .tb-lanes 纵向 lane，任务/字段/按钮齐全', async () => {
@@ -683,6 +689,7 @@ test('BoardTab（窄栏）：无 ResizeObserver 时用 .tb-lanes 纵向 lane，�
   const { tree, instance } = await renderNarrow(BoardTab)
 
   assert.equal(tree.props['data-narrow'], 'true', 'narrow lane layout expected without ResizeObserver')
+  assert.equal(tree.props['data-layout'], 'narrow', 'narrow layout is published for CSS')
   assert.equal(nodesWithClass(tree, 'tb-lanes').length, 1, 'narrow uses .tb-lanes')
   assert.equal(nodesWithClass(tree, 'tb-board').length, 0, 'narrow must not render the four-column board')
 
@@ -767,6 +774,7 @@ test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boar
   const { tree } = await renderWide(BoardTab)
 
   assert.equal(tree.props['data-narrow'], 'false', 'fullscreen must use the wide layout')
+  assert.equal(tree.props['data-layout'], 'wide', 'fullscreen publishes the wide layout')
   assert.equal(nodesWithClass(tree, 'tb-board').length, 1, 'wide uses .tb-board')
   assert.equal(nodesWithClass(tree, 'tb-lanes').length, 0, 'wide must not render narrow lanes')
 
@@ -794,6 +802,109 @@ test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boar
   assert.equal(selects[0].props['aria-label'], undefined)
   assert.ok(!includesText(tree, '派发给'), 'dispatch-target selector must be gone')
   assert.ok(includesText(tree, '加进「待开始」后由主 Agent 自动接手'), 'composer shows the auto hint instead')
+})
+
+/* ══════════════════════════════════════════════════════════════
+ * 用例：会话绑定（sessionId）与工作区提示 / 卡片 tag
+ * ══════════════════════════════════════════════════════════════ */
+
+function composerInput(tree) {
+  return collect(tree).find((node) => node.type === 'input' && node.props.className === 'tb-input')
+}
+
+function submitButton(tree) {
+  return buttons(tree).find((node) => textOf(node).trim() === '添加到待开始')
+}
+
+/** 输入标题 → 重渲染 → 点「添加到待开始」→ 等 RPC 落地。 */
+async function addTaskByUi(BoardTab, initialProps, titleValue) {
+  const rendered = await renderNarrow(BoardTab, initialProps)
+  const input = composerInput(rendered.tree)
+  assert.ok(input, 'composer input must render')
+  input.props.onChange({ target: { value: titleValue } })
+  const filled = await rendered.instance.run()
+  const submit = submitButton(filled)
+  assert.ok(submit, 'submit button must render')
+  assert.equal(submit.props.disabled, false, 'submit becomes enabled once the title is non-empty')
+  submit.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  return rendered
+}
+
+test('BoardTab：新建任务把当前会话 sessionId 带进 add-task payload', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  await addTaskByUi(harness.componentOf('sidebar.right.pane.tab'), { sessionId: 'session-abc' }, '把任务绑定到本对话')
+
+  const addCall = harness.rpcCalls.find((call) => call.endpoint === 'add-task')
+  assert.ok(addCall, 'clicking 添加到待开始 must call add-task')
+  assert.equal(addCall.channel, '/taskboard')
+  // payload 由 vm 沙箱里的组件创建，跨 realm 对象先拷回本 realm 再比较
+  assert.deepEqual(Object.assign({}, addCall.payload), { title: '把任务绑定到本对话', sessionId: 'session-abc' })
+})
+
+test('BoardTab：没有 sessionId 时 add-task payload 不带会话绑定', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  await addTaskByUi(harness.componentOf('sidebar.right.pane.tab'), undefined, '普通任务')
+
+  const addCall = harness.rpcCalls.find((call) => call.endpoint === 'add-task')
+  assert.ok(addCall)
+  assert.deepEqual(Object.assign({}, addCall.payload), { title: '普通任务' })
+  assert.equal(Object.prototype.hasOwnProperty.call(addCall.payload, 'sessionId'), false)
+})
+
+test('BoardTab：当前会话有 cwd 时新建提示写工作区名，否则退回通用提示', async () => {
+  const snapshot = makeSnapshot({
+    agents: [
+      { sessionId: 'session-abc', status: 'running', cwd: 'C:\\Users\\duan\\Code\\demo\\demo\\日常问答' },
+      { sessionId: 'session-other', status: 'idle', cwd: 'C:\\work\\demo' },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const BoardTab = harness.componentOf('sidebar.right.pane.tab')
+
+  const matched = await renderNarrow(BoardTab, { sessionId: 'session-abc' })
+  const matchedHint = nodesWithClass(matched.tree, 'tb-hint')
+  assert.equal(matchedHint.length, 1, 'composer must render exactly one hint')
+  assert.ok(includesText(matchedHint[0], '工作区：日常问答'), 'hint should name the current workspace')
+  assert.ok(includesText(matchedHint[0], '任务会回到本对话执行'))
+
+  const unmatched = await renderNarrow(BoardTab, { sessionId: 'session-missing' })
+  const unmatchedHint = nodesWithClass(unmatched.tree, 'tb-hint')
+  assert.equal(unmatchedHint.length, 1)
+  assert.ok(includesText(unmatchedHint[0], '你只管加任务和看结论'), 'unknown session keeps the generic hint')
+  assert.ok(!includesText(unmatchedHint[0], '工作区：'), 'generic hint must not name a workspace')
+
+  const noSession = await renderNarrow(BoardTab)
+  const noSessionHint = nodesWithClass(noSession.tree, 'tb-hint')
+  assert.equal(noSessionHint.length, 1)
+  assert.ok(includesText(noSessionHint[0], '你只管加任务和看结论'))
+
+  // 会话匹配但 agent 没有 cwd（或 cwd 为空）→ 仍退回通用提示
+  const noCwdSnapshot = makeSnapshot({
+    agents: [{ sessionId: 'session-abc', status: 'running', cwd: '' }],
+  })
+  const noCwdHarness = createHarness({ snapshot: noCwdSnapshot })
+  const noCwd = await renderNarrow(noCwdHarness.componentOf('sidebar.right.pane.tab'), { sessionId: 'session-abc' })
+  assert.ok(includesText(nodesWithClass(noCwd.tree, 'tb-hint')[0], '你只管加任务和看结论'))
+})
+
+test('BoardTab：任务带 cwd 时卡片出现「工作区 demo」tag，title 为完整路径', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      { id: 't-1', title: '写冒烟测试', status: 'todo', cwd: 'C:\\work\\demo', updatedAt: minutesAgo(2) },
+      { id: 't-2', title: '没有工作区的任务', status: 'todo', updatedAt: minutesAgo(2) },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'))
+
+  const workspaceTags = nodesWithClass(tree, 'tb-card-tag').filter((node) => textOf(node).includes('工作区'))
+  assert.equal(workspaceTags.length, 1, 'only the task with cwd carries a workspace tag')
+  assert.equal(textOf(workspaceTags[0]), '工作区 demo')
+  assert.equal(workspaceTags[0].props.title, 'C:\\work\\demo')
+
+  const titles = nodesWithClass(tree, 'tb-card-title').map((node) => textOf(node))
+  assert.deepEqual(titles, ['写冒烟测试', '没有工作区的任务'], 'both tasks still render their titles')
 })
 
 /* ══════════════════════════════════════════════════════════════

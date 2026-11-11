@@ -70,15 +70,29 @@ README.md               Lead：安装 / 使用 / 排障
 
 ### 1.4 目标 Agent 解析
 
-**全自动，不需要用户选会话**（v0.1.0 修订：UI 的「派发给」下拉已移除）。解析顺序：
+**全自动，不需要用户选会话**；同时**任务绑定创建它的对话与工作区**。解析顺序：
 
-1. 在 `ctx.agents.roots()` 的空闲 Agent 里优先挑 `session.header.agentPreset === 'taskboard-dispatch'`
-   的最近一个（避免「打开 Web UI 自动生成的空白标准模式会话」抢走任务）；
-2. 没有派单模式会话 → 退化为最近注册的空闲 root Agent（普通模式也能接任务）；
-3. 都没有（没有任何空闲会话）→ 本轮跳过，UI 显示跳过原因（`agent-busy` / `no-live-agent`）。
+1. 任务带 `sessionId`（从某个对话的右栏加的）且该会话在线：
+   - 会话空闲 → **派回创建它的那个对话**（`creator-session`），子 Agent 在同一个工作区里干活；
+   - 会话正在跑 → 本轮跳过（`creator-busy`），**绝不改派别的会话**，等它空下来；
+   - 用户手动点「立即派发」（`force`）时例外：即使它正忙，也把消息排进它的下一轮。
+2. 创建它的会话没有 live agent（历史/冷会话）→ 先尝试**唤醒它**：Web 端走
+   `ctx.get('sessionController').resolveAgent(sessionId)`（与 UI 打开会话时的物化同一路径，带并发去重）。
+   成功就按第 1 步回派；失败（实测历史会话被 UI 持有 writer 时会返回 `session/writer-held`）记 5 分钟负缓存；
+3. 唤醒不成功 → **本轮不派**（`creator-cold`）：任务留在待开始并显示
+   「创建这条任务的对话还没激活（历史会话）：在那边发一条消息，任务就会回到该对话执行；急的话点『立即派发』」。
+   **绝不**把工作区绑定的任务偷偷派到别的会话/工作区；
+4. 只有手动「立即派发」（`force`）才允许退化：优先 `session.header.agentPreset === 'taskboard-dispatch'`
+   的空闲 root Agent，再退化到最近注册的空闲 root Agent；
+5. 都没有（没有任何空闲会话）→ 本轮跳过，UI 显示跳过原因（`agent-busy` / `no-live-agent`）。
 
-任务上的 `sessionId` 只是「哪个会话创建的」这条元信息（`taskboard_add` 会记调用者的会话），
-**不参与路由**——没有任何配置能让用户把某个任务钉到某个会话。
+一次轮询会**逐条**试候选任务：某个任务的目标会话正忙时跳过它继续看下一条，
+不会让「一个忙会话」挡住整列任务（每个任务按自己的创建者判断）。
+
+`task.sessionId` = 创建这条任务的对话（决定默认派发归属）；`task.cwd` = 该对话的工作区。
+三个解析时机：`add-task` 时先查 live Agent/Session 的 `header.cwd`；查不到用
+`sessionQuery.listSessions()` 从会话列表兜底（冷会话也能拿到）；仍没有就在投递前从目标会话补一次。
+`cwd` 会写进派发文本的「工作目录」一行，也是卡片上「工作区 X」tag 的来源。
 
 注意：子 Agent 不是 root，`roots()` 天然不含它们，不需要额外过滤。
 
@@ -107,7 +121,7 @@ README.md               Lead：安装 / 使用 / 排障
       "note": "验收标准：…",     // 可空串
       "status": "todo",          // todo | doing | done | archived
       "source": "user",          // user | agent | poller
-      "sessionId": "…" | null,   // 创建来源会话（仅元信息，不参与派发路由）
+      "sessionId": "…" | null,   // 创建这条任务的对话（决定默认派发归属）
       "cwd": "C:\\…" | null,
       "assignee": "…",           // 子 Agent 的 label / sessionId，主 Agent 填
       "result": "…",             // 审核结论 / 子 Agent 汇报摘要
@@ -151,12 +165,13 @@ Content-Type: application/json
 | endpoint | payload | value | 说明 |
 | --- | --- | --- | --- |
 | `snapshot` | `{}` | `Snapshot` | 全量看板 + 运行时状态，client 每 2s 轮一次 |
-| `add-task` | `{title, note?}` | `{task}` | 新建到 `todo`，`source='user'`；派发目标由宿主自动决定（不接受 sessionId） |
+| `add-task` | `{title, note?, sessionId?}` | `{task}` | 新建到 `todo`，`source='user'`；`sessionId` = 创建它的对话（右栏 tab 自带），宿主据此解析 `cwd` 并决定派发归属 |
 | `update-task` | `{id, status?, title?, note?, result?, assignee?, lastError?}` | `{task}` | 局部更新；非法状态迁移 → `conflict` |
 | `delete-task` | `{id}` | `{deleted:true,id}` | 物理删除（仅限 UI 手动） |
 | `dispatch-now` | `{id}` | `{dispatched, sessionId, task}` | 立即投递一次（不等轮询、无视冷却） |
 | `set-config` | `{pollEnabled?, pollIntervalMs?}` | `{config}` | 开关/间隔 |
 | `archive-done` | `{}` | `{archived:n}` | 一键把全部 `done` 归档 |
+| `session-info` | `{sessionId}` | `{sessionId, cwd}` | 给 client 兜底：冷会话（历史会话）不在 `agents[]` 里时也能拿到工作区，用于提示文案 |
 | `install-preset` | `{}` | `PresetStatus + {action:'none'}` | **兼容端点**：0.2.2 起模式随 bundle patch 声明，这里只强制刷新 registry 状态 |
 
 ### 3.2 `Snapshot` 形状
@@ -176,7 +191,7 @@ Content-Type: application/json
     "lastDispatchSessionTitle": "…" | null,  // 会话标题（有则优先展示）
     "lastSkipReason": "no-live-agent" | "agent-busy" | "cooldown" | "poll-disabled" | null
   },
-  "agents": [                               // 在线会话快照（诊断/调试用；UI 不再提供会话选择器）
+  "agents": [                               // 在线会话快照（client 用它显示「当前工作区」提示；不提供会话选择器）
     { "sessionId": "…", "status": "idle"|"running", "cwd": "…"|null, "title": "…"|null,
       "preset": "taskboard-dispatch"|"standard"|…|null, "root": true }
   ],
@@ -322,11 +337,15 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
    - `Snapshot.preset.broken` 非空 → 红色 banner 显示挂载诊断；
    - `Snapshot.preset.installed === false` → 黄色 banner 显示原因（没有 agentPresets 服务 / 名单里没有本模式）。
 2. **新建任务行**：输入框（Enter 提交）+ 备注展开（可选）+ 「添加到待开始」按钮；
-   下方一行只有「加备注」链接和一句提示「加进『待开始』后由主 Agent 自动接手」——
-   **没有「派发给」选择器**（派发全自动，产品决策）。
+   下方一行只有「加备注」链接和一句提示——**没有「派发给」选择器**（派发全自动，产品决策）：
+   - 本会话在 `agents[]` 里能查到 cwd → 「…任务会回到本对话执行（工作区：name）。」
+   - 查不到（冷会话/历史会话）→ 挂载时调一次 `session-info` 拿 cwd，同样显示工作区；
+   - 实在拿不到 → 通用文案「…你只管加任务和看结论。」
+   新建时把 `props.sessionId` 一并交给 `add-task`，决定这条任务的归属。
 3. **看板主体**（布局见上）：待开始（蓝）/ 进行中（黄）/ 已完成（绿）/ 已归档（灰）。
    - 每块头部：列名 + 计数 + 快捷动作（待开始：`全部派发`；已完成：`全部归档`）。
-   - 卡片：标题、备注（两行截断，hover title 展开）、`#t-3`、相对时间、assignee、result、
+   - 卡片：标题、备注（两行截断，hover title 展开）、`#t-3`、工作区 tag（`task.cwd` 尾段，title 为完整路径）、
+     相对时间、assignee、result、
      `lastError`（红色小字，状态变更时自动清空）。
    - 卡片动作（按状态）：
      - todo：`开始`（→doing）、`立即派发`（`dispatch-now`）、`编辑`、`删除`
@@ -408,6 +427,7 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 | --- | --- |
 | 右栏 tab 契约（tab 类型/keyed 正文/`useTabInfo`）与官方示例不一致 | 已从安装包源码取证（`sidebar-right/lib/types/client/*`、`sidebar-right` 自身与 `ui-deliverables`/`ui-sidebar-files` 的注册实现），e2e 用真实页面复核 |
 | 用户环境没启用右侧栏（非 web-app 部署 / 关闭了 ui-sidebar-right） | 服务缺失时插件不崩：header 按钮点击只在 console 警告；body 注册由 slots.inject 等待 |
+| 创建任务的对话是历史会话（无 live agent），且被 UI 持有 writer 无法唤醒 | 任务留在待开始并显示 `creator-cold` 原因；用户在那边发条消息即可回派；手动「立即派发」是唯一逃生口 |
 | 第三方 bundle 声明 preset 的行为与官方是否一致（无官方先例） | 已在 0.2.2-rc.1 实测：两条声明行都出现在 `agentPresets.list()`，`broken` 为空；`dsh --dump-config` 可见两行 |
 | `agent.followup()` 的 UserMessage 手工构造被会话解码器拒绝（source.kind 未知） | 用 `{kind:'user'}` 构造，不发明新 kind；e2e 必须验证「重启后会话可恢复」 |
 | 轮询把用户手动对话打断 | 只在 idle 投递；每轮最多 1 条；冷却 + 上限 |
@@ -420,6 +440,11 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 - v0.1.0（首个版本）：看板 + 轮询派单 + 两个模式声明（dispatch / worker）+ 三个模型工具。
   预设机制已按 0.2.2 的 bundle-patch 声明式实现（`presets/taskboard.patch.yml`），不再写
   `$DSH_HOME/.agent-presets` 目录。
+- v0.1.0 修订（冷会话兜底）：`session-info` 端点 + `sessionQuery` 解析冷会话 cwd；派发前尝试
+  `sessionController.resolveAgent` 唤醒创建者，唤醒不了就停在待开始（`creator-cold`）不改派，
+  只有「立即派发」是逃生口。
+- v0.1.0 修订（工作区绑定）：任务在右栏创建时记录 `sessionId`/工作区，轮询优先派回创建它的对话
+  （忙则等、关掉才退化）；一次轮询逐条试候选，忙会话不再挡住整列；卡片显示工作区 tag。
 - v0.1.0 修订：看板从左侧面板（`sidebar.panellist` + `main`）迁到**右侧栏 tab**
   （`sidebarRightTabs` + `sidebar.right.pane.tab`），入口按钮放会话 header；窄栏纵向 lane、
   宽栏/全屏四列；左侧菜单不再有看板项。

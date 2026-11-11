@@ -150,7 +150,13 @@ async function runChecks(initial) {
   const preset = await call('install-preset')
   check('install-preset 兼容端点只刷新状态', preset.result.value && preset.result.value.action === 'none' && preset.result.value.installed === true, preset.result.value)
 
-  console.log('6) 非法端点')
+  console.log('6) session-info（冷会话工作区兜底）')
+  const info = await call('session-info', { sessionId: 'session-not-a-real-id' })
+  check('session-info 未知会话返回 cwd=null', info.result.ok && info.result.value.cwd === null)
+  const infoEmpty = await call('session-info', {})
+  check('session-info 空参数不崩', infoEmpty.result.ok && infoEmpty.result.value.cwd === null)
+
+  console.log('7) 非法端点')
   await expectError('nope', {}, 'bad-request')
 
   console.log('')
