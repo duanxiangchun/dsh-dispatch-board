@@ -1,0 +1,23 @@
+const { chromium } = require('playwright');
+const TARGET = process.env.TARGET_URL;
+const OUT = process.env.OUT_DIR;
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const ctx = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
+  const page = await ctx.newPage();
+  page.on('pageerror', e => console.log('[pageerror]', e.message));
+  page.on('console', m => { if (m.type() === 'error') console.log('[console.error]', m.text().slice(0,300)); });
+  const resp = await page.goto(TARGET, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  console.log('status:', resp && resp.status());
+  await page.waitForTimeout(7000);
+  console.log('title:', await page.title());
+  console.log('url:', page.url());
+  await page.screenshot({ path: OUT + '/shots/explore-01-home.png' });
+  const txt = await page.evaluate(() => document.body.innerText.slice(0, 4000));
+  console.log('=== BODY TEXT ===');
+  console.log(txt);
+  const btns = await page.evaluate(() => Array.from(document.querySelectorAll('button,[role=button],a')).slice(0,80).map(b => ({ tag: b.tagName, label: (b.getAttribute('aria-label')||'').slice(0,60), title: (b.getAttribute('title')||'').slice(0,40), text: (b.innerText||'').trim().slice(0,50), cls: (b.className||'').toString().slice(0,80) })));
+  console.log('=== BUTTONS ===');
+  console.log(JSON.stringify(btns, null, 1));
+  await browser.close();
+})().catch(e => { console.error('FATAL', e); process.exit(1); });

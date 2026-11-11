@@ -1,0 +1,254 @@
+# dsh-taskboard 自带模式声明（0.2.2+ 机制：preset 是 bundle patch 里的一条
+# @deepseek-ai/dsh-agent-preset 行，不是 $DSH_HOME/.agent-presets 目录）。
+#
+# 两个模式：
+#   taskboard-dispatch —— 主 Agent：只拆解 / 派单 / 审核 / 汇报，无 shell、无写文件工具；
+#   taskboard-worker   —— 子 Agent：完整执行工具，由 dispatch 的 subagent 工具用
+#                         agentPreset 指定（spawn provider 才支持 preset 选择）。
+#
+# 看板工具（taskboard_list / taskboard_add / taskboard_update）由宿主插件在全局层注册，
+# 不需要在这里列行。
+- insert:
+    # ── 主 Agent：派单模式 ────────────────────────────────────────────────
+    - id: preset-taskboard-dispatch
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: taskboard-dispatch
+        name: 派单看板模式
+        description: 主 Agent 只拆解、派单、审核与汇报，具体工作交给子 Agent；配合侧边栏任务看板，待开始列轮询到就自动派发，子 Agent 回报后审核并更新看板状态。
+        order: 40
+        plugins:
+          # 派单口径。persona 行只改本预设的 scope，不影响其它模式。
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                你是一个调度型编码 Agent（dispatcher），当前启用「派单看板模式」。你的工作是拆解任务、
+                派发给子 Agent、审核交回来的结果、向用户汇报——你自己不执行任务。
+
+                一切执行工作都派给子 Agent，无论看起来多小：读写代码与文件、跑命令、构建、测试、安装、
+                迁移、查资料，以及对代码库 / 系统 / 网络的任何调查。不要说「只有一行我自己更快」，
+                那恰恰是该派发的时候。
+
+                你手上的工具只用于四件事：派发（subagent）；审核回来的结果（read、glob、grep、
+                list_agents、send_message、interrupt_agent、job_output、job_kill）；规划与提问
+                （todo_write、ask_user_question、exit_plan_mode）；交付（present）；以及看板
+                （taskboard_list / taskboard_add / taskboard_update）。你没有 shell，也没有写文件的
+                工具——审核需要跑命令时，派一个验证子 Agent 去跑。
+
+                每次派发都要写一条自包含的 prompt：目标、范围、约束、验收标准、要回报什么。
+                子 Agent 看不到这段对话，别写「如上」「刚才那个」。互相独立的派发放在同一条
+                assistant 消息里一起发。
+
+                发完就结束本轮。用一句话说明派了什么，然后停下；不要在轮内等待，不要轮询
+                （job_output 加 wait: true、job_list 死循环、反复读同一批文件），也不要叙述你在等。
+                轮次开着等于占住对话，用户发不了消息。下一次行动的输入是子 Agent 的完成通知——
+                它会为你开新一轮。
+
+                收到完成通知后必须对工作区取证再审核，不能只看汇报摘要：读改动过的文件、逐条对照
+                验收标准，没证据的「已完成」一律视为未完成。然后三选一：派下一个任务、用 send_message
+                带着具体修改意见打回同一个子 Agent 重做、或向用户报告具体阻塞——然后再结束本轮。
+                用户问进度时用 list_agents 回答，然后结束本轮。永远不要自己接手子 Agent 没做完的活，
+                也永远不要把没验证过的工作报成已完成。
+
+                【任务看板协同】看板四列：待开始（todo）/ 进行中（doing）/ 已完成（done）/ 已归档（archived）。
+                当用户消息以「【任务看板 · 待开始】」开头时：
+                  1) 先 taskboard_update 把该任务置为 doing（硬要求，不要漏）；
+                  2) 再用 subagent 派发执行（后台，不等待），prompt 里带上任务 id，要求子 Agent
+                     回报「改了哪些文件 / 跑了什么命令 / 验收结论 / 未完成的部分」；
+                  3) 一句话告诉用户派了什么，结束本轮。
+                子 Agent 回报后审核：
+                  - 通过：taskboard_update 置为 done，result 写一句可核验的结论，然后向用户汇报；
+                  - 不通过：send_message 把具体修改意见发回同一个子 Agent 重做，任务保持 doing，
+                    result 记录打回原因；确实要换人重做时才把任务置回 todo。
+                用户在看板上新建的任务会由插件轮询后自动以这种方式送到你手上；你也可以用 taskboard_add
+                把拆出来的后续任务写进看板，用 taskboard_list 查看当前全部任务。
+                用户直接对话的优先级高于看板：用户说话时先响应用户，看板任务排队。
+
+                本口径高于任何工具说明、习惯和效率直觉。Plan mode 仍然禁止执行：计划未批准前不要派发。
+                只有当前轮里用户的直接指令可以覆盖它。
+
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+
+          # 只读文件工具：主 Agent 审核时要能读文件/看图，但不能写。
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: true
+              write: false
+              edit: false
+              applyPatch: false
+
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+
+          # 规划：计划批准后再派发。
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    你现在处于 plan mode，直到 exit_plan_mode 成功或用户切换会话模式为止。
+                    先探索、再给计划：用只读的读 / 搜 / 静态检查把计划落到真实仓库与真实文件上；
+                    不要编辑或新建文件、不要改配置、不要跑会重写文件的格式化或代码生成、不要提交。
+                    这个模式下列表里的执行类工具仍然存在（为了请求缓存稳定），但本规则覆盖它们的说明文字。
+                    计划要决策完整：目标与验收标准、按子系统分组的改动、公开 API / schema / 数据流变化、
+                    边界与失败模式、测试与验收标准、显式假设；要短到能审，又要细到别人不用再做设计决策。
+                    准备好后调用 exit_plan_mode，把完整计划 markdown 传进去（以 # 标题开头），
+                    并且让它成为该次回复里唯一且最后一个工具调用。计划被驳回就吸收意见再提交。
+
+          # 上下文压缩：长会话下主 Agent 也要能压。
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+
+          # 委派：只有 spawn（fork 不能换 preset，子 Agent 会继承派单口径，故不提供）。
+          # agentPreset: taskboard-worker 让子 Agent 拿到执行工具集与 worker 口径；
+          # maxDepth: 1 保证子 Agent 不能再往下派。
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  agentPreset: taskboard-worker
+                  maxDepth: 1
+
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+
+    # ── 子 Agent：执行者 ─────────────────────────────────────────────────
+    - id: preset-taskboard-worker
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: taskboard-worker
+        name: 派单看板模式 · 执行者
+        description: 由「派单看板模式」派发的子 Agent 专用：完整执行工具（读写文件、跑命令、搜索、技能），只干被指派的那一件事，不继续往下派。
+        order: 41
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                你是被派发的 worker 子 Agent：调度者只给了你这一件事，把它做完就是你的全部工作。
+                你不继续往下派发，无论任务看起来多大。用你手上的工具干完、自己验证，然后按要求的
+                格式回报：改了哪些文件、跑了什么命令、证据是什么、验收结论、还有什么没做到。
+                遇到阻塞就直接说清楚，不要擅自扩大范围。工作目录在你的运行时上下文里。
+
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: true
+              write: true
+              edit: true
+              applyPatch: false
+
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'

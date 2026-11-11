@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Task board + dispatcher mode",
+    "description": "Sidebar task board with a dispatcher agent mode: the main agent only plans, dispatches, reviews and reports while subagents do the work. Four columns (todo / in progress / done / archived); the todo column is polled and handed to the main agent, which reviews subagent results and moves the board state."
+  }
+}
