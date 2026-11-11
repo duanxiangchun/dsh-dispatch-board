@@ -63,6 +63,8 @@ README.md               Lead：安装 / 使用 / 排障
 ### 1.3 轮询器的边界
 
 - 只在 **目标 Agent 空闲**（`agent.status === 'idle'`）时投递；运行中不打扰（下次轮询再试）。
+  **投递成功即自动把任务置为 `doing`**（写 `startedAt`、清 `lastError`）：看板立刻反映「已派发」，
+  不再依赖主 Agent 记得调 `taskboard_update`（它再调一次 doing 也合法）。
 - 每个任务同一时刻最多一条未失效通知：`notifiedAt` 之后 `min(2×intervalMs, 120s)` 内不重复投递；
   超过冷却且仍未变化则重投（`notificationCount++`），`notificationCount >= 5` 后停手并在 UI 标「派发超时」。
 - 每轮最多投递 1 条，避免一次把 10 个任务糊到主 Agent 脸上。
@@ -467,6 +469,7 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 | `agent.followup()` 的 UserMessage 手工构造被会话解码器拒绝（source.kind 未知） | 用 `{kind:'user'}` 构造，不发明新 kind；e2e 必须验证「重启后会话可恢复」 |
 | 轮询把用户手动对话打断 | 只在 idle 投递；每轮最多 1 条；冷却 + 上限 |
 | 多窗口/多会话重复派发 | 任务级 `notifiedAt` + 冷却 + `notificationCount` 上限；不做跨进程锁（单进程部署） |
+| 卡片按钮「点了没反应」（归档/删除/开始/完成全失效） | 0.1.0 修过一个真实 bug：双看板重构时局部数组变量 `actions` 遮蔽了 `bind.actions`，按钮回调里 `actions.updateTask` 全是 undefined，点击直接抛异常。UI 级回归必须**真点按钮**，且点完重新查询节点再点第二次 |
 | **两个 dsh 进程共用同一个 board.json**（例如同时开着正式实例和测试实例） | 每个 RPC/tick 前 `reloadBoardIfStale`：盘上 revision 更大就采用盘上状态（读也重载，否则界面显示旧内存、点归档像没生效）；测试实例用 `DSH_TASKBOARD_PATH` 指向自己的 board.json 彻底隔离。**这不是真正的并发锁**，两个进程同一毫秒写仍可能丢一次更新 |
 
 ---

@@ -458,6 +458,10 @@ test('tick dispatches around a busy creator instead of being blocked by it', asy
     assert.equal(idleTask.notificationCount, 1)
     // 创建时没有 cwd 的任务，投递前从目标会话补上工作区
     assert.equal(idleTask.cwd, 'C:\\work')
+    // 投递成功即自动置 doing：看板马上显示「进行中」，不依赖主 Agent 记得调 taskboard_update
+    assert.equal(idleTask.status, 'doing')
+    assert.ok(idleTask.startedAt)
+    assert.equal(busyTask.status, 'todo')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
