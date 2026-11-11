@@ -56,6 +56,24 @@ transcript-worker-af04b22a: header.agentPreset=taskboard-worker, header.parentSe
 > 探针卫生：`.dev/verify-rpc.mjs` 现在会在跑之前 `set-config pollEnabled:false`、finally 恢复，
 > 避免 add-task → dispatch-now → delete-task 被轮询当成真任务派给主 Agent（幽灵任务）。
 
+## 2.2 产品简化：「派发给」选择器移除（后续修订）
+
+用户反馈「派发给很多余，完全就是主 Agent 全自动」。已按此调整：
+
+- 看板新建区删掉会话选择器，只留「加备注」+ 一句「加进『待开始』后由主 Agent 自动接手」；
+- 宿主 `resolveTargetAgent` 不再读 `task.sessionId`（它只作为「创建来源」元信息保留），
+  永远按「派单模式空闲会话 → 任意空闲会话」挑目标；
+- `add-task` RPC 不再使用 sessionId；单测相应改为「忽略 task.sessionId」。
+
+验证（verifier，`.dev/e2e/auto-dispatch-report.md`）：**4/4 PASS**
+
+| # | 项目 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 1 | 新建区无「派发给」（select 数=0），只有「加备注」+「自动接手」提示 | PASS | `rs-01-composer.png` |
+| 2 | 只加任务不干预 → 0.7s 自动派发 → +37s doing → +87s done（主 Agent 派子 Agent 写文件并独立复核） | PASS | `rs-01b-added.png`、`rs-02-doing.png`、`rs-03-done.png`、`rs-auto.txt` |
+| 3 | `board.json` 中该任务 `sessionId=null`；`poll.lastDispatchSessionId` 指向当时在线的会话 | PASS | `rs-data.json` |
+| 4 | console 无报错 | PASS | `rs-console.json` |
+
 ## 3. 复跑方式
 
 ```powershell

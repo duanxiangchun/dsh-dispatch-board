@@ -70,13 +70,15 @@ README.md               Lead：安装 / 使用 / 排障
 
 ### 1.4 目标 Agent 解析
 
-任务可带 `sessionId`（从看板 UI 新建时由 client 提供当前会话）。解析顺序：
+**全自动，不需要用户选会话**（v0.1.0 修订：UI 的「派发给」下拉已移除）。解析顺序：
 
-1. `sessionId` 存在且 `ctx.agents.get(sessionId)` 活着 → 用它（显式指定永远优先，即使不是派单模式）；
-2. 否则在 `ctx.agents.roots()` 的空闲 Agent 里优先挑 `session.header.agentPreset === 'taskboard-dispatch'`
+1. 在 `ctx.agents.roots()` 的空闲 Agent 里优先挑 `session.header.agentPreset === 'taskboard-dispatch'`
    的最近一个（避免「打开 Web UI 自动生成的空白标准模式会话」抢走任务）；
-3. 没有派单模式会话 → 退化为最近注册的空闲 root Agent（普通模式也能接任务）；
-4. 都没有（没有任何空闲会话）→ 本轮跳过，UI 显示跳过原因（`agent-busy` / `no-live-agent`）。
+2. 没有派单模式会话 → 退化为最近注册的空闲 root Agent（普通模式也能接任务）；
+3. 都没有（没有任何空闲会话）→ 本轮跳过，UI 显示跳过原因（`agent-busy` / `no-live-agent`）。
+
+任务上的 `sessionId` 只是「哪个会话创建的」这条元信息（`taskboard_add` 会记调用者的会话），
+**不参与路由**——没有任何配置能让用户把某个任务钉到某个会话。
 
 注意：子 Agent 不是 root，`roots()` 天然不含它们，不需要额外过滤。
 
@@ -105,7 +107,7 @@ README.md               Lead：安装 / 使用 / 排障
       "note": "验收标准：…",     // 可空串
       "status": "todo",          // todo | doing | done | archived
       "source": "user",          // user | agent | poller
-      "sessionId": "…" | null,   // 派发目标会话
+      "sessionId": "…" | null,   // 创建来源会话（仅元信息，不参与派发路由）
       "cwd": "C:\\…" | null,
       "assignee": "…",           // 子 Agent 的 label / sessionId，主 Agent 填
       "result": "…",             // 审核结论 / 子 Agent 汇报摘要
@@ -149,7 +151,7 @@ Content-Type: application/json
 | endpoint | payload | value | 说明 |
 | --- | --- | --- | --- |
 | `snapshot` | `{}` | `Snapshot` | 全量看板 + 运行时状态，client 每 2s 轮一次 |
-| `add-task` | `{title, note?, sessionId?, cwd?}` | `{task}` | 新建到 `todo`，`source='user'`；同标题未归档任务重复时返回 `conflict` |
+| `add-task` | `{title, note?}` | `{task}` | 新建到 `todo`，`source='user'`；派发目标由宿主自动决定（不接受 sessionId） |
 | `update-task` | `{id, status?, title?, note?, result?, assignee?, lastError?}` | `{task}` | 局部更新；非法状态迁移 → `conflict` |
 | `delete-task` | `{id}` | `{deleted:true,id}` | 物理删除（仅限 UI 手动） |
 | `dispatch-now` | `{id}` | `{dispatched, sessionId, task}` | 立即投递一次（不等轮询、无视冷却） |
@@ -174,7 +176,7 @@ Content-Type: application/json
     "lastDispatchSessionTitle": "…" | null,  // 会话标题（有则优先展示）
     "lastSkipReason": "no-live-agent" | "agent-busy" | "cooldown" | "poll-disabled" | null
   },
-  "agents": [                               // 派发目标候选，UI 显示会话选择器
+  "agents": [                               // 在线会话快照（诊断/调试用；UI 不再提供会话选择器）
     { "sessionId": "…", "status": "idle"|"running", "cwd": "…"|null, "title": "…"|null,
       "preset": "taskboard-dispatch"|"standard"|…|null, "root": true }
   ],
@@ -193,10 +195,10 @@ Content-Type: application/json
 }
 ```
 
-`agents[].title`：会话头里的标题（未命名时为空串，client 回退到 sessionId 尾 8 位）。
+`agents[].title`：会话头里的标题（未命名时为空串）。
 `agents[].preset`：**`ctx.get('agentPresets').presetForSession(agent.session)`**（Session 的 agentPreset 投影，
 反映创建后切换过的模式；`session.header.agentPreset` 只是创建时的值，实测新建派单模式会话后仍是 `standard`，不能用作判据）。
-client 用它在「派发给」下拉里附模式名。
+宿主用它决定「优先派给哪个空闲会话」，client 不再展示会话选择器。
 
 ### 3.3 错误码
 
@@ -320,12 +322,12 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
    - `Snapshot.preset.broken` 非空 → 红色 banner 显示挂载诊断；
    - `Snapshot.preset.installed === false` → 黄色 banner 显示原因（没有 agentPresets 服务 / 名单里没有本模式）。
 2. **新建任务行**：输入框（Enter 提交）+ 备注展开（可选）+ 「添加到待开始」按钮；
-   会话选择器（`agents[]`，默认「自动（最近活跃）」）。
+   下方一行只有「加备注」链接和一句提示「加进『待开始』后由主 Agent 自动接手」——
+   **没有「派发给」选择器**（派发全自动，产品决策）。
 3. **看板主体**（布局见上）：待开始（蓝）/ 进行中（黄）/ 已完成（绿）/ 已归档（灰）。
    - 每块头部：列名 + 计数 + 快捷动作（待开始：`全部派发`；已完成：`全部归档`）。
    - 卡片：标题、备注（两行截断，hover title 展开）、`#t-3`、相对时间、assignee、result、
      `lastError`（红色小字，状态变更时自动清空）。
-   - 「派发给」下拉：`标题（或 id 尾 8 位） · running? · 模式名`，避免多个无标题会话分不清。
    - 卡片动作（按状态）：
      - todo：`开始`（→doing）、`立即派发`（`dispatch-now`）、`编辑`、`删除`
      - doing：`完成`（→done）、`打回`（→todo）、`编辑`

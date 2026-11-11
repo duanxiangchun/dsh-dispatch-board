@@ -761,7 +761,7 @@ test('BoardTab（窄栏）：轮询状态与派发 skip 原因照常渲染', asy
  * 用例：BoardTab —— 宽栏（全屏 / 拖宽后）
  * ══════════════════════════════════════════════════════════════ */
 
-test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boardPath，派发给下拉来自 agents', async () => {
+test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boardPath，且没有「派发给」选择器', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
   const BoardTab = harness.componentOf('sidebar.right.pane.tab')
   const { tree } = await renderWide(BoardTab)
@@ -788,54 +788,12 @@ test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boar
   assert.ok(includesText(tree, '看板数据保存在本机'), 'wide footer keeps the tip')
   assert.ok(includesText(tree, 'v0.1.0'), 'footer version should render')
 
+  // 「派发给」选择器已被产品删除：派发完全由宿主自动决定，用户只加任务。
   const selects = collect(tree).filter((node) => node.type === 'select')
-  assert.equal(selects.length, 2, 'interval select + target select')
-  const targetSelect = selects[1]
-  assert.equal(targetSelect.props['aria-label'], '派发给')
-  const optionTexts = collect(targetSelect)
-    .filter((node) => node.type === 'option')
-    .map((node) => textOf(node))
-  assert.ok(optionTexts.includes('自动（最近活跃会话）'), 'auto target option should render')
-  assert.ok(optionTexts.includes('主会话 · running'), 'running agent option should render')
-  assert.ok(optionTexts.includes('备用会话'), 'idle agent option should render')
-})
-
-test('BoardTab：派发给下拉带模式名与 id 尾 8 位', async () => {
-  const snapshot = makeSnapshot({
-    preset: {
-      installed: true,
-      path: 'bundle:presets/taskboard.patch.yml',
-      broken: '',
-      presets: [
-        { id: 'taskboard-dispatch', name: '派单看板模式', broken: '' },
-        { id: 'taskboard-worker', name: '派单看板模式 · 执行者', broken: '' },
-      ],
-    },
-    agents: [
-      {
-        sessionId: 'session-aaaaaaaa-bbbb-cccc-dddd-eeff00112233',
-        title: '',
-        status: 'idle',
-        preset: 'taskboard-dispatch',
-      },
-      { sessionId: 'session-11111111-2222-3333-4444-555566667777', title: '普通会话', status: 'running', preset: 'standard' },
-    ],
-  })
-  const harness = createHarness({ snapshot })
-  const { tree } = await renderWide(harness.componentOf('sidebar.right.pane.tab'))
-  const selects = collect(tree).filter((node) => node.type === 'select')
-  const targetSelect = selects[1]
-  const optionTexts = collect(targetSelect)
-    .filter((node) => node.type === 'option')
-    .map((node) => textOf(node))
-  assert.ok(
-    optionTexts.includes('00112233 · 派单看板模式'),
-    'untitled dispatcher session should show id tail + mode name, got: ' + JSON.stringify(optionTexts),
-  )
-  assert.ok(
-    optionTexts.includes('普通会话 · running'),
-    'standard-mode titled session keeps title/status and adds no unknown mode, got: ' + JSON.stringify(optionTexts),
-  )
+  assert.equal(selects.length, 1, 'only the poll-interval select remains')
+  assert.equal(selects[0].props['aria-label'], undefined)
+  assert.ok(!includesText(tree, '派发给'), 'dispatch-target selector must be gone')
+  assert.ok(includesText(tree, '加进「待开始」后由主 Agent 自动接手'), 'composer shows the auto hint instead')
 })
 
 /* ══════════════════════════════════════════════════════════════

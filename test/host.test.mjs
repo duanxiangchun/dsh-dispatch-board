@@ -183,19 +183,18 @@ test('selectDispatchCandidate honours cooldown, cap and order', () => {
   assert.equal(selectDispatchCandidate(state, NOW + 40000), null)
 })
 
-test('resolveTargetAgent prefers the task session then an idle root', () => {
+test('resolveTargetAgent is fully automatic and ignores task.sessionId', () => {
   const agent = { id: 'sess-1', status: 'idle' }
   const busy = { id: 'sess-2', status: 'running' }
   const service = {
-    get: (id) => (id === 'sess-1' ? agent : undefined),
+    get: () => undefined,
     roots: () => [busy, agent],
   }
-  assert.equal(resolveTargetAgent(service, { sessionId: 'sess-1' }).agent, agent)
-  assert.equal(resolveTargetAgent(service, { sessionId: 'missing' }).reason, 'agent-offline')
-  assert.equal(resolveTargetAgent(service, {}).agent, agent)
-  assert.equal(resolveTargetAgent({ get: () => undefined, roots: () => [busy] }, {}).reason, 'agent-busy')
-  assert.equal(resolveTargetAgent({ get: () => undefined, roots: () => [] }, {}).reason, 'no-live-agent')
-  assert.equal(resolveTargetAgent(undefined, {}).reason, 'no-agents-service')
+  // 任务上的 sessionId 不参与路由：即使指定了别的会话，也还是挑空闲 root
+  assert.equal(resolveTargetAgent(service).agent, agent)
+  assert.equal(resolveTargetAgent({ get: () => undefined, roots: () => [busy] }).reason, 'agent-busy')
+  assert.equal(resolveTargetAgent({ get: () => undefined, roots: () => [] }).reason, 'no-live-agent')
+  assert.equal(resolveTargetAgent(undefined).reason, 'no-agents-service')
 })
 
 test('buildDispatchText carries the task facts and instructions', () => {
@@ -354,17 +353,12 @@ test('resolveTargetAgent prefers an idle dispatcher-mode session', () => {
     get: () => undefined,
     roots: () => [standard, busyDispatcher, dispatcher],
   }
-  const resolved = resolveTargetAgent(service, {})
+  const resolved = resolveTargetAgent(service)
   assert.equal(resolved.agent, dispatcher)
   assert.equal(resolved.reason, 'dispatcher-root')
 
   // 没有派单模式会话时才退化到任意空闲 root
-  const fallback = resolveTargetAgent({ get: () => undefined, roots: () => [standard, busyDispatcher] }, {})
+  const fallback = resolveTargetAgent({ get: () => undefined, roots: () => [standard, busyDispatcher] })
   assert.equal(fallback.agent, standard)
   assert.equal(fallback.reason, 'recent-root')
-
-  // 显式 sessionId 永远优先（即使不是派单模式）
-  const explicit = resolveTargetAgent({ get: (id) => (id === 's-standard' ? standard : undefined), roots: () => [dispatcher] }, { sessionId: 's-standard' })
-  assert.equal(explicit.agent, standard)
-  assert.equal(explicit.reason, 'task-session')
 })
