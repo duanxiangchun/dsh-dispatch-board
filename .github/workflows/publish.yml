@@ -11,8 +11,10 @@ name: Publish to npm
 #     Workflow: publish.yml / Environment: 留空。
 #     注意：新包首次发布必须先手工 `npm publish` 一次，npm 上存在该包后才能配 Trusted Publisher。
 #
-# npm 对来自 CI 的发布启用了 Staged publishing：上传后需维护者带 2FA 在 npmjs.com
-# 「Staged publishes」批准，或本地执行 `npm stage approve <pkg>@<version>`。
+# 本仓库实际走 A（GitHub 仓库 Secret `NPM_TOKEN` 已配置）：Actions 里的 `npm publish` 直接生效——
+# 不需要本地 `npm login`、不需要 2FA、不需要 `npm stage approve`，也不用在 npmjs.com 点任何批准。
+# 2026-11-11 发布 v0.1.3 实测：tag 推送后工作流 green，registry 几十秒内出现新版本。
+# 只有改用 B（OIDC / Trusted Publishing）时才可能需要额外审批；届时以该路径的实际提示为准。
 on:
   push:
     tags:

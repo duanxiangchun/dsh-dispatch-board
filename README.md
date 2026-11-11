@@ -50,7 +50,7 @@
 dsh plugin --profile web add dsh-dispatch-board
 ```
 
-npm: https://www.npmjs.com/package/dsh-dispatch-board · GitHub Release 由 tag `v*` 触发流水线自动发布。
+npm: https://www.npmjs.com/package/dsh-dispatch-board · npm 发布与 GitHub Release 都由 tag `v*` 触发流水线自动完成（仓库 Secret `NPM_TOKEN`，无需人工 2FA / staged 批准）。
 
 ## 安装
 

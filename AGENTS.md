@@ -29,5 +29,26 @@ node --test            # test/*.test.mjs 纯函数单测
 
 ## 发布
 
-版本在 `package.json`；`docs/architecture.md` 顶部记录版本与变更点。
+版本在 `package.json`；变更点记在 `docs/architecture.md` §9「变更记录」。
 推 GitHub 时默认同时创建并推送 annotated tag `v<version>`（与 dsh-ollama-statistical 的约定一致）。
+
+标准发布流程：
+
+```powershell
+# 1) 改 package.json 版本 + docs/architecture.md §9 变更记录，跑验证流程
+# 2) 提交并打 annotated tag
+git add -A
+git commit -m "chore: release vX.Y.Z"
+git tag -a vX.Y.Z -m "dsh-dispatch-board vX.Y.Z"
+# 3) 分支和 tag 一起推
+git push origin main vX.Y.Z
+```
+
+- tag `v*` 触发 `.github/workflows/publish.yml`：校验 tag 与 `package.json` 版本一致 → `node --test`
+  → `npm publish --access public --provenance` → 建 GitHub Release；push `main` 触发 `ci.yml`（Node 20/22）。
+- **发布鉴权：不需要本地 npm login，不需要 2FA，不需要 staged approve。** GitHub 仓库 Secret
+  `NPM_TOKEN` 已经配好，Actions 直接用这个 key 发布，全程无人工鉴权/审批（2026-11-11 发布
+  v0.1.3 实测：tag 推送后工作流 green，registry 几十秒内出现新版本）。本机 `npm whoami` 未登录
+  不影响发布；`npm stage approve` 也不用跑。
+- 发布后核对：`npm view dsh-dispatch-board version` 应为新版本（registry 有几十秒级延迟，
+  CI 刚绿时查不到属正常，过一会儿再查，别急着判定失败）。
