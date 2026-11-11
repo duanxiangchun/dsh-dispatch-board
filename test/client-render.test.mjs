@@ -1301,12 +1301,15 @@ test('Detail：点卡片标题打开浮层，完整展示结论/备注/执行者
   assert.ok(detailTextAll.includes(longNote), 'full note text must render untruncated')
   assert.ok(longResult.length > 200, 'fixture result is long enough to prove no truncation')
 
-  // 字段网格：状态/工作区/时间线/执行者/来源/提醒次数/id
+  // 字段网格：状态在徽标里，其余分「基本信息」「时间线」两组
   const { dts, dds } = detailLabels(opened)
-  for (const label of ['状态', '工作区', '创建时间', '最后更新', '开始时间', '完成时间', '执行者 / 派给谁', '创建来源', '派发提醒次数', '任务 id']) {
+  for (const label of ['工作区', '创建时间', '最后更新', '开始时间', '完成时间', '执行者 / 派给谁', '创建来源', '派发提醒次数', '任务 id']) {
     assert.ok(dts.includes(label), 'missing detail field label: ' + label)
   }
-  assert.ok(dds.includes('已完成'), 'status value must render')
+  for (const sectionLabel of ['基本信息', '时间线']) {
+    assert.ok(dts.includes(sectionLabel) || detailTextAll.includes(sectionLabel), 'missing detail section: ' + sectionLabel)
+  }
+  assert.ok(!dts.includes('状态'), 'status lives in the badge, not a duplicate row')
   assert.ok(dds.includes(WS_A), 'workspace path must render')
   assert.ok(dds.includes('main-agent-1'), 'assignee must render')
   assert.ok(dds.includes('5'), 'notification count must render')
