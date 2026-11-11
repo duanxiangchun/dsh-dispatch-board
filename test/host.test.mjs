@@ -26,6 +26,8 @@ import {
   normalizeConfig,
   notifyCooldownMs,
   parseRpcEnvelope,
+  listWorkspaces,
+  normalizePathForCompare,
   resolveSessionCwd,
   resolveSessionCwdViaQuery,
   tick,
@@ -564,4 +566,75 @@ test('tick caches a failed revive and falls back instead of retrying every tick'
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+test('listWorkspaces reads the workspace registry and normalizes titles', () => {
+  const registry = {
+    list: () => [
+      { id: 'w1', path: 'C:\\work\\plinto', title: 'plinto', status: 'ok' },
+      { id: 'w2', path: 'C:\\work\\whart', title: '', status: 'missing' },
+    ],
+  }
+  const rows = listWorkspaces({ ctx: { get: (name) => (name === 'workspaceRegistry' ? registry : undefined) } })
+  assert.deepEqual(rows, [
+    { id: 'w1', path: 'C:\\work\\plinto', title: 'plinto', status: 'ok' },
+    { id: 'w2', path: 'C:\\work\\whart', title: 'whart', status: 'missing' },
+  ])
+  assert.deepEqual(listWorkspaces({ ctx: { get: () => undefined } }), [])
+  assert.deepEqual(listWorkspaces(undefined), [])
+})
+
+test('normalizePathForCompare ignores separators, trailing slashes and Windows case', () => {
+  assert.equal(normalizePathForCompare('C:\\Work\\Demo/'), normalizePathForCompare('c:\\work\\demo'))
+  assert.equal(normalizePathForCompare(''), '')
+})
+
+test('resolveTargetAgent prefers an idle session in the task workspace', () => {
+  const inWorkspace = { id: 's-in', status: 'idle', session: { header: { cwd: 'C:\\work\\demo' } } }
+  const elsewhere = { id: 's-out', status: 'idle', session: { header: { cwd: 'C:\\work\\other' } } }
+  const dispatcher = { id: 's-dispatch', status: 'idle', session: { header: { cwd: 'C:\\work\\other', agentPreset: 'taskboard-dispatch' } } }
+  const service = { get: () => undefined, roots: () => [elsewhere, dispatcher, inWorkspace] }
+  const presetOf = (agent) => (agent.session.header.agentPreset ? 'taskboard-dispatch' : 'standard')
+
+  // 平台看板任务：优先同工作区（即使别的闲置会话是派单模式）
+  const hit = resolveTargetAgent(service, { id: 't-1', cwd: 'C:\\Work\\Demo\\' }, presetOf)
+  assert.equal(hit.agent, inWorkspace)
+  assert.equal(hit.reason, 'workspace-session')
+
+  // 该工作区没有空闲会话 → 等，不改派
+  const noIdle = resolveTargetAgent(
+    { get: () => undefined, roots: () => [elsewhere, dispatcher] },
+    { id: 't-2', cwd: 'C:\\work\\demo' },
+    presetOf,
+  )
+  assert.equal(noIdle.agent, null)
+  assert.equal(noIdle.reason, 'workspace-offline')
+
+  // 该工作区有会话在跑 → workspace-busy
+  const busy = { id: 's-busy', status: 'running', session: { header: { cwd: 'C:\\work\\demo' } } }
+  const waitBusy = resolveTargetAgent({ get: () => undefined, roots: () => [busy] }, { cwd: 'C:\\work\\demo' }, presetOf)
+  assert.equal(waitBusy.reason, 'workspace-busy')
+
+  // force（立即派发）才退到派单模式/任意空闲会话
+  const forced = resolveTargetAgent(
+    { get: () => undefined, roots: () => [elsewhere, dispatcher] },
+    { cwd: 'C:\\work\\demo' },
+    presetOf,
+    { force: true },
+  )
+  assert.equal(forced.agent, dispatcher)
+  assert.equal(forced.reason, 'dispatcher-root')
+})
+
+test('snapshot exposes the workspace list', () => {
+  const registry = { list: () => [{ id: 'w1', path: 'C:\\work\\demo', title: 'demo', status: 'ok' }] }
+  const rt = {
+    ctx: { get: (name) => (name === 'workspaceRegistry' ? registry : undefined) },
+    state: createEmptyBoard(),
+    filePath: 'C:\\tmp\\board.json',
+    poll: { running: true },
+    presetInfo: null,
+  }
+  const snapshot = buildSnapshot(rt)
+  assert.equal(snapshot.workspaces.length, 1)
+  assert.equal(snapshot.workspaces[0].title, 'demo')
 })

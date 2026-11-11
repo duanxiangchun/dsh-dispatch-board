@@ -223,7 +223,7 @@ test('client bundle exposes apply/inject and only requires react', () => {
   assert.equal(captured.id, 'dsh-taskboard')
 })
 
-test('apply 注册右栏 tab 类型（包在 effect 里）并注册三个槽位', () => {
+test('apply 注册右栏 tab 类型 + 右栏三处入口 + 左侧栏平台看板', () => {
   const harness = createApplyHarness()
 
   // 1) 两个 cordis 注入点：tab 类型 + 右栏导航服务
@@ -258,15 +258,18 @@ test('apply 注册右栏 tab 类型（包在 effect 里）并注册三个槽位'
   assert.deepEqual(harness.tabs.disposed, ['dsh-taskboard'])
   assert.equal(harness.tabs.definitions.length, 0)
 
-  // 3) 槽位：右栏 tab 正文 + tab chip + 会话 header 入口
-  assert.deepEqual(harness.slotInjections, [
+  // 3) 槽位：右栏 tab 正文 + tab chip + 会话 header 入口 + 左侧栏平台看板
+  const expectedSlots = [
     'sidebar.right.pane.tab',
     'sidebar.right.pane.tab.title',
     'conversation.session.header.actions',
-  ])
+    'sidebar.panellist',
+    'main',
+  ]
+  assert.deepEqual(harness.slotInjections, expectedSlots)
   assert.deepEqual(
     harness.registrations.map((entry) => entry.options.name),
-    ['sidebar.right.pane.tab', 'sidebar.right.pane.tab.title', 'conversation.session.header.actions'],
+    expectedSlots,
   )
 
   const tabBody = harness.registrations[0]
@@ -284,9 +287,23 @@ test('apply 注册右栏 tab 类型（包在 effect 里）并注册三个槽位'
   assert.equal(headerAction.options.label(), '任务看板')
   assert.equal(typeof headerAction.component, 'function')
 
-  // 旧契约（左侧栏入口 + main 页面）不应再注册
-  assert.ok(!harness.registrations.some((entry) => entry.options.name === 'sidebar.panellist'))
-  assert.ok(!harness.registrations.some((entry) => entry.options.name === 'main'))
+  // 左侧栏平台看板：入口图标（todo+doing 角标）+ main 页面，key/id 一致
+  const platformIcon = harness.registrations[3]
+  assert.equal(platformIcon.options.id, 'taskboard-platform')
+  assert.equal(platformIcon.options.order, 25)
+  assert.equal(typeof platformIcon.options.label, 'function')
+  assert.equal(platformIcon.options.label(), '平台任务看板')
+  assert.equal(platformIcon.options.locale, 'taskboard')
+  assert.equal(typeof platformIcon.component, 'function')
+
+  const platformPage = harness.registrations[4]
+  assert.equal(platformPage.options.key, 'taskboard-platform')
+  assert.equal(typeof platformPage.options.label, 'function')
+  assert.equal(platformPage.options.label(), '平台任务看板')
+  assert.equal(platformPage.options.locale, 'taskboard')
+  assert.equal(typeof platformPage.component, 'function')
+  // 平台看板的 slot key 与入口 icon 的 id 必须一致，点击图标才能切到页面
+  assert.equal(platformPage.options.key, platformIcon.options.id)
 
   // 4) 插件资源：样式只注入一次；locale 字典 zh/en
   assert.equal(harness.styleTags.length, 1)
@@ -302,12 +319,14 @@ test('apply 在右侧栏服务缺失时安静降级（不崩、槽位照常注�
   assert.equal(harness.tabs.definitions.length, 0)
   assert.equal(harness.openTabCalls.length, 0)
 
-  // 槽位与资源注册不受影响
-  assert.equal(harness.registrations.length, 3)
+  // 槽位与资源注册不受影响（右栏三处 + 左侧栏平台看板两处）
+  assert.equal(harness.registrations.length, 5)
   assert.deepEqual(harness.slotInjections, [
     'sidebar.right.pane.tab',
     'sidebar.right.pane.tab.title',
     'conversation.session.header.actions',
+    'sidebar.panellist',
+    'main',
   ])
   assert.equal(harness.styleTags.length, 1)
 })
@@ -350,4 +369,44 @@ test('formatting helpers behave', () => {
   assert.equal(helpers.fmtAgo(t0, new Date(Date.now() - 1000).toISOString(), Date.now()), '刚刚')
   assert.equal(helpers.fmtAgo(t0, new Date(Date.now() - 5 * 60000).toISOString(), Date.now()), '5 分钟前')
   assert.equal(helpers.fmtAgo(t0, new Date(Date.now() - 3 * 3600000).toISOString(), Date.now()), '3 小时前')
+})
+
+test('工作区路径纯函数：归一化 / 同路径比较 / 展示名 / 过滤', () => {
+  const { exported } = loadClient()
+  const helpers = exported.__test
+
+  assert.equal(helpers.baseName('C:\\work\\demo'), 'demo')
+  assert.equal(helpers.baseName('/home/u/demo/'), 'demo')
+  assert.equal(helpers.baseName(''), '')
+  assert.equal(helpers.normalizePath('C:/work/demo/'), 'C:\\work\\demo')
+  assert.equal(helpers.normalizePath(''), '')
+
+  // 反斜杠/斜杠、尾斜杠、Windows 盘符大小写都算同一个工作区
+  assert.equal(helpers.samePath('C:\\work\\a', 'C:/work/a'), true)
+  assert.equal(helpers.samePath('C:\\work\\a\\', 'C:\\work\\a'), true)
+  assert.equal(helpers.samePath('C:\\Work\\A', 'c:\\work\\a'), true)
+  assert.equal(helpers.samePath('C:\\work\\a', 'C:\\work\\b'), false)
+  assert.equal(helpers.samePath('/home/u/a', '/home/u/a/'), true)
+  assert.equal(helpers.samePath('', 'C:\\work\\a'), false)
+  assert.equal(helpers.samePath(null, null), false)
+
+  const workspaces = [
+    { id: 'w1', path: 'C:\\work\\a', title: '工作区 A' },
+    { id: 'w2', path: 'C:\\work\\b', title: '' },
+  ]
+  assert.equal(helpers.workspaceTitleOf(workspaces, 'C:/work/a/'), '工作区 A')
+  assert.equal(helpers.workspaceTitleOf(workspaces, 'C:\\work\\b'), 'b') // title 为空 → 路径尾段
+  assert.equal(helpers.workspaceTitleOf(workspaces, 'C:\\work\\missing'), 'missing')
+  assert.equal(helpers.workspaceTitleOf(null, 'C:\\work\\a'), 'a')
+
+  const tasks = [
+    { id: 't-1', cwd: 'C:\\work\\a' },
+    { id: 't-2', cwd: 'c:/work/a' },
+    { id: 't-3', cwd: 'C:\\work\\b' },
+    { id: 't-4', cwd: null },
+  ]
+  assert.deepEqual(helpers.tasksForWorkspace(tasks, 'C:\\work\\a').map((task) => task.id), ['t-1', 't-2'])
+  assert.equal(helpers.tasksForWorkspace(tasks, '').length, 0, 'unknown workspace shows no tasks')
+  assert.deepEqual(helpers.tasksForFilter(tasks, 'C:\\work\\b').map((task) => task.id), ['t-3'])
+  assert.equal(helpers.tasksForFilter(tasks, '').length, 4)
 })

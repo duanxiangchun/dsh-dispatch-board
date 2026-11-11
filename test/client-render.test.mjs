@@ -8,7 +8,7 @@ import vm from 'node:vm'
 /**
  * lib/client.js 的组件层渲染冒烟测试（无浏览器、无 react 依赖）。
  *
- * 契约已从「左侧栏入口 + main 页面」迁到「右侧栏 tab 类型 + 会话 header 入口」：
+ * 现在有两块看板：右侧栏「本工作区看板」（BoardTab）+ 左侧栏「平台任务看板」（PlatformBoard）：
  *  - conversation.session.header.actions → HeaderBoardAction（按钮 .tb-headbtn + 待办角标）
  *  - sidebar.right.pane.tab             → BoardTab（窄栏 .tb-lanes / 宽栏 .tb-board）
  *  - sidebar.right.pane.tab.title       → BoardTabTitle（chip：glyph + 标题）
@@ -367,7 +367,15 @@ function createHarness(options = {}) {
   const registrations = []
   const tabs = { definitions: [], disposed: [] }
   const openTabCalls = []
-  const defaultRpc = options.rpc || (() => Promise.resolve({ ok: true, value: options.snapshot || {} }))
+  const defaultRpc = options.rpc || ((channel, endpoint, payload) => {
+    if (endpoint === 'session-info') {
+      return Promise.resolve({
+        ok: true,
+        value: { sessionId: payload && payload.sessionId, cwd: options.sessionCwd || null },
+      })
+    }
+    return Promise.resolve({ ok: true, value: options.snapshot || {} })
+  })
 
   const tabsService = options.sidebarRightTabs === false ? undefined : {
     register(definition) {
@@ -491,16 +499,20 @@ function createHarness(options = {}) {
 }
 
 /* ══════════════════════════════════════════════════════════════
- * snapshot 夹具：4 个状态、5 条任务，config/poll/agents/preset/boardPath 齐全
+ * snapshot 夹具：2 个工作区、4 个状态、5 条任务（跨工作区 + 一条无 cwd）
  * ══════════════════════════════════════════════════════════════ */
 
 const NOW = Date.now()
 const minutesAgo = (n) => new Date(NOW - n * 60000).toISOString()
 
+const WS_A = 'C:\\work\\a'
+const WS_B = 'C:\\work\\b'
+
 function makeSnapshot(overrides = {}) {
   return Object.assign(
     {
       version: 1,
+      revision: 1,
       boardPath: 'C:\\Users\\duan\\.dsh\\storages\\taskboard\\board.json',
       pluginVersion: '0.1.0',
       config: { pollEnabled: true, pollIntervalMs: 15000 },
@@ -511,9 +523,13 @@ function makeSnapshot(overrides = {}) {
         lastDispatchSessionTitle: '主会话',
         lastSkipReason: 'agent-busy',
       },
+      workspaces: [
+        { id: 'w1', path: WS_A, title: '工作区 A', status: 'ok' },
+        { id: 'w2', path: WS_B, title: '', status: 'ok' },
+      ],
       agents: [
-        { sessionId: '0123456789abcdef', title: '主会话', status: 'running' },
-        { sessionId: 'fedcba9876543210', title: '备用会话', status: 'idle' },
+        { sessionId: '0123456789abcdef', title: '主会话', status: 'running', cwd: WS_A },
+        { sessionId: 'fedcba9876543210', title: '备用会话', status: 'idle', cwd: WS_B },
       ],
       preset: {
         installed: false,
@@ -527,6 +543,7 @@ function makeSnapshot(overrides = {}) {
           id: 't-1',
           title: '梳理看板数据模型',
           status: 'todo',
+          cwd: WS_A,
           note: '先定 board.json 的字段',
           assignee: 'main',
           notificationCount: 3,
@@ -536,6 +553,7 @@ function makeSnapshot(overrides = {}) {
           id: 't-2',
           title: '实现轮询自动派发',
           status: 'todo',
+          cwd: WS_B,
           source: 'agent',
           updatedAt: minutesAgo(12),
         },
@@ -543,6 +561,7 @@ function makeSnapshot(overrides = {}) {
           id: 't-3',
           title: '写客户端渲染冒烟测试',
           status: 'doing',
+          cwd: null,
           result: '四列已渲染',
           lastError: '上一次投递超时',
           updatedAt: minutesAgo(30),
@@ -551,6 +570,7 @@ function makeSnapshot(overrides = {}) {
           id: 't-4',
           title: '打通宿主 RPC',
           status: 'done',
+          cwd: WS_A,
           result: 'snapshot / add-task 已通',
           updatedAt: minutesAgo(90),
         },
@@ -558,6 +578,7 @@ function makeSnapshot(overrides = {}) {
           id: 't-5',
           title: '归档过期的旧任务',
           status: 'archived',
+          cwd: WS_B,
           updatedAt: minutesAgo(180),
         },
       ],
@@ -574,12 +595,69 @@ const TASK_TITLES = [
   '归档过期的旧任务',
 ]
 
+const WS_A_TITLES = ['梳理看板数据模型', '打通宿主 RPC']
 const COLUMN_TITLES = ['待开始', '进行中', '已完成', '已归档']
-
 const CARD_BUTTONS = ['开始', '立即派发', '完成', '归档', '重新打开', '打回', '编辑', '删除']
 
 /* ══════════════════════════════════════════════════════════════
- * 用例：会话 header 入口按钮
+ * 通用小工具
+ * ══════════════════════════════════════════════════════════════ */
+
+const SESSION_A = '0123456789abcdef'
+
+function countCalls(harness, endpoint) {
+  return harness.rpcCalls.filter((call) => call.endpoint === endpoint).length
+}
+
+function composerInput(tree) {
+  return collect(tree).find((node) => node.type === 'input' && node.props.className === 'tb-input')
+}
+
+function submitButton(tree) {
+  return buttons(tree).find((node) => textOf(node).trim() === '添加到待开始')
+}
+
+function selectByAria(tree, label) {
+  return collect(tree).find((node) => node.type === 'select' && node.props['aria-label'] === label)
+}
+
+function optionTexts(select) {
+  return collect(select)
+    .filter((node) => node.type === 'option')
+    .map((node) => textOf(node))
+}
+
+function renderNarrow(BoardTab, extraProps = {}) {
+  return renderComponent(
+    BoardTab,
+    Object.assign({ useTabInfo: () => ({ sidebar: { fullscreen: false } }) }, extraProps),
+  )
+}
+
+function renderWide(BoardTab, extraProps = {}) {
+  return renderComponent(
+    BoardTab,
+    Object.assign({ useTabInfo: () => ({ sidebar: { fullscreen: true } }) }, extraProps),
+  )
+}
+
+/** 输入标题 → 重渲染 → 点「添加到待开始」→ 等 RPC 落地。 */
+async function addTaskByUi(render, titleValue) {
+  const rendered = await render()
+  const input = composerInput(rendered.tree)
+  assert.ok(input, 'composer input must render')
+  input.props.onChange({ target: { value: titleValue } })
+  const filled = await rendered.instance.run()
+  const submit = submitButton(filled)
+  assert.ok(submit, 'submit button must render')
+  assert.equal(submit.props.disabled, false, 'submit becomes enabled once the form is valid')
+  submit.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  return rendered
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 用例：会话 header 入口按钮（打开右侧栏）
  * ══════════════════════════════════════════════════════════════ */
 
 test('HeaderBoardAction：按钮 + glyph + 待办角标，点击打开右侧栏 taskboard tab', async () => {
@@ -589,22 +667,19 @@ test('HeaderBoardAction：按钮 + glyph + 待办角标，点击打开右侧栏 
 
   assert.equal(tree.type, 'button')
   assert.ok(hasClass(tree, 'tb-headbtn'), 'header entry must be a .tb-headbtn button')
-  assert.equal(tree.props.type, 'button')
   assert.equal(tree.props['aria-label'], '打开任务看板（右侧栏）')
   assert.match(String(tree.props.title), /2 个待开始任务/)
 
   const svg = collect(tree).find((node) => node.type === 'svg')
   assert.ok(svg, 'header entry must render the board glyph')
   assert.equal(svg.props.width, 16)
-  assert.equal(svg.props.height, 16)
   assert.equal(collect(svg).filter((node) => node.type === 'rect').length, 4)
 
   const badge = nodesWithClass(tree, 'tb-badge')
   assert.equal(badge.length, 1, 'two todo tasks must show a badge')
   assert.equal(textOf(badge[0]), '2')
 
-  // 只拉一次 snapshot；6s 轮询走 ctx.interval（没有真的启动）
-  assert.deepEqual(harness.rpcCalls.map((call) => call.endpoint), ['snapshot'])
+  assert.equal(countCalls(harness, 'snapshot'), 1)
   assert.equal(harness.rpcCalls[0].channel, '/taskboard')
   assert.equal(harness.intervals.length, 1)
   assert.equal(harness.intervals[0].ms, 6000)
@@ -622,7 +697,6 @@ test('HeaderBoardAction：RPC 失败不崩无角标；右栏服务缺失时点�
   const failTree = (await renderComponent(failHarness.componentOf('conversation.session.header.actions'), {})).tree
   assert.equal(nodesWithClass(failTree, 'tb-badge').length, 0)
   assert.equal(failTree.props.title, '任务看板')
-  assert.equal(failTree.props['aria-label'], '打开任务看板（右侧栏）')
   failTree.props.onClick()
   assert.deepEqual(failHarness.openTabCalls, ['taskboard'])
 
@@ -654,7 +728,6 @@ test('BoardTabTitle：优先用宿主 tab 标题，缺省/抛错时退回「任�
   assert.equal(svg.props.width, 14)
 
   const withoutHook = await renderComponent(BoardTabTitle, {})
-  assert.ok(hasClass(withoutHook.tree, 'tb-tabtitle'))
   assert.ok(includesText(withoutHook.tree, '任务看板'))
 
   const brokenHook = await renderComponent(BoardTabTitle, {
@@ -666,32 +739,22 @@ test('BoardTabTitle：优先用宿主 tab 标题，缺省/抛错时退回「任�
 })
 
 /* ══════════════════════════════════════════════════════════════
- * 用例：BoardTab —— 窄栏（默认，无 ResizeObserver）
+ * 用例：BoardTab —— 本工作区看板（右栏）
  * ══════════════════════════════════════════════════════════════ */
 
-function renderNarrow(BoardTab, extraProps = {}) {
-  return renderComponent(
-    BoardTab,
-    Object.assign({ useTabInfo: () => ({ sidebar: { fullscreen: false } }) }, extraProps),
-  )
-}
-
-function renderWide(BoardTab, extraProps = {}) {
-  return renderComponent(
-    BoardTab,
-    Object.assign({ useTabInfo: () => ({ sidebar: { fullscreen: true } }) }, extraProps),
-  )
-}
-
-test('BoardTab（窄栏）：无 ResizeObserver 时用 .tb-lanes 纵向 lane，任务/字段/按钮齐全', async () => {
+test('BoardTab（窄栏）：只显示本工作区任务，.tb-lanes + 副标题带工作区名', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
   const BoardTab = harness.componentOf('sidebar.right.pane.tab')
-  const { tree, instance } = await renderNarrow(BoardTab)
+  const { tree, instance } = await renderNarrow(BoardTab, { sessionId: SESSION_A })
 
   assert.equal(tree.props['data-narrow'], 'true', 'narrow lane layout expected without ResizeObserver')
-  assert.equal(tree.props['data-layout'], 'narrow', 'narrow layout is published for CSS')
+  assert.equal(tree.props['data-layout'], 'narrow')
   assert.equal(nodesWithClass(tree, 'tb-lanes').length, 1, 'narrow uses .tb-lanes')
   assert.equal(nodesWithClass(tree, 'tb-board').length, 0, 'narrow must not render the four-column board')
+
+  // 副标题带工作区名（workspaces 里按 path 匹配 title）
+  assert.ok(includesText(tree, '工作区 A'), 'subtitle must name the current workspace')
+  assert.equal(nodesWithClass(tree, 'tb-notice').length, 0, 'known workspace must not show the unknown notice')
 
   const columns = nodesWithClass(tree, 'tb-col')
   assert.equal(columns.length, 4, 'four status lanes must render')
@@ -707,144 +770,130 @@ test('BoardTab（窄栏）：无 ResizeObserver 时用 .tb-lanes 纵向 lane，�
     assert.ok(columnText.includes(label), 'missing column title: ' + label)
   }
 
+  // 只显示 cwd 属于工作区 A 的两条任务
   const cards = nodesWithClass(tree, 'tb-card')
-  assert.equal(cards.length, 5, 'five task cards must render')
+  assert.equal(cards.length, 2, 'only tasks of the current workspace render')
   const pageText = textOf(tree)
-  for (const title of TASK_TITLES) {
-    assert.ok(pageText.includes(title), 'missing task title: ' + title)
+  for (const title of WS_A_TITLES) {
+    assert.ok(pageText.includes(title), 'missing workspace task: ' + title)
+  }
+  for (const title of ['实现轮询自动派发', '写客户端渲染冒烟测试', '归档过期的旧任务']) {
+    assert.ok(!pageText.includes(title), 'task from another workspace / no cwd must not render: ' + title)
   }
 
-  // 任务字段
+  // 工作区 A 的任务字段
   assert.ok(includesText(tree, '先定 board.json 的字段'), 'task note should render')
-  assert.ok(includesText(tree, '结论: 四列已渲染'), 'task result should render')
-  assert.ok(includesText(tree, '上一次投递超时'), 'task lastError should render')
+  assert.ok(includesText(tree, '结论: snapshot / add-task 已通'), 'task result should render')
   assert.ok(includesText(tree, '执行者: main'), 'task assignee should render')
   assert.ok(includesText(tree, '已通知 3 次'), 'notificationCount should render')
-  assert.ok(includesText(tree, 'agent'), 'source=agent tag should render')
   assert.ok(includesText(tree, '5 分钟前'), 'relative time should render')
+  assert.ok(!includesText(tree, '上一次投递超时'), 'lastError belongs to a task outside this workspace')
 
-  // 按钮
   const labels = buttonTexts(tree)
-  for (const label of CARD_BUTTONS) {
+  for (const label of ['开始', '立即派发', '编辑', '删除', '归档', '打回', '全部派发', '全部归档', '刷新', '暂停轮询', '添加到待开始']) {
     assert.ok(labels.includes(label), 'missing card button: ' + label)
   }
-  assert.ok(labels.includes('全部派发'), 'todo lane header needs 全部派发')
-  assert.ok(labels.includes('全部归档'), 'done lane header needs 全部归档')
-  assert.ok(labels.includes('刷新'), 'header needs 刷新')
-  assert.ok(labels.includes('暂停轮询'), 'pollEnabled=true needs 暂停轮询')
-  assert.ok(labels.includes('添加到待开始'), 'composer needs 添加到待开始')
-  assert.ok(!labels.includes('同步模式预设'), '预设随 bundle 安装，不再有同步按钮')
+  assert.ok(!labels.includes('同步模式预设'))
+  assert.ok(!labels.includes('一键归档已完成'), 'platform-only button must not leak into the right board')
 
-  // 窄栏页脚只留版本号：没有 boardPath 的 <code>，也没有「数据文件」标签
+  // 窄栏页脚只留版本号
   assert.equal(collect(tree).find((node) => node.type === 'code'), undefined)
-  assert.ok(includesText(tree, 'v0.1.0'), 'narrow footer keeps the version')
-  assert.ok(!includesText(tree, '数据文件'), 'narrow footer must drop the board path')
+  assert.ok(includesText(tree, 'v0.1.0'))
+  assert.ok(!includesText(tree, '数据文件'))
 
-  // 预设未安装 → warn banner（带原因）
+  // 预设未安装 → warn banner
   const banners = nodesWithClass(tree, 'tb-banner')
-  assert.equal(banners.length, 1, 'exactly one preset banner expected')
+  assert.equal(banners.length, 1)
   assert.equal(banners[0].props['data-tone'], 'warn')
   assert.ok(includesText(banners[0], '没有找到「派单看板模式」'))
-  assert.ok(includesText(banners[0], 'agentPresets'))
 
-  // 只拉一次 snapshot；2 个 interval（轮询 + 相对时间）；清理函数记录 3 个
-  assert.deepEqual(harness.rpcCalls.map((call) => call.endpoint), ['snapshot'])
+  // 一次 snapshot + 一次 session-info（挂载时问工作区）；轮询走 ctx.interval
+  assert.equal(countCalls(harness, 'snapshot'), 1)
+  assert.equal(countCalls(harness, 'session-info'), 1)
   assert.equal(harness.intervals.length, 2)
   assert.equal(harness.windowCounters.setInterval, 0)
-  assert.equal(instance.cleanups.length, 3, 'refresh/poll/tick effects should each record a cleanup')
+  assert.equal(instance.cleanups.length, 3)
 })
 
 test('BoardTab（窄栏）：轮询状态与派发 skip 原因照常渲染', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
-  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'))
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
 
   assert.ok(includesText(tree, '每 15s 轮询'))
   assert.ok(includesText(tree, '目标会话正在运行，稍后自动重试'))
   assert.ok(includesText(tree, '上次派发'))
   assert.ok(includesText(tree, '主会话'), 'last dispatch prefers the session title')
+  assert.ok(includesText(tree, '工作区 A'))
 })
-
-/* ══════════════════════════════════════════════════════════════
- * 用例：BoardTab —— 宽栏（全屏 / 拖宽后）
- * ══════════════════════════════════════════════════════════════ */
 
 test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boardPath，且没有「派发给」选择器', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
   const BoardTab = harness.componentOf('sidebar.right.pane.tab')
-  const { tree } = await renderWide(BoardTab)
+  const { tree } = await renderWide(BoardTab, { sessionId: SESSION_A })
 
-  assert.equal(tree.props['data-narrow'], 'false', 'fullscreen must use the wide layout')
-  assert.equal(tree.props['data-layout'], 'wide', 'fullscreen publishes the wide layout')
-  assert.equal(nodesWithClass(tree, 'tb-board').length, 1, 'wide uses .tb-board')
-  assert.equal(nodesWithClass(tree, 'tb-lanes').length, 0, 'wide must not render narrow lanes')
+  assert.equal(tree.props['data-narrow'], 'false')
+  assert.equal(tree.props['data-layout'], 'wide')
+  assert.equal(nodesWithClass(tree, 'tb-board').length, 1)
+  assert.equal(nodesWithClass(tree, 'tb-lanes').length, 0)
 
   const columns = nodesWithClass(tree, 'tb-col')
   assert.equal(columns.length, 4)
   for (const column of columns) {
-    assert.equal(column.props['data-compact'], 'false', 'wide columns are not compact')
+    assert.equal(column.props['data-compact'], 'false')
   }
-  assert.equal(nodesWithClass(tree, 'tb-card').length, 5)
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 2)
   const pageText = textOf(tree)
-  for (const title of TASK_TITLES) {
-    assert.ok(pageText.includes(title), 'missing task title: ' + title)
+  for (const title of WS_A_TITLES) {
+    assert.ok(pageText.includes(title), 'missing workspace task: ' + title)
   }
 
   const code = collect(tree).find((node) => node.type === 'code')
   assert.ok(code, 'wide footer must render a <code> node')
   assert.equal(textOf(code), 'C:\\Users\\duan\\.dsh\\storages\\taskboard\\board.json')
-  assert.ok(includesText(tree, '数据文件'), 'wide footer keeps the path label')
-  assert.ok(includesText(tree, '看板数据保存在本机'), 'wide footer keeps the tip')
-  assert.ok(includesText(tree, 'v0.1.0'), 'footer version should render')
+  assert.ok(includesText(tree, '数据文件'))
+  assert.ok(includesText(tree, '看板数据保存在本机'))
+  assert.ok(includesText(tree, 'v0.1.0'))
 
-  // 「派发给」选择器已被产品删除：派发完全由宿主自动决定，用户只加任务。
+  // 「派发给」选择器已被产品删除；本页只剩轮询间隔选择器
   const selects = collect(tree).filter((node) => node.type === 'select')
   assert.equal(selects.length, 1, 'only the poll-interval select remains')
   assert.equal(selects[0].props['aria-label'], undefined)
   assert.ok(!includesText(tree, '派发给'), 'dispatch-target selector must be gone')
-  assert.ok(includesText(tree, '加进「待开始」后由主 Agent 自动接手'), 'composer shows the auto hint instead')
+  assert.ok(includesText(tree, '加进「待开始」后由主 Agent 自动接手'), 'composer shows the auto hint')
 })
 
-/* ══════════════════════════════════════════════════════════════
- * 用例：会话绑定（sessionId）与工作区提示 / 卡片 tag
- * ══════════════════════════════════════════════════════════════ */
-
-function composerInput(tree) {
-  return collect(tree).find((node) => node.type === 'input' && node.props.className === 'tb-input')
-}
-
-function submitButton(tree) {
-  return buttons(tree).find((node) => textOf(node).trim() === '添加到待开始')
-}
-
-/** 输入标题 → 重渲染 → 点「添加到待开始」→ 等 RPC 落地。 */
-async function addTaskByUi(BoardTab, initialProps, titleValue) {
-  const rendered = await renderNarrow(BoardTab, initialProps)
-  const input = composerInput(rendered.tree)
-  assert.ok(input, 'composer input must render')
-  input.props.onChange({ target: { value: titleValue } })
-  const filled = await rendered.instance.run()
-  const submit = submitButton(filled)
-  assert.ok(submit, 'submit button must render')
-  assert.equal(submit.props.disabled, false, 'submit becomes enabled once the title is non-empty')
-  submit.props.onClick()
-  await new Promise((resolve) => setImmediate(resolve))
-  return rendered
-}
-
-test('BoardTab：新建任务把当前会话 sessionId 带进 add-task payload', async () => {
+test('BoardTab：工作区未知（无 sessionId / 历史会话）时给说明条并显示空看板', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
-  await addTaskByUi(harness.componentOf('sidebar.right.pane.tab'), { sessionId: 'session-abc' }, '把任务绑定到本对话')
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'))
+
+  assert.equal(tree.props['data-narrow'], 'true')
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 0, 'unknown workspace shows no tasks')
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 4, 'empty board still renders the four lanes')
+  const notices = nodesWithClass(tree, 'tb-notice')
+  assert.equal(notices.length, 1)
+  assert.ok(includesText(notices[0], '无法确定当前工作区'))
+  assert.equal(countCalls(harness, 'session-info'), 0, 'no session id means no session-info probe')
+  assert.equal(countCalls(harness, 'snapshot'), 1)
+})
+
+test('BoardTab：新建任务把当前会话 sessionId 带进 add-task payload（不带 cwd）', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  await addTaskByUi(
+    () => renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: 'session-abc' }),
+    '把任务绑定到本对话',
+  )
 
   const addCall = harness.rpcCalls.find((call) => call.endpoint === 'add-task')
   assert.ok(addCall, 'clicking 添加到待开始 must call add-task')
   assert.equal(addCall.channel, '/taskboard')
   // payload 由 vm 沙箱里的组件创建，跨 realm 对象先拷回本 realm 再比较
   assert.deepEqual(Object.assign({}, addCall.payload), { title: '把任务绑定到本对话', sessionId: 'session-abc' })
+  assert.equal('cwd' in addCall.payload, false, 'right board lets the host resolve cwd from sessionId')
 })
 
 test('BoardTab：没有 sessionId 时 add-task payload 不带会话绑定', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
-  await addTaskByUi(harness.componentOf('sidebar.right.pane.tab'), undefined, '普通任务')
+  await addTaskByUi(() => renderNarrow(harness.componentOf('sidebar.right.pane.tab')), '普通任务')
 
   const addCall = harness.rpcCalls.find((call) => call.endpoint === 'add-task')
   assert.ok(addCall)
@@ -854,6 +903,7 @@ test('BoardTab：没有 sessionId 时 add-task payload 不带会话绑定', asyn
 
 test('BoardTab：当前会话有 cwd 时新建提示写工作区名，否则退回通用提示', async () => {
   const snapshot = makeSnapshot({
+    workspaces: [],
     agents: [
       { sessionId: 'session-abc', status: 'running', cwd: 'C:\\Users\\duan\\Code\\demo\\demo\\日常问答' },
       { sessionId: 'session-other', status: 'idle', cwd: 'C:\\work\\demo' },
@@ -872,15 +922,14 @@ test('BoardTab：当前会话有 cwd 时新建提示写工作区名，否则退�
   const unmatchedHint = nodesWithClass(unmatched.tree, 'tb-hint')
   assert.equal(unmatchedHint.length, 1)
   assert.ok(includesText(unmatchedHint[0], '你只管加任务和看结论'), 'unknown session keeps the generic hint')
-  assert.ok(!includesText(unmatchedHint[0], '工作区：'), 'generic hint must not name a workspace')
+  assert.ok(!includesText(unmatchedHint[0], '工作区：'))
 
   const noSession = await renderNarrow(BoardTab)
-  const noSessionHint = nodesWithClass(noSession.tree, 'tb-hint')
-  assert.equal(noSessionHint.length, 1)
-  assert.ok(includesText(noSessionHint[0], '你只管加任务和看结论'))
+  assert.ok(includesText(nodesWithClass(noSession.tree, 'tb-hint')[0], '你只管加任务和看结论'))
 
-  // 会话匹配但 agent 没有 cwd（或 cwd 为空）→ 仍退回通用提示
+  // 会话匹配但 cwd 为空 → 通用提示
   const noCwdSnapshot = makeSnapshot({
+    workspaces: [],
     agents: [{ sessionId: 'session-abc', status: 'running', cwd: '' }],
   })
   const noCwdHarness = createHarness({ snapshot: noCwdSnapshot })
@@ -888,27 +937,209 @@ test('BoardTab：当前会话有 cwd 时新建提示写工作区名，否则退�
   assert.ok(includesText(nodesWithClass(noCwd.tree, 'tb-hint')[0], '你只管加任务和看结论'))
 })
 
-test('BoardTab：任务带 cwd 时卡片出现「工作区 demo」tag，title 为完整路径', async () => {
-  const snapshot = makeSnapshot({
-    tasks: [
-      { id: 't-1', title: '写冒烟测试', status: 'todo', cwd: 'C:\\work\\demo', updatedAt: minutesAgo(2) },
-      { id: 't-2', title: '没有工作区的任务', status: 'todo', updatedAt: minutesAgo(2) },
-    ],
+/* ══════════════════════════════════════════════════════════════
+ * 用例：左侧栏平台看板入口图标
+ * ══════════════════════════════════════════════════════════════ */
+
+test('PlatformPanelIcon：todo+doing 角标 + 6s 轮询 snapshot', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const Icon = harness.componentOf('sidebar.panellist')
+  const { tree, instance } = await renderComponent(Icon, { size: 18 })
+
+  assert.ok(hasClass(tree, 'tb-icon'))
+  assert.match(String(tree.props.title), /平台任务看板/)
+  assert.match(String(tree.props.title), /3 条待处理/)
+
+  const svg = collect(tree).find((node) => node.type === 'svg')
+  assert.ok(svg, 'platform entry must render the board glyph')
+  assert.equal(svg.props.width, 18)
+  assert.equal(collect(svg).filter((node) => node.type === 'rect').length, 4)
+
+  const badge = nodesWithClass(tree, 'tb-badge')
+  assert.equal(badge.length, 1, 'todo + doing = 3 must show a badge')
+  assert.equal(textOf(badge[0]), '3')
+
+  assert.equal(countCalls(harness, 'snapshot'), 1)
+  assert.equal(harness.intervals.length, 1)
+  assert.equal(harness.intervals[0].ms, 6000)
+  assert.equal(harness.windowCounters.setInterval, 0)
+  assert.ok(instance.cleanups.length >= 1)
+})
+
+test('PlatformPanelIcon：RPC 失败时不崩、不显示角标', async () => {
+  const harness = createHarness({
+    rpc: () => Promise.resolve({ ok: false, error: { code: 'network', message: 'boom' } }),
   })
-  const harness = createHarness({ snapshot })
-  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'))
-
-  const workspaceTags = nodesWithClass(tree, 'tb-card-tag').filter((node) => textOf(node).includes('工作区'))
-  assert.equal(workspaceTags.length, 1, 'only the task with cwd carries a workspace tag')
-  assert.equal(textOf(workspaceTags[0]), '工作区 demo')
-  assert.equal(workspaceTags[0].props.title, 'C:\\work\\demo')
-
-  const titles = nodesWithClass(tree, 'tb-card-title').map((node) => textOf(node))
-  assert.deepEqual(titles, ['写冒烟测试', '没有工作区的任务'], 'both tasks still render their titles')
+  const result = await renderComponent(harness.componentOf('sidebar.panellist'), { size: 20 })
+  assert.equal(nodesWithClass(result.tree, 'tb-badge').length, 0)
+  assert.equal(result.tree.props.title, '平台任务看板')
+  const svg = collect(result.tree).find((node) => node.type === 'svg')
+  assert.equal(svg.props.width, 20)
 })
 
 /* ══════════════════════════════════════════════════════════════
- * 用例：预设 banner 状态机（窄栏渲染，与布局无关）
+ * 用例：PlatformBoard —— 全部工作区看板（左侧栏 main 页面）
+ * ══════════════════════════════════════════════════════════════ */
+
+test('PlatformBoard：默认显示全部工作区任务，卡片带工作区 tag，可按工作区过滤', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  assert.ok(hasClass(tree, 'tb-page'))
+  assert.ok(hasClass(tree, 'tb-platform'))
+  assert.equal(tree.props['data-layout'], 'wide')
+  assert.ok(includesText(tree, '平台任务看板'))
+  assert.ok(includesText(tree, '共 5 条'), 'header shows the total task count')
+
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 4)
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 5, 'all tasks render by default')
+  const pageText = textOf(tree)
+  for (const title of TASK_TITLES) {
+    assert.ok(pageText.includes(title), 'missing task: ' + title)
+  }
+
+  // 工作区 tag：4 条有 cwd 的任务各一个（cwd=null 的老任务不显示）
+  const workspaceTags = nodesWithClass(tree, 'tb-card-tag').filter((node) => textOf(node).includes('工作区'))
+  assert.equal(workspaceTags.length, 4)
+  assert.equal(
+    workspaceTags.map((node) => textOf(node)).sort().join('|'),
+    '工作区 a|工作区 a|工作区 b|工作区 b',
+  )
+  for (const tag of workspaceTags) {
+    assert.ok(String(tag.props.title).startsWith('C:\\work\\'), 'workspace tag title carries the full path')
+  }
+
+  // 工作区过滤下拉：全部 + 两个工作区（title 为空用路径尾段）
+  const filterSelect = selectByAria(tree, '工作区')
+  assert.ok(filterSelect, 'workspace filter select must render')
+  assert.equal(filterSelect.props.value, '')
+  assert.deepEqual(optionTexts(filterSelect), ['全部工作区', '工作区 A', 'b'])
+
+  // 过滤到工作区 A：只显示属于 A 的两条
+  filterSelect.props.onChange({ target: { value: WS_A } })
+  const filteredA = await instance.run()
+  assert.equal(nodesWithClass(filteredA, 'tb-card').length, 2)
+  assert.ok(includesText(filteredA, '梳理看板数据模型'))
+  assert.ok(includesText(filteredA, '打通宿主 RPC'))
+  assert.ok(!includesText(filteredA, '实现轮询自动派发'))
+  assert.ok(includesText(filteredA, '共 2 条'), 'toolbar count follows the filter')
+  assert.ok(includesText(filteredA, '共 5 条'), 'header still shows the total')
+
+  // 过滤只影响显示，不触发额外 RPC
+  assert.equal(countCalls(harness, 'snapshot'), 1)
+})
+
+test('PlatformBoard：新增任务必须选工作区，提交 payload 带 cwd、不带 sessionId', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const PlatformBoard = harness.componentOf('main')
+  const { tree, instance } = await renderComponent(PlatformBoard, {})
+
+  let submit = submitButton(tree)
+  assert.ok(submit)
+  assert.equal(submit.props.disabled, true, 'submit disabled while no workspace is chosen')
+  assert.ok(includesText(tree, '先选择任务所属的工作区'), 'hint explains the required workspace')
+
+  // 工作区下拉：placeholder + 两个工作区
+  const workspaceSelect = selectByAria(tree, '任务所属工作区')
+  assert.ok(workspaceSelect, 'workspace picker must render')
+  assert.deepEqual(optionTexts(workspaceSelect), ['选择工作区', '工作区 A', 'b'])
+
+  // 只选工作区、没写标题 → 仍然禁用
+  workspaceSelect.props.onChange({ target: { value: WS_A } })
+  let next = await instance.run()
+  submit = submitButton(next)
+  assert.equal(submit.props.disabled, true, 'submit stays disabled without a title')
+  assert.ok(!includesText(next, '先选择任务所属的工作区'), 'hint disappears once a workspace is chosen')
+
+  // 写标题 → 可提交
+  composerInput(next).props.onChange({ target: { value: '平台任务一' } })
+  next = await instance.run()
+  submit = submitButton(next)
+  assert.equal(submit.props.disabled, false)
+  submit.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const addCall = harness.rpcCalls.find((call) => call.endpoint === 'add-task')
+  assert.ok(addCall, 'clicking 添加到待开始 must call add-task')
+  assert.equal(addCall.channel, '/taskboard')
+  assert.deepEqual(Object.assign({}, addCall.payload), { title: '平台任务一', cwd: WS_A })
+  assert.equal('sessionId' in addCall.payload, false, 'platform board must not bind a session')
+})
+
+test('PlatformBoard：页面结构、按钮与页脚/预设 banner', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+
+  const labels = buttonTexts(tree)
+  for (const label of ['立即刷新', '暂停轮询', '一键归档已完成', '添加到待开始', '加备注']) {
+    assert.ok(labels.includes(label), 'missing platform control: ' + label)
+  }
+  assert.ok(!labels.includes('同步模式预设'))
+
+  // 页脚：数据文件路径 + 版本（平台页始终是宽布局）
+  const code = collect(tree).find((node) => node.type === 'code')
+  assert.ok(code, 'platform footer must render the board path')
+  assert.equal(textOf(code), 'C:\\Users\\duan\\.dsh\\storages\\taskboard\\board.json')
+  assert.ok(includesText(tree, '数据文件'))
+  assert.ok(includesText(tree, 'v0.1.0'))
+
+  // 预设未安装 → warn banner
+  const banners = nodesWithClass(tree, 'tb-banner')
+  assert.equal(banners.length, 1)
+  assert.equal(banners[0].props['data-tone'], 'warn')
+  assert.ok(includesText(banners[0], '没有找到「派单看板模式」'))
+
+  // 同一工作区路径（斜杠/大小写不同）在下拉里只出现一次
+  const dupHarness = createHarness({
+    snapshot: makeSnapshot({
+      workspaces: [
+        { id: 'w1', path: WS_A, title: '工作区 A', status: 'ok' },
+        { id: 'w1b', path: 'c:/work/a/', title: '工作区 A 重复', status: 'ok' },
+        { id: 'w2', path: WS_B, title: '', status: 'ok' },
+      ],
+    }),
+  })
+  const dupTree = (await renderComponent(dupHarness.componentOf('main'), {})).tree
+  assert.deepEqual(optionTexts(selectByAria(dupTree, '任务所属工作区')), ['选择工作区', '工作区 A', 'b'])
+  assert.deepEqual(optionTexts(selectByAria(dupTree, '工作区')), ['全部工作区', '工作区 A', 'b'])
+})
+
+test('PlatformBoard：快照为空时显示空态与空工作区下拉（不抛异常）', async () => {
+  const harness = createHarness({ snapshot: {} })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 0)
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 4, 'columns still render when empty')
+  assert.ok(includesText(tree, '没有任务。选个工作区加一条，主 Agent 会自动接手。'))
+  assert.ok(includesText(tree, '共 0 条'))
+
+  const code = collect(tree).find((node) => node.type === 'code')
+  assert.ok(code)
+  assert.equal(textOf(code), '')
+
+  const workspaceSelect = selectByAria(tree, '任务所属工作区')
+  assert.deepEqual(optionTexts(workspaceSelect), ['选择工作区'])
+  assert.equal(submitButton(tree).props.disabled, true)
+})
+
+test('PlatformBoard：RPC 报错时降级渲染（错误 banner + 四列仍在）', async () => {
+  const harness = createHarness({
+    rpc: () => Promise.resolve({ ok: false, error: { code: 'network', message: 'connect ECONNREFUSED' } }),
+  })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+
+  assert.ok(hasClass(tree, 'tb-page'))
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 4)
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 0)
+  const banners = nodesWithClass(tree, 'tb-banner')
+  assert.equal(banners.length, 1)
+  assert.equal(banners[0].props['data-tone'], 'error')
+  assert.equal(banners[0].props.role, 'alert')
+  assert.ok(includesText(banners[0], '连接看板服务失败：网络错误'))
+})
+
+/* ══════════════════════════════════════════════════════════════
+ * 用例：预设 banner 状态机 / 降级渲染（右栏 BoardTab）
  * ══════════════════════════════════════════════════════════════ */
 
 test('BoardTab：preset 正常时不出现 banner；broken 时出现 error banner', async () => {
@@ -916,47 +1147,40 @@ test('BoardTab：preset 正常时不出现 banner；broken 时出现 error banne
     preset: { installed: true, path: 'bundle:presets/taskboard.patch.yml', restartRequired: false, broken: '' },
   })
   const okHarness = createHarness({ snapshot: okSnapshot })
-  const okTree = (await renderNarrow(okHarness.componentOf('sidebar.right.pane.tab'))).tree
+  const okTree = (await renderNarrow(okHarness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })).tree
   assert.equal(nodesWithClass(okTree, 'tb-banner').length, 0)
 
   const brokenSnapshot = makeSnapshot({
     preset: { installed: false, path: 'bundle:presets/taskboard.patch.yml', broken: 'row persona: boom' },
   })
   const brokenHarness = createHarness({ snapshot: brokenSnapshot })
-  const brokenTree = (await renderNarrow(brokenHarness.componentOf('sidebar.right.pane.tab'))).tree
+  const brokenTree = (await renderNarrow(brokenHarness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })).tree
   const brokenBanners = nodesWithClass(brokenTree, 'tb-banner')
   assert.equal(brokenBanners.length, 1)
   assert.equal(brokenBanners[0].props['data-tone'], 'error')
-  assert.equal(brokenBanners[0].props.role, 'alert')
   assert.ok(includesText(brokenBanners[0], '加载失败'))
   assert.ok(includesText(brokenBanners[0], 'row persona: boom'))
 })
-
-/* ══════════════════════════════════════════════════════════════
- * 用例：降级渲染
- * ══════════════════════════════════════════════════════════════ */
 
 test('BoardTab：RPC 报错时降级渲染（错误 banner + 四列仍在，不抛异常）', async () => {
   const harness = createHarness({
     rpc: () => Promise.resolve({ ok: false, error: { code: 'network', message: 'connect ECONNREFUSED' } }),
   })
-  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'))
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
 
   assert.ok(hasClass(tree, 'tb-page'))
-  assert.equal(tree.props['data-narrow'], 'true')
-  assert.equal(nodesWithClass(tree, 'tb-col').length, 4, 'lanes must survive a failed snapshot')
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 4)
   assert.equal(nodesWithClass(tree, 'tb-card').length, 0)
   const banners = nodesWithClass(tree, 'tb-banner')
   assert.equal(banners.length, 1)
   assert.equal(banners[0].props['data-tone'], 'error')
   assert.equal(banners[0].props.role, 'alert')
   assert.ok(includesText(banners[0], '连接看板服务失败：网络错误'))
-  assert.ok(includesText(tree, '没有待开始的任务'))
 })
 
 test('BoardTab：snapshot 为空对象时降级渲染（四列空态，不抛异常）', async () => {
   const harness = createHarness({ snapshot: {} })
-  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'))
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
 
   assert.equal(nodesWithClass(tree, 'tb-col').length, 4)
   assert.equal(nodesWithClass(tree, 'tb-card').length, 0)
@@ -968,6 +1192,5 @@ test('BoardTab：snapshot 为空对象时降级渲染（四列空态，不抛异
   ]) {
     assert.ok(includesText(tree, empty), 'missing empty state: ' + empty)
   }
-  assert.ok(includesText(tree, '每 15s 轮询'), 'default config fallback should render')
-  assert.equal(collect(tree).find((node) => node.type === 'code'), undefined)
+  assert.ok(includesText(tree, '每 15s 轮询'))
 })

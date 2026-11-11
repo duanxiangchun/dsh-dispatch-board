@@ -76,20 +76,25 @@ README.md               Lead：安装 / 使用 / 排障
    - 会话空闲 → **派回创建它的那个对话**（`creator-session`），子 Agent 在同一个工作区里干活；
    - 会话正在跑 → 本轮跳过（`creator-busy`），**绝不改派别的会话**，等它空下来；
    - 用户手动点「立即派发」（`force`）时例外：即使它正忙，也把消息排进它的下一轮。
-2. 创建它的会话没有 live agent（历史/冷会话）→ 先尝试**唤醒它**：Web 端走
+2. 任务带 `cwd` 但没有 `sessionId`（平台看板创建的）→ 优先找**同一工作区**的空闲 root 会话
+   （`workspace-session`，路径归一化比较）；同工作区没有空闲会话 →
+   `workspace-busy`（有会话在跑）/ `workspace-offline`（一个都没有），**本轮不派**，也不改派到别的工作区；
+   只有手动「立即派发」（`force`）才允许退化到第 4 步的挑法；
+3. 创建它的会话没有 live agent（历史/冷会话）→ 先尝试**唤醒它**：Web 端走
    `ctx.get('sessionController').resolveAgent(sessionId)`（与 UI 打开会话时的物化同一路径，带并发去重）。
    成功就按第 1 步回派；失败（实测历史会话被 UI 持有 writer 时会返回 `session/writer-held`）记 5 分钟负缓存；
-3. 唤醒不成功 → **本轮不派**（`creator-cold`）：任务留在待开始并显示
+4. 唤醒不成功 → **本轮不派**（`creator-cold`）：任务留在待开始并显示
    「创建这条任务的对话还没激活（历史会话）：在那边发一条消息，任务就会回到该对话执行；急的话点『立即派发』」。
    **绝不**把工作区绑定的任务偷偷派到别的会话/工作区；
-4. 只有手动「立即派发」（`force`）才允许退化：优先 `session.header.agentPreset === 'taskboard-dispatch'`
+5. 只有手动「立即派发」（`force`）才允许退化：优先 `session.header.agentPreset === 'taskboard-dispatch'`
    的空闲 root Agent，再退化到最近注册的空闲 root Agent；
-5. 都没有（没有任何空闲会话）→ 本轮跳过，UI 显示跳过原因（`agent-busy` / `no-live-agent`）。
+6. 都没有（没有任何空闲会话）→ 本轮跳过，UI 显示跳过原因（`agent-busy` / `no-live-agent`）。
 
 一次轮询会**逐条**试候选任务：某个任务的目标会话正忙时跳过它继续看下一条，
 不会让「一个忙会话」挡住整列任务（每个任务按自己的创建者判断）。
 
-`task.sessionId` = 创建这条任务的对话（决定默认派发归属）；`task.cwd` = 该对话的工作区。
+`task.sessionId` = 创建这条任务的对话（右栏创建时记录，决定默认派发归属）；
+`task.cwd` = 任务所属工作区（右栏创建时由会话解析；平台看板创建时由用户选择，直接取 `workspaceRegistry.list()` 的 `path`）。
 三个解析时机：`add-task` 时先查 live Agent/Session 的 `header.cwd`；查不到用
 `sessionQuery.listSessions()` 从会话列表兜底（冷会话也能拿到）；仍没有就在投递前从目标会话补一次。
 `cwd` 会写进派发文本的「工作目录」一行，也是卡片上「工作区 X」tag 的来源。
@@ -165,7 +170,7 @@ Content-Type: application/json
 | endpoint | payload | value | 说明 |
 | --- | --- | --- | --- |
 | `snapshot` | `{}` | `Snapshot` | 全量看板 + 运行时状态，client 每 2s 轮一次 |
-| `add-task` | `{title, note?, sessionId?}` | `{task}` | 新建到 `todo`，`source='user'`；`sessionId` = 创建它的对话（右栏 tab 自带），宿主据此解析 `cwd` 并决定派发归属 |
+| `add-task` | `{title, note?, sessionId?, cwd?}` | `{task}` | 新建到 `todo`，`source='user'`；右栏传 `sessionId`（宿主解析 cwd），平台看板传 `cwd`（用户选的工作区） |
 | `update-task` | `{id, status?, title?, note?, result?, assignee?, lastError?}` | `{task}` | 局部更新；非法状态迁移 → `conflict` |
 | `delete-task` | `{id}` | `{deleted:true,id}` | 物理删除（仅限 UI 手动） |
 | `dispatch-now` | `{id}` | `{dispatched, sessionId, task}` | 立即投递一次（不等轮询、无视冷却） |
@@ -191,6 +196,9 @@ Content-Type: application/json
     "lastDispatchSessionTitle": "…" | null,  // 会话标题（有则优先展示）
     "lastSkipReason": "no-live-agent" | "agent-busy" | "cooldown" | "poll-disabled" | null
   },
+  "workspaces": [                           // 工作区注册表（平台看板的新建下拉/过滤用）
+    { "id": "…", "path": "C:\\work\\demo", "title": "demo", "status": "ok" }
+  ],
   "agents": [                               // 在线会话快照（client 用它显示「当前工作区」提示；不提供会话选择器）
     { "sessionId": "…", "status": "idle"|"running", "cwd": "…"|null, "title": "…"|null,
       "preset": "taskboard-dispatch"|"standard"|…|null, "root": true }
@@ -288,10 +296,16 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 
 ---
 
-## 5. Client 半要求（右侧栏放置）
+## 5. Client 半要求（两个看板）
 
-看板住在**右侧栏**（官方 `@deepseek-ai/dsh-client-ui-sidebar-right` 的 tab 体系），不是左侧菜单面板。
-左侧 `sidebar.panellist` / `main` 两个注册已删除——用户明确要求放在右侧栏。
+同一个数据文件、两套视图：
+
+| 视图 | 位置 | 范围 | 新建任务 |
+| --- | --- | --- | --- |
+| **本工作区看板** | 右侧栏 tab（`sidebarRightTabs` + `sidebar.right.pane.tab`）+ 会话 header 入口按钮 | 只显示 `task.cwd === 当前会话工作区` 的任务 | 默认绑定当前对话/工作区（sessionId 交给宿主解析 cwd） |
+| **平台任务看板** | 左侧栏面板（`sidebar.panellist` + `main` 整页） | 全部任务（含 `cwd=null` 的老任务），每张卡带工作区 tag，可按工作区过滤 | **必须选工作区**（下拉来自 `snapshot.workspaces`），传 `cwd`、不传 sessionId |
+
+两个视图共用同一套卡片/列组件与 RPC；左栏面板图标带 `todo+doing` 角标。
 
 ### 5.0 右栏集成契约（0.2.2-rc.1 实测）
 
@@ -313,13 +327,31 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 
 | 槽位 | 注册参数 | 内容 |
 | --- | --- | --- |
-| `conversation.session.header.actions` | `{ name, id:'taskboard', order:40, label: () => t('panel.label') }` | 会话 header 右侧的看板按钮（`.tb-headbtn`），带 `todo` 数量角标（`.tb-badge`，>99 显示 99+，6s 刷新） |
-| `sidebar.right.pane.tab` | `{ name, key:'dsh-taskboard' }` | 看板正文 `BoardTab` |
+| `conversation.session.header.actions` | `{ name, id:'taskboard', order:40, label: () => t('panel.label') }` | 会话 header 右侧的看板按钮（`.tb-headbtn`），带本工作区 `todo` 数量角标（`.tb-badge`，>99 显示 99+，6s 刷新） |
+| `sidebar.right.pane.tab` | `{ name, key:'dsh-taskboard' }` | 本工作区看板正文 `BoardTab` |
 | `sidebar.right.pane.tab.title` | `{ name, key:'dsh-taskboard' }` | chip：看板 glyph + 标题 |
+| `sidebar.panellist` | `{ name:'sidebar.panellist', id:'taskboard-platform', order:25, label: () => t('platform.label'), locale }` | 左侧栏「平台任务看板」图标，带 `todo+doing` 角标 |
+| `main` | `{ name:'main', key:'taskboard-platform', locale }` | 平台任务看板整页 `PlatformBoard` |
 
 > `label` 必须是 thunk（`string | (() => string)`），语言切换后无需重注册。
 
-### 5.2 看板面板布局
+### 5.1.1 平台看板页（`main`）
+
+自上而下：
+
+1. **头部**：标题「平台任务看板」+ 副标题（`共 N 条 · 轮询状态`）+ 立即刷新 + 轮询开关 + 间隔选择 +
+   一键归档已完成；preset 异常 banner；页脚（数据文件路径 + 版本）。
+2. **新建行**：标题输入（Enter 提交）+ 备注展开 + **工作区选择（必选）**：
+   下拉 `placeholder = 选择工作区`，options 来自 `snapshot.workspaces`（title，空则路径尾段）；
+   未选时「添加到待开始」禁用并提示「先选择任务所属的工作区」。提交 `add-task {title, note?, cwd: 工作区 path}`。
+3. **工作区过滤**：`全部工作区`（默认）/ 单个工作区——只影响显示。
+4. **四列看板**：复用 `Col`（宽度足够时四列），卡片带「工作区 X」tag；`cwd=null` 的老任务也显示（无 tag）。
+5. **空态**：「没有任务。选个工作区加一条，主 Agent 会自动接手。」
+
+派发：平台任务带 `cwd`，宿主优先找同工作区的空闲会话（`workspace-session`），找不到就等
+（`workspace-offline` / `workspace-busy`），手动「立即派发」才允许改派。
+
+### 5.2 右栏看板布局
 
 | 条件 | 布局 |
 | --- | --- |

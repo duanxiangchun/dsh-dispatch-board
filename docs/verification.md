@@ -96,6 +96,20 @@ transcript-worker-af04b22a: header.agentPreset=taskboard-worker, header.parentSe
 | 3 | `board.json` 中该任务 `sessionId=null`；`poll.lastDispatchSessionId` 指向当时在线的会话 | PASS | `rs-data.json` |
 | 4 | console 无报错 | PASS | `rs-console.json` |
 
+## 2.5 双看板（右栏本工作区 / 左栏平台）
+
+需求：右栏看板只显示本工作区任务；左侧栏加回「平台任务看板」显示全平台任务、卡片带工作区标签、
+新建必须选工作区。验证 `.dev/e2e/dual-board-report.md`：**6/6 PASS**
+
+| # | 项目 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 1 | 右栏只显示本工作区任务，副标题「· 工作区名」 | PASS | `dual-01-right-scope.png` |
+| 2 | 左栏平台看板入口 + todo+doing 角标；未选工作区时禁用添加 + 提示 | PASS | `dual-02-platform.png`、`dual-03-required.png`、`dual-08-platform-badge.png` |
+| 3 | 平台新建（选 plinto）→ 卡片「工作区 plinto」tag；board.json cwd、sessionId=null | PASS | `dual-04-created.png` |
+| 4 | 派发：无 plinto 会话 → `workspace-offline` 待开始；开了 plinto 会话后 15s 内派给它 → doing → done | PASS | `dual-05-offline.png`、`dual-05b-doing.png`、`dual-05c-done.png` |
+| 5 | 工作区过滤（全部 2 / plinto 1 / 日常问答 1），tag 与 cwd 一致 | PASS | `dual-06-filter-all.png`、`dual-06-filter.png` |
+| 6 | 右栏建任务在平台看板可见（数据同源），console 零错 | PASS | `dual-07-right-add.png`、`dual-07-both.png` |
+
 ## 3. 复跑方式
 
 ```powershell
