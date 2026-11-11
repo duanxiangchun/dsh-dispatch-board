@@ -227,7 +227,7 @@ test('apply 注册右栏 tab 类型 + 右栏三处入口 + 左侧栏平台看板
   const harness = createApplyHarness()
 
   // 1) 两个 cordis 注入点：tab 类型 + 右栏导航服务
-  assert.deepEqual(harness.injectRequests, [['sidebarRightTabs'], ['sidebarRight']])
+  assert.deepEqual(harness.injectRequests, [['sidebarRightTabs'], ['uiWorkspace'], ['sidebarRight']])
 
   // 2) tab 类型定义：register 包在 scope.effect 里，definition 形状正确
   //    （sidebarRight 句柄也会注册一个清理 effect，所以按 label 精确找 tab 类型那个。）
@@ -314,7 +314,7 @@ test('apply 在右侧栏服务缺失时安静降级（不崩、槽位照常注�
   const harness = createApplyHarness({ sidebarRightTabs: false, sidebarRight: false })
 
   // 注入请求已被发起，但服务未就绪 → 回调不执行
-  assert.deepEqual(harness.injectRequests, [['sidebarRightTabs'], ['sidebarRight']])
+  assert.deepEqual(harness.injectRequests, [['sidebarRightTabs'], ['uiWorkspace'], ['sidebarRight']])
   assert.equal(harness.scopeEffects.length, 0)
   assert.equal(harness.tabs.definitions.length, 0)
   assert.equal(harness.openTabCalls.length, 0)

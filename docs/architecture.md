@@ -390,6 +390,10 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
      - done：`归档`（→archived）、`返工`（→doing）
      - archived：`重新打开`（→todo）、`删除`
    - 编辑用行内表单（标题 + 备注），保存调 `update-task`。
+   - **跳到关联对话**：卡片动作里「对话」（`task.dispatchedSessionId` 优先，其次 `task.sessionId`）；
+     详情浮层「关联对话」区块里分别有「发起对话 · <尾8>」与「执行对话 · <尾8>」按钮。
+     点击调用客户端服务 `ctx.get('uiWorkspace').openSession(sessionId)`（官方导航 API，同步 void），
+     服务缺失/会话不存在时只 console.warn 不崩。宿主在投递时把 `dispatchedSessionId` / Title 记到任务上。
    - **任务详情浮层**（`Detail`，两块看板共用）：点卡片标题或「详情」按钮打开，展示完整标题 / 状态 /
      工作区 / 创建·开始·完成·归档时间 / 执行者 / 创建来源 / 提醒次数 / 任务 id / 完整备注 /
      完整结论（含 done 但没写结论时的提示）/ 最近错误，并提供按状态的主操作（开始 / 完成 / 归档 / 重新打开）

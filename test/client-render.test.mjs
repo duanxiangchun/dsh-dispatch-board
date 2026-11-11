@@ -422,7 +422,17 @@ function createHarness(options = {}) {
       getLocale: () => ({ active: 'zh-CN' }),
     },
   }
-  const scopeServices = { sidebarRightTabs: tabsService, sidebarRight: sidebarRightService }
+  const openSessionCalls = []
+  const uiWorkspaceService = options.uiWorkspace === false ? undefined : {
+    openSession(sessionId) {
+      openSessionCalls.push(sessionId)
+    },
+  }
+  const scopeServices = {
+    uiWorkspace: uiWorkspaceService,
+    sidebarRightTabs: tabsService,
+    sidebarRight: sidebarRightService,
+  }
 
   const effects = []
   const cleanups = []
@@ -488,6 +498,7 @@ function createHarness(options = {}) {
     scopeEffects,
     tabs,
     openTabCalls,
+    openSessionCalls,
     document: documentStub,
     windowCounters,
     warnings,
@@ -1320,8 +1331,11 @@ test('Detail：done 但结论为空时显示 .tb-detail-muted 提示；未完成
 
   const doneTree = await openDetailByTitle(instance, tree, '完成了但没写结论')
   const muted = nodesWithClass(doneTree, 'tb-detail-muted')
-  assert.equal(muted.length, 1, 'empty result for a done task must use .tb-detail-muted')
-  assert.ok(includesText(muted[0], '任务已完成，但主 Agent 还没有写结论。'))
+  // 结论区一个 muted（done 但空结论）+ 关联对话区一个 muted（无任何关联会话）
+  const resultMuted = muted.filter((node) => textOf(node).includes('任务已完成，但主 Agent 还没有写结论。'))
+  const sessionMuted = muted.filter((node) => textOf(node).includes('（这条任务还没有关联对话）'))
+  assert.equal(resultMuted.length, 1, 'empty result for a done task must use .tb-detail-muted')
+  assert.equal(sessionMuted.length, 1, 'task without sessions must show the no-session muted text')
   // 关闭后打开未完成任务：空结论走「待写」提示，不是 muted
   const closeButton = buttons(doneTree).find((node) => node.props['aria-label'] === '关闭')
   assert.ok(closeButton, 'detail must render a close button')
@@ -1329,7 +1343,17 @@ test('Detail：done 但结论为空时显示 .tb-detail-muted 提示；未完成
   const closed = await instance.run()
   assert.equal(detailMask(closed), null)
   const todoTree = await openDetailByTitle(instance, closed, '还没开始的任务')
-  assert.equal(nodesWithClass(todoTree, 'tb-detail-muted').length, 0)
+  const todoMuted = nodesWithClass(todoTree, 'tb-detail-muted')
+  assert.equal(
+    todoMuted.filter((node) => textOf(node).includes('任务还没完成')).length,
+    0,
+    'pending-result placeholder is not muted',
+  )
+  assert.equal(
+    todoMuted.filter((node) => textOf(node).includes('（这条任务还没有关联对话）')).length,
+    1,
+    'no-session muted still renders for a task without sessions',
+  )
   assert.ok(detailText(todoTree).includes('任务还没完成，完成后主 Agent 会把结论写在这里。'))
 })
 
@@ -1419,4 +1443,159 @@ test('两块看板都能打开详情浮层（右栏点标题 / 平台点「详�
   const platformHeading = collect(detailBox(platformTree)).find((node) => node.type === 'h2')
   assert.ok(platformHeading)
   assert.equal(textOf(platformHeading), '梳理看板数据模型', '详情 button opens the matching task')
+})
+
+/* ══════════════════════════════════════════════════════════════
+ * 用例：跳到关联对话（uiWorkspace.openSession）
+ * ══════════════════════════════════════════════════════════════ */
+
+function cardByTitle(tree, title) {
+  return (
+    collect(tree).find((node) => {
+      if (!hasClass(node, 'tb-card')) return false
+      return collect(node).some((child) => hasClass(child, 'tb-card-titlebtn') && textOf(child) === title)
+    }) || null
+  )
+}
+
+function detailSessionButtons(tree) {
+  const box = detailBox(tree)
+  assert.ok(box, 'detail overlay must be open')
+  const row = collect(box).find((node) => hasClass(node, 'tb-detail-sessions'))
+  assert.ok(row, 'detail session block must render')
+  return buttons(row)
+}
+
+test('卡片「对话」按钮：只有关联会话才出现，dispatchedSessionId 优先', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      { id: 'c-1', title: '有发起会话', status: 'todo', cwd: WS_A, sessionId: 'session-aaaa1111', updatedAt: minutesAgo(2) },
+      { id: 'c-2', title: '有执行会话', status: 'todo', cwd: WS_A, dispatchedSessionId: 'session-bbbb2222', updatedAt: minutesAgo(2) },
+      {
+        id: 'c-3',
+        title: '两者都有',
+        status: 'todo',
+        cwd: WS_A,
+        sessionId: 'session-cccc3333',
+        dispatchedSessionId: 'session-dddd4444',
+        updatedAt: minutesAgo(2),
+      },
+      { id: 'c-4', title: '没有会话', status: 'todo', cwd: WS_A, updatedAt: minutesAgo(2) },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 4)
+  const chatButtons = buttons(tree).filter((node) => textOf(node).trim() === '对话')
+  assert.equal(chatButtons.length, 3, 'only tasks with a linked session expose the 对话 action')
+
+  const clickChat = (title) => {
+    const card = cardByTitle(tree, title)
+    assert.ok(card, 'card must render: ' + title)
+    const button = buttons(card).find((node) => textOf(node).trim() === '对话')
+    assert.ok(button, 'missing 对话 button on ' + title)
+    button.props.onClick()
+  }
+
+  clickChat('有发起会话')
+  assert.deepEqual(harness.openSessionCalls, ['session-aaaa1111'], 'creator session id is used when no dispatch ran')
+  clickChat('有执行会话')
+  assert.deepEqual(harness.openSessionCalls, ['session-aaaa1111', 'session-bbbb2222'])
+  clickChat('两者都有')
+  assert.deepEqual(
+    harness.openSessionCalls,
+    ['session-aaaa1111', 'session-bbbb2222', 'session-dddd4444'],
+    'dispatchedSessionId wins over the creator session',
+  )
+
+  const noSessionCard = cardByTitle(tree, '没有会话')
+  assert.ok(noSessionCard)
+  assert.ok(
+    !buttons(noSessionCard).some((node) => textOf(node).trim() === '对话'),
+    'task without sessions must not expose the 对话 action',
+  )
+})
+
+test('详情「关联对话」：发起/执行按钮分别用对应 id 调 openSession，无会话给 muted 文案', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 's-both',
+        title: '两者都有',
+        status: 'todo',
+        cwd: WS_A,
+        sessionId: 'session-cccc3333',
+        dispatchedSessionId: 'session-dddd4444',
+        updatedAt: minutesAgo(2),
+      },
+      { id: 's-none', title: '没有会话', status: 'todo', cwd: WS_A, updatedAt: minutesAgo(2) },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), {
+    sessionId: SESSION_A,
+  })
+
+  const opened = await openDetailByTitle(instance, tree, '两者都有')
+  assert.ok(detailText(opened).includes('关联对话'), 'detail must render the linked-sessions section')
+  const sessionButtons = detailSessionButtons(opened)
+  assert.equal(sessionButtons.length, 2, 'creator + dispatched session buttons')
+
+  const creator = sessionButtons.find((node) => textOf(node).startsWith('发起对话'))
+  assert.ok(creator, 'creator-session button must render')
+  assert.equal(textOf(creator), '发起对话 · cccc3333')
+  assert.equal(creator.props.title, 'session-cccc3333')
+
+  const runner = sessionButtons.find((node) => textOf(node).startsWith('执行对话'))
+  assert.ok(runner, 'dispatched-session button must render')
+  assert.equal(textOf(runner), '执行对话 · dddd4444')
+  assert.equal(runner.props.title, 'session-dddd4444')
+
+  creator.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, ['session-cccc3333'])
+  runner.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, ['session-cccc3333', 'session-dddd4444'])
+
+  // 关闭后打开无会话任务：只有一个 muted 文案，没有会话按钮
+  const closeButton = buttons(opened).find((node) => node.props['aria-label'] === '关闭')
+  closeButton.props.onClick()
+  const closed = await instance.run()
+  const noneTree = await openDetailByTitle(instance, closed, '没有会话')
+  assert.equal(detailSessionButtons(noneTree).length, 0, 'no session buttons without sessions')
+  assert.ok(
+    nodesWithClass(noneTree, 'tb-detail-muted').some((node) => textOf(node).includes('（这条任务还没有关联对话）')),
+    'no-session muted text must render',
+  )
+})
+
+test('uiWorkspace 缺失：卡片「对话」/详情会话按钮点击只 warn，不抛异常', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      { id: 'w-1', title: '有关联会话', status: 'todo', cwd: WS_A, sessionId: 'session-eeee5555', updatedAt: minutesAgo(2) },
+    ],
+  })
+  const harness = createHarness({ snapshot, uiWorkspace: false })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), {
+    sessionId: SESSION_A,
+  })
+
+  const card = cardByTitle(tree, '有关联会话')
+  assert.ok(card)
+  const chatButton = buttons(card).find((node) => textOf(node).trim() === '对话')
+  assert.ok(chatButton)
+  assert.doesNotThrow(() => chatButton.props.onClick())
+  assert.deepEqual(harness.openSessionCalls, [], 'missing uiWorkspace must not call anything')
+  assert.ok(
+    harness.warnings.some((line) => line.includes('uiWorkspace 不可用')),
+    'missing uiWorkspace must warn, got: ' + JSON.stringify(harness.warnings),
+  )
+
+  const opened = await openDetailByTitle(instance, tree, '有关联会话')
+  const creator = detailSessionButtons(opened).find((node) => textOf(node).startsWith('发起对话'))
+  assert.ok(creator)
+  const warningsBefore = harness.warnings.length
+  assert.doesNotThrow(() => creator.props.onClick())
+  assert.ok(harness.warnings.length > warningsBefore, 'detail session button must also warn')
+  assert.deepEqual(harness.openSessionCalls, [])
 })
