@@ -351,7 +351,7 @@ function createHarness(options = {}) {
   vm.runInContext(clientSource, sandbox, { filename: 'lib/client.js' })
 
   assert.ok(captured.definition, 'window.__ModuleLoader__.load must be called')
-  assert.equal(captured.definition.id, 'dsh-taskboard')
+  assert.equal(captured.definition.id, 'dsh-dispatch-board')
   assert.equal(typeof captured.definition.factory, 'function')
 
   const exported = captured.definition.factory((specifier) => {

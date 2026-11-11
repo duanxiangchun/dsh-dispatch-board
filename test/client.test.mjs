@@ -74,7 +74,7 @@ function loadClient() {
   vm.createContext(sandbox)
   vm.runInContext(clientSource, sandbox, { filename: 'lib/client.js' })
   assert.ok(captured, 'window.__ModuleLoader__.load must be called')
-  assert.equal(captured.id, 'dsh-taskboard')
+  assert.equal(captured.id, 'dsh-dispatch-board')
 
   const fakeReact = {
     createElement: () => null,
@@ -220,7 +220,7 @@ test('client bundle exposes apply/inject and only requires react', () => {
   const { exported, captured } = loadClient()
   assert.equal(typeof exported.apply, 'function')
   assert.deepEqual([...exported.inject], ['slots', 'connection', 'timer', 'locale'])
-  assert.equal(captured.id, 'dsh-taskboard')
+  assert.equal(captured.id, 'dsh-dispatch-board')
 })
 
 test('apply 注册右栏 tab 类型 + 右栏三处入口 + 左侧栏平台看板', () => {

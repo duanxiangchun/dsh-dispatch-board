@@ -1,6 +1,8 @@
-# dsh-taskboard —— 任务看板 + 派单模式
+# dsh-dispatch-board —— 派单看板 + 派单模式
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）用的插件，解决一个具体问题：
+
+> 包名：`dsh-dispatch-board`（npm / GitHub 同名）。内部运行时标识仍是 `taskboard`（存储目录 `~/.dsh/storages/dsh-taskboard/`、RPC 路由 `/taskboard`、预设 id `taskboard-*`、工具 `taskboard_*`），这样老安装和已有看板数据不会失效。
 
 > **让主 Agent 别自己干活。** 主 Agent 只拆解、派单、审核、汇报；具体工作全部交给子 Agent。
 > 你在看板上往「待开始」丢任务，插件轮询到就送给主 Agent 派发，子 Agent 干完自动回报，
@@ -53,7 +55,7 @@ dsh web
 ```
 
 > 也可以用 GUI 的插件管理器安装本地包（等价于把包 link 进 profile）。
-> 卸载：`dsh plugin --profile web remove dsh-taskboard`。
+> 卸载：`dsh plugin --profile web remove dsh-dispatch-board`。
 
 「派单看板模式」由插件包自带的 `presets/taskboard.patch.yml` **声明**（dsh 0.2.2 起 preset 是
 bundle patch 里的 `@deepseek-ai/dsh-agent-preset` 行，不是 `~/.dsh/.agent-presets` 目录）。
@@ -120,9 +122,9 @@ bundle patch 里的 `@deepseek-ai/dsh-agent-preset` 行，不是 `~/.dsh/.agent-
 ## 排障
 
 - **会话 header 没有「任务看板」按钮**：确认部署里有右侧栏（`@deepseek-ai/dsh-client-ui-sidebar-right`，
-  web-app 自带）；再确认 `dsh plugin --profile web list` 里有 `dsh-taskboard`，重启 `dsh web` 后刷新页面。
+  web-app 自带）；再确认 `dsh plugin --profile web list` 里有 `dsh-dispatch-board`，重启 `dsh web` 后刷新页面。
   浏览器控制台若有 `dsh.client` 相关报错，说明 `lib/client.js` 没被识别（检查 `exports["./client"]`）。
-- **点了按钮右栏没出现看板**：看 console 的 `[dsh-taskboard]` 警告——通常是右栏服务不可用；
+- **点了按钮右栏没出现看板**：看 console 的 `[dsh-dispatch-board]` 警告——通常是右栏服务不可用；
   也可以直接点右栏 tab 条上的 + 从引导页里选「任务看板」。
 - **加了任务但没派发**：看页面顶部的跳过原因——
   「没有在线的会话」表示当前没有打开的会话；「目标会话正在运行」表示主 Agent 正忙；

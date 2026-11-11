@@ -1,10 +1,10 @@
-# dsh-taskboard bundle patch.
+# dsh-dispatch-board bundle patch.
 #
 # 只插入一行 Host loader entry；包名由 profile 的 node_modules 解析
-# （dsh plugin --profile <name> add ./dsh-taskboard 安装的就是这个包）。
+# （dsh plugin --profile <name> add <本目录/包名> 安装的就是这个包）。
 #
 # Client 半由 package.json 的 dsh.client 声明，不需要单独的 loader row。
 # Preact/React 之外的 @deepseek-ai/* 一律不 import（见 docs/architecture.md）。
 - insert:
     - id: taskboard
-      name: dsh-taskboard
+      name: dsh-dispatch-board

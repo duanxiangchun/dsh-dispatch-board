@@ -1,9 +1,10 @@
-# dsh-taskboard — 内部契约 v1（Host ⇄ Client ⇄ Preset 单一事实来源）
+# dsh-dispatch-board — 内部契约 v1（Host ⇄ Client ⇄ Preset 单一事实来源）
 
 本文件是 Host 半（`lib/index.js`）、Client 半（`lib/client.js`）与「派单模式」预设
 （`presets/taskboard.patch.yml`）之间的**唯一契约**。任何一方想改字段/端点/状态机，先改本文件，再改代码。
 
-- 插件包名（= Client bundle id）：`dsh-taskboard`
+- 插件包名（= Client bundle id）：`dsh-dispatch-board`
+- 运行时内部标识保持 `taskboard`：存储 `~/.dsh/storages/dsh-taskboard/`、RPC `/taskboard`、右栏 tab 类型 `dsh-taskboard`、预设 `taskboard-dispatch`/`taskboard-worker`、工具 `taskboard_*`（改包名不影响老数据）
 - RPC 通道前缀：`/taskboard`
 - Host loader row id：`taskboard`
 - 模式声明：`presets/taskboard.patch.yml`（bundle patch 里的两条 `@deepseek-ai/dsh-agent-preset` 行，
