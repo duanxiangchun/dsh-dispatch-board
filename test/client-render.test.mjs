@@ -1308,9 +1308,11 @@ test('Detail：点卡片标题打开浮层，完整展示结论/备注/执行者
 
   // 字段网格：状态在徽标里，其余分「基本信息」「时间线」两组
   const { dts, dds } = detailLabels(opened)
-  for (const label of ['工作区', '创建时间', '最后更新', '开始时间', '完成时间', '执行者 / 派给谁', '创建来源', '派发提醒次数', '任务 id']) {
+  for (const label of ['工作区', '执行者', '创建来源', '派发提醒次数', '任务 id']) {
     assert.ok(dts.includes(label), 'missing detail field label: ' + label)
   }
+  const timelineLabels = nodesWithClass(box, 'tb-timeline-label').map((node) => textOf(node))
+  assert.deepEqual(timelineLabels, ['创建时间', '最后更新', '开始时间', '完成时间', '归档时间'])
   for (const sectionLabel of ['基本信息', '时间线']) {
     assert.ok(dts.includes(sectionLabel) || detailTextAll.includes(sectionLabel), 'missing detail section: ' + sectionLabel)
   }
@@ -1319,7 +1321,14 @@ test('Detail：点卡片标题打开浮层，完整展示结论/备注/执行者
   assert.ok(dds.includes('main-agent-1'), 'assignee must render')
   assert.ok(dds.includes('5'), 'notification count must render')
   assert.ok(dds.includes('t-detail-1'), 'task id must render')
-  assert.ok(dds.some((value) => value.includes('2026-11-11')), 'timeline dates must render')
+  // 时间线现在是紧凑条：5 项、值形如 MM-DD HH:mm，完整时间在 title 里
+  const timelineValues = nodesWithClass(box, 'tb-timeline-value')
+  assert.equal(timelineValues.length, 5, 'timeline strip must render 5 items')
+  for (const node of timelineValues) {
+    const text = textOf(node)
+    assert.ok(text === '—' || /^\d{2}-\d{2} \d{2}:\d{2}$/.test(text), 'compact timeline value: ' + text)
+  }
+  assert.ok(timelineValues[0].props.title.includes('2026-11-11'), 'full timeline date stays in the title attribute')
   assert.ok(detailTextAll.includes('主 Agent（模型工具）'), 'agent source must render')
 
   // 卡片本身也能看到「详情」入口
