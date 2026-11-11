@@ -1,0 +1,218 @@
+{
+ "url": "https://www.npmjs.com/package/dsh-dispatch-board/access",
+ "inputs": [
+  {
+   "tag": "INPUT",
+   "type": "search",
+   "name": "q",
+   "id": "",
+   "placeholder": "Search packages",
+   "label": "",
+   "value": ""
+  },
+  {
+   "tag": "INPUT",
+   "type": "hidden",
+   "name": "csrftoken",
+   "id": "",
+   "placeholder": "",
+   "label": "",
+   "value": "1j83uLPCY5cXGWJxAC7V9DUTM327xqcASYbrW8Mr63E"
+  },
+  {
+   "tag": "INPUT",
+   "type": "text",
+   "name": "",
+   "id": "react-select-2-input",
+   "placeholder": "",
+   "label": "",
+   "value": ""
+  },
+  {
+   "tag": "INPUT",
+   "type": "hidden",
+   "name": "publisher",
+   "id": "",
+   "placeholder": "",
+   "label": "",
+   "value": "github"
+  },
+  {
+   "tag": "INPUT",
+   "type": "hidden",
+   "name": "selectedPublisher",
+   "id": "",
+   "placeholder": "",
+   "label": "",
+   "value": "github"
+  },
+  {
+   "tag": "INPUT",
+   "type": "text",
+   "name": "label",
+   "id": "oidc-label",
+   "placeholder": "",
+   "label": "Label",
+   "value": ""
+  },
+  {
+   "tag": "INPUT",
+   "type": "text",
+   "name": "repositoryOwner",
+   "id": "oidc-repositoryOwner",
+   "placeholder": "",
+   "label": "Organization or user*",
+   "value": ""
+  },
+  {
+   "tag": "INPUT",
+   "type": "text",
+   "name": "repositoryName",
+   "id": "oidc-repositoryName",
+   "placeholder": "",
+   "label": "Repository*",
+   "value": ""
+  },
+  {
+   "tag": "INPUT",
+   "type": "text",
+   "name": "workflowName",
+   "id": "oidc-workflowName",
+   "placeholder": "",
+   "label": "Workflow filename*",
+   "value": ""
+  },
+  {
+   "tag": "INPUT",
+   "type": "text",
+   "name": "githubEnvironmentName",
+   "id": "oidc-githubEnvironmentName",
+   "placeholder": "",
+   "label": "Environment name",
+   "value": ""
+  },
+  {
+   "tag": "INPUT",
+   "type": "checkbox",
+   "name": "",
+   "id": "oidc-allow-publish",
+   "placeholder": "",
+   "label": "Allow npm publish",
+   "value": "on"
+  },
+  {
+   "tag": "INPUT",
+   "type": "checkbox",
+   "name": "",
+   "id": "oidc-allow-manage-dist-tags",
+   "placeholder": "",
+   "label": "Allow npm dist-tag",
+   "value": "on"
+  },
+  {
+   "tag": "INPUT",
+   "type": "hidden",
+   "name": "actionType",
+   "id": "",
+   "placeholder": "",
+   "label": "",
+   "value": "create"
+  },
+  {
+   "tag": "INPUT",
+   "type": "hidden",
+   "name": "csrftoken",
+   "id": "",
+   "placeholder": "",
+   "label": "",
+   "value": "1j83uLPCY5cXGWJxAC7V9DUTM327xqcASYbrW8Mr63E"
+  },
+  {
+   "tag": "INPUT",
+   "type": "radio",
+   "name": "publishingAccess",
+   "id": "package-settings_publishingAccess_tfa-always-required",
+   "placeholder": "",
+   "label": "Require two-factor authentication and disallow bypass 2fa to",
+   "value": "tfa-always-required"
+  },
+  {
+   "tag": "INPUT",
+   "type": "radio",
+   "name": "publishingAccess",
+   "id": "package-settings_publishingAccess_tfa-required-unless-automation",
+   "placeholder": "",
+   "label": "Require two-factor authentication or a granular access token",
+   "value": "tfa-required-unless-automation"
+  },
+  {
+   "tag": "INPUT",
+   "type": "hidden",
+   "name": "csrftoken",
+   "id": "",
+   "placeholder": "",
+   "label": "",
+   "value": "1j83uLPCY5cXGWJxAC7V9DUTM327xqcASYbrW8Mr63E"
+  },
+  {
+   "tag": "INPUT",
+   "type": "text",
+   "name": "add",
+   "id": "invite_add",
+   "placeholder": "",
+   "label": "Username",
+   "value": ""
+  },
+  {
+   "tag": "INPUT",
+   "type": "hidden",
+   "name": "csrftoken",
+   "id": "",
+   "placeholder": "",
+   "label": "",
+   "value": "1j83uLPCY5cXGWJxAC7V9DUTM327xqcASYbrW8Mr63E"
+  }
+ ],
+ "buttons": [
+  {
+   "text": "×",
+   "type": "submit"
+  },
+  {
+   "text": "×",
+   "type": "submit"
+  },
+  {
+   "text": "",
+   "type": "button"
+  },
+  {
+   "text": "Search",
+   "type": "submit"
+  },
+  {
+   "text": "Menu",
+   "type": "submit"
+  },
+  {
+   "text": "Set up connection",
+   "type": "submit"
+  },
+  {
+   "text": "Cancel",
+   "type": "button"
+  },
+  {
+   "text": "Update Package Settings",
+   "type": "submit"
+  },
+  {
+   "text": "Invite",
+   "type": "submit"
+  },
+  {
+   "text": "",
+   "type": "button"
+  }
+ ]
+}
