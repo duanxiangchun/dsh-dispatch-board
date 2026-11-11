@@ -3,13 +3,10 @@ name: Publish to npm
 # 触发：推一个 v* tag（例如 `npm version patch && git push --follow-tags`）。
 # 流程：校验 tag 与 package.json 版本一致 → 跑测试 → npm publish（带 provenance）→ 建 GitHub Release。
 #
-# 认证方式（二选一，工作流都支持）：
-#  A. 仓库 Secret `NPM_TOKEN`（npm Automation token）：存在时用它发布。
-#  B. npm Trusted Publishing（OIDC，推荐、零 secret）：
-#     npmjs.com → 包 → Settings → Publishing access → Trusted Publishers →
-#     Provider: GitHub Actions / User: duanxiangchun / Repository: dsh-dispatch-board /
-#     Workflow: publish.yml / Environment: 留空。
-#     注意：新包首次发布必须先手工 `npm publish` 一次，npm 上存在该包后才能配 Trusted Publisher。
+# 认证：npm Trusted Publishing（OIDC），零 secret。
+# 一次性配置：npmjs.com → 包 dsh-dispatch-board → Settings → Trusted Publishers →
+#   Provider: GitHub Actions / User: duanxiangchun / Repository: dsh-dispatch-board /
+#   Workflow: publish.yml / Environment: 留空，勾选 Allow npm publish。
 #
 # npm 对来自 CI 的发布启用了 Staged publishing：上传后需维护者带 2FA 在 npmjs.com
 # 「Staged publishes」批准，或本地执行 `npm stage approve <pkg>@<version>`。
@@ -31,9 +28,6 @@ permissions:
 concurrency:
   group: npm-publish
   cancel-in-progress: false
-
-env:
-  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
 jobs:
   publish:
@@ -62,16 +56,9 @@ jobs:
       - name: Pack (dry run)
         run: npm pack --dry-run
 
-      - name: Publish with NPM_TOKEN
-        if: env.NODE_AUTH_TOKEN != '' && github.event.inputs.dry_run != 'true'
+      - name: Publish to npm (Trusted Publishing / OIDC)
+        if: github.event.inputs.dry_run != 'true'
         run: npm publish --access public --provenance
-
-      - name: Publish with Trusted Publishing (OIDC, no token)
-        if: env.NODE_AUTH_TOKEN == '' && github.event.inputs.dry_run != 'true'
-        run: |
-          # setup-node 写进 .npmrc 的 _authToken 引用的是 NODE_AUTH_TOKEN；这里清空让它走 OIDC。
-          unset NODE_AUTH_TOKEN
-          npm publish --access public --provenance
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
