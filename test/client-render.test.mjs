@@ -532,6 +532,7 @@ function makeSnapshot(overrides = {}) {
         lastDispatchAt: minutesAgo(3),
         lastDispatchSessionId: '0123456789abcdef',
         lastDispatchSessionTitle: '主会话',
+        lastDispatchTaskId: null,
         lastSkipReason: 'agent-busy',
       },
       workspaces: [
@@ -1598,4 +1599,152 @@ test('uiWorkspace 缺失：卡片「对话」/详情会话按钮点击只 warn�
   assert.doesNotThrow(() => creator.props.onClick())
   assert.ok(harness.warnings.length > warningsBefore, 'detail session button must also warn')
   assert.deepEqual(harness.openSessionCalls, [])
+})
+
+/* ══════════════════════════════════════════════════════════════
+ * 用例：进行中任务的「执行对话」兜底（老 Host 派发时没记 dispatchedSessionId）
+ * ══════════════════════════════════════════════════════════════ */
+
+const DISPATCH_SESSION = 'session-eeee1111'
+
+function pollWithDispatch(overrides = {}) {
+  return Object.assign(
+    {
+      lastRunAt: minutesAgo(1),
+      lastDispatchAt: minutesAgo(3),
+      lastDispatchSessionId: DISPATCH_SESSION,
+      lastDispatchSessionTitle: '执行会话',
+      lastDispatchTaskId: null,
+      lastSkipReason: null,
+    },
+    overrides,
+  )
+}
+
+test('doing 兜底 A：只有一条 doing 时用 poll.lastDispatchSessionId 当执行对话', async () => {
+  const snapshot = makeSnapshot({
+    poll: pollWithDispatch(),
+    tasks: [{ id: 'd-1', title: '进行中的任务', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(2) }],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), {
+    sessionId: SESSION_A,
+  })
+
+  const card = cardByTitle(tree, '进行中的任务')
+  assert.ok(card)
+  const chat = buttons(card).find((node) => textOf(node).trim() === '对话')
+  assert.ok(chat, 'single doing task must expose the fallback 对话 action')
+  chat.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, [DISPATCH_SESSION])
+
+  const opened = await openDetailByTitle(instance, tree, '进行中的任务')
+  const runSession = detailSessionButtons(opened).find((node) => textOf(node).startsWith('执行对话'))
+  assert.ok(runSession, 'detail must expose 执行对话 from the fallback')
+  assert.equal(textOf(runSession), '执行对话 · eeee1111')
+  assert.equal(runSession.props.title, DISPATCH_SESSION)
+  runSession.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, [DISPATCH_SESSION, DISPATCH_SESSION])
+})
+
+test('doing 兜底 B：两条 doing 且 lastDispatchTaskId 缺失时都不显示（避免张冠李戴）', async () => {
+  const snapshot = makeSnapshot({
+    poll: pollWithDispatch({ lastDispatchTaskId: null }),
+    tasks: [
+      { id: 'd-1', title: '进行中甲', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(2) },
+      { id: 'd-2', title: '进行中乙', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(2) },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), {
+    sessionId: SESSION_A,
+  })
+
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 2)
+  assert.equal(
+    buttons(tree).filter((node) => textOf(node).trim() === '对话').length,
+    0,
+    'two doing tasks without a dispatch pointer must not expose 对话',
+  )
+
+  const opened = await openDetailByTitle(instance, tree, '进行中甲')
+  assert.equal(detailSessionButtons(opened).length, 0, 'no session button in detail either')
+  assert.ok(
+    nodesWithClass(opened, 'tb-detail-muted').some((node) => textOf(node).includes('（这条任务还没有关联对话）')),
+    'detail shows the no-session muted text',
+  )
+  assert.deepEqual(harness.openSessionCalls, [])
+})
+
+test('doing 兜底 C：lastDispatchTaskId 精确命中哪条，只有那条显示执行对话', async () => {
+  const snapshot = makeSnapshot({
+    poll: pollWithDispatch({ lastDispatchTaskId: 'd-2' }),
+    tasks: [
+      { id: 'd-1', title: '进行中甲', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(2) },
+      { id: 'd-2', title: '进行中乙', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(2) },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), {
+    sessionId: SESSION_A,
+  })
+
+  const chatButtons = buttons(tree).filter((node) => textOf(node).trim() === '对话')
+  assert.equal(chatButtons.length, 1, 'only the task named by lastDispatchTaskId gets the fallback')
+
+  const matchedCard = cardByTitle(tree, '进行中乙')
+  assert.ok(matchedCard)
+  const matchedChat = buttons(matchedCard).find((node) => textOf(node).trim() === '对话')
+  assert.ok(matchedChat)
+  const otherCard = cardByTitle(tree, '进行中甲')
+  assert.ok(otherCard)
+  assert.ok(!buttons(otherCard).some((node) => textOf(node).trim() === '对话'))
+
+  matchedChat.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, [DISPATCH_SESSION])
+
+  // 命中的那条详情里有「执行对话」，没命中的那条没有
+  const matchedTree = await openDetailByTitle(instance, tree, '进行中乙')
+  assert.equal(detailSessionButtons(matchedTree).length, 1)
+  assert.ok(textOf(detailSessionButtons(matchedTree)[0]).startsWith('执行对话'))
+
+  const closeButton = buttons(matchedTree).find((node) => node.props['aria-label'] === '关闭')
+  closeButton.props.onClick()
+  const closed = await instance.run()
+  const otherTree = await openDetailByTitle(instance, closed, '进行中甲')
+  assert.equal(detailSessionButtons(otherTree).length, 0)
+})
+
+test('doing 兜底 D：dispatchedSessionId 仍然优先于 poll 兜底', async () => {
+  const snapshot = makeSnapshot({
+    poll: pollWithDispatch(),
+    tasks: [
+      {
+        id: 'd-1',
+        title: '进行中的任务',
+        status: 'doing',
+        cwd: WS_A,
+        dispatchedSessionId: 'session-ffff2222',
+        updatedAt: minutesAgo(2),
+      },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), {
+    sessionId: SESSION_A,
+  })
+
+  const card = cardByTitle(tree, '进行中的任务')
+  const chat = buttons(card).find((node) => textOf(node).trim() === '对话')
+  assert.ok(chat)
+  chat.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, ['session-ffff2222'], 'dispatchedSessionId must win over the fallback')
+
+  const opened = await openDetailByTitle(instance, tree, '进行中的任务')
+  const runSession = detailSessionButtons(opened).find((node) => textOf(node).startsWith('执行对话'))
+  assert.ok(runSession)
+  assert.equal(textOf(runSession), '执行对话 · ffff2222')
+  assert.equal(runSession.props.title, 'session-ffff2222')
+  runSession.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, ['session-ffff2222', 'session-ffff2222'])
 })
