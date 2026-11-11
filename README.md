@@ -123,6 +123,11 @@ bundle patch 里的 `@deepseek-ai/dsh-agent-preset` 行，不是 `~/.dsh/.agent-
   并重启了 `dsh web`；看板页顶部若出现红色「派单看板模式加载失败：…」就是某个预设行配置有误，
   照着 `broken` 原文改 `presets/taskboard.patch.yml`（常见：删了必填 config）。
 - **主 Agent 还是自己干活**：确认会话用的确实是「派单看板模式」，而不是 standard。
+- **点了「归档」没反应 / 过一会儿又变回「已完成」**：最常见原因是**同时开了两个 dsh 进程共用同一个
+  `board.json`**（比如正式实例 + 一个测试实例），后写的整份内存状态会把先写的覆盖掉。
+  0.1.0 起读/写前都会比对 `revision`、盘上更新就采用盘上状态；测试实例请用
+  `$env:DSH_TASKBOARD_PATH='C:\Users\<你>\.dsh-taskboard-test\board.json'` 单独隔离。
+  升级后需要**重启一次 `dsh web`**（Host 半改动）再刷新页面。
 
 ## 开发
 

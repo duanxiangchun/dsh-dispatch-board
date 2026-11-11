@@ -106,6 +106,9 @@ README.md               Lead：安装 / 使用 / 排障
 ## 2. 持久化
 
 路径：`$DSH_HOME/storages/dsh-taskboard/board.json`（`$DSH_HOME` 取 `process.env.DSH_HOME`，缺省 `~/.dsh`）。
+测试/多实例可用 `DSH_TASKBOARD_PATH` 直接指定 board.json 路径（例如
+`$env:DSH_TASKBOARD_PATH='C:\Users\duan\.dsh-taskboard-test\board.json'`），避免两个进程抢同一个文件。
+所有读写前都会比对 revision（`reloadBoardIfStale`），盘上更新就采用盘上状态。
 
 ```jsonc
 {
@@ -464,6 +467,7 @@ patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行（config: `id/name/
 | `agent.followup()` 的 UserMessage 手工构造被会话解码器拒绝（source.kind 未知） | 用 `{kind:'user'}` 构造，不发明新 kind；e2e 必须验证「重启后会话可恢复」 |
 | 轮询把用户手动对话打断 | 只在 idle 投递；每轮最多 1 条；冷却 + 上限 |
 | 多窗口/多会话重复派发 | 任务级 `notifiedAt` + 冷却 + `notificationCount` 上限；不做跨进程锁（单进程部署） |
+| **两个 dsh 进程共用同一个 board.json**（例如同时开着正式实例和测试实例） | 每个 RPC/tick 前 `reloadBoardIfStale`：盘上 revision 更大就采用盘上状态（读也重载，否则界面显示旧内存、点归档像没生效）；测试实例用 `DSH_TASKBOARD_PATH` 指向自己的 board.json 彻底隔离。**这不是真正的并发锁**，两个进程同一毫秒写仍可能丢一次更新 |
 
 ---
 

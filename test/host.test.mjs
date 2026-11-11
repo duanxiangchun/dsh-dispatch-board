@@ -14,6 +14,7 @@ import {
   buildDispatchText,
   buildSnapshot,
   canTransition,
+  commitBoard,
   createBoardUserMessage,
   createEmptyBoard,
   deleteTask,
@@ -24,6 +25,7 @@ import {
   isLoopbackRequest,
   normalizeBoard,
   normalizeConfig,
+  reloadBoardIfStale,
   notifyCooldownMs,
   parseRpcEnvelope,
   listWorkspaces,
@@ -637,4 +639,43 @@ test('snapshot exposes the workspace list', () => {
   const snapshot = buildSnapshot(rt)
   assert.equal(snapshot.workspaces.length, 1)
   assert.equal(snapshot.workspaces[0].title, 'demo')
+})
+test('reloadBoardIfStale adopts a newer board written by another process', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-stale-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const diskState = createEmptyBoard()
+    addTask(diskState, { title: 'written by another process' }, NOW)
+    commitBoard(diskState, filePath)
+    const diskRevision = diskState.revision
+
+    const rt = { state: createEmptyBoard(), filePath }
+    assert.equal(reloadBoardIfStale(rt), true, 'must reload when disk revision is newer')
+    assert.equal(rt.state.revision, diskRevision)
+    assert.equal(rt.state.tasks[0].title, 'written by another process')
+
+    // 盘上没有更新 → 不重载
+    assert.equal(reloadBoardIfStale(rt), false)
+    // 内存比盘新（本地刚改还没写盘）→ 不重载，别把自己的改动冲掉
+    rt.state.revision = diskRevision + 3
+    assert.equal(reloadBoardIfStale(rt), false)
+    assert.equal(rt.state.revision, diskRevision + 3)
+    // 文件不存在 → 不重载
+    assert.equal(reloadBoardIfStale({ state: createEmptyBoard(), filePath: join(dir, 'nope.json') }), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('boardPath honors DSH_TASKBOARD_PATH so test instances do not share the real board', () => {
+  const previous = process.env.DSH_TASKBOARD_PATH
+  try {
+    process.env.DSH_TASKBOARD_PATH = 'C:\\tmp\\isolated-board.json'
+    assert.equal(boardPath(), 'C:\\tmp\\isolated-board.json')
+    delete process.env.DSH_TASKBOARD_PATH
+    assert.match(boardPath(), /board\.json$/)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_TASKBOARD_PATH
+    else process.env.DSH_TASKBOARD_PATH = previous
+  }
 })
