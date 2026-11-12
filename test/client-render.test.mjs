@@ -381,6 +381,7 @@ function createHarness(options = {}) {
   const registrations = []
   const tabs = { definitions: [], disposed: [] }
   const openTabCalls = []
+  const hideCalls = []
   const defaultRpc = options.rpc || ((channel, endpoint, payload) => {
     if (endpoint === 'session-info') {
       return Promise.resolve({
@@ -401,10 +402,26 @@ function createHarness(options = {}) {
       }
     },
   }
+  // 右栏服务桩：默认「没展开、没有活动 tab」，即任何点击都走 openTab（保持既有用例行为）。
+  // sidebarRightActive / sidebarRightExpanded 也接受函数（用例里想中途换状态时用），
+  // sidebarRightMissing 列出要摘掉的 API，用来验证缺 API 时退回 openTab、不抛错。
+  const readOption = (value) => (typeof value === 'function' ? value() : value)
   const sidebarRightService = options.sidebarRight === false ? undefined : {
     openTab(kind) {
       openTabCalls.push(kind)
     },
+    active() {
+      return readOption(options.sidebarRightActive)
+    },
+    isExpanded() {
+      return readOption(options.sidebarRightExpanded) === true
+    },
+    hide(tabId) {
+      hideCalls.push(tabId)
+    },
+  }
+  for (const method of options.sidebarRightMissing || []) {
+    if (sidebarRightService) delete sidebarRightService[method]
   }
 
   const services = {
@@ -512,6 +529,8 @@ function createHarness(options = {}) {
     scopeEffects,
     tabs,
     openTabCalls,
+    hideCalls,
+    sidebarRightService,
     openSessionCalls,
     document: documentStub,
     windowCounters,
@@ -746,6 +765,71 @@ test('HeaderBoardAction：RPC 失败不崩无角标；右栏服务缺失时点�
 })
 
 /* ══════════════════════════════════════════════════════════════
+ * 用例：会话 header 按钮「再点一次收起」（toggle）
+ * ══════════════════════════════════════════════════════════════ */
+
+test('HeaderBoardAction：看板已展开且是活动 tab 时，再点一次只调 hide 收起，不 openTab', async () => {
+  // TabRecord 实测形状 { id, kind, title, contentId }（sidebar-right/lib/client.js 的 seedRecord）。
+  const boardTab = { id: 'tab-taskboard-1', kind: 'taskboard', title: '任务看板', contentId: 'page:dsh-taskboard' }
+  const harness = createHarness({
+    snapshot: makeSnapshot(),
+    sidebarRightActive: boardTab,
+    sidebarRightExpanded: true,
+  })
+  const { tree } = await renderComponent(harness.componentOf('conversation.session.header.actions'), {})
+
+  assert.doesNotThrow(() => tree.props.onClick())
+  assert.deepEqual(harness.hideCalls, ['tab-taskboard-1'], 're-click must hide the tab that is already showing')
+  assert.deepEqual(harness.openTabCalls, [], 're-click must not open/focus the tab again')
+})
+
+test('HeaderBoardAction：已收起 / 活动 tab 是别的类型时，点击仍 openTab 打开并聚焦', async () => {
+  // 1) 已收起：活动 tab 仍停在看板页，但列是折起来的 —— 应该打开而不是 hide。
+  const collapsed = createHarness({
+    snapshot: makeSnapshot(),
+    sidebarRightActive: { id: 'tab-taskboard-1', kind: 'taskboard' },
+    sidebarRightExpanded: false,
+  })
+  const collapsedTree = (await renderComponent(collapsed.componentOf('conversation.session.header.actions'), {})).tree
+  assert.doesNotThrow(() => collapsedTree.props.onClick())
+  assert.deepEqual(collapsed.openTabCalls, ['taskboard'], 'collapsed column must open the board')
+  assert.deepEqual(collapsed.hideCalls, [])
+
+  // 2) 列展开着，但活动 tab 是别的插件（例如文件树）：点 header 应该聚焦/打开看板。
+  const other = createHarness({
+    snapshot: makeSnapshot(),
+    sidebarRightActive: { id: 'tab-files-1', kind: 'files' },
+    sidebarRightExpanded: true,
+  })
+  const otherTree = (await renderComponent(other.componentOf('conversation.session.header.actions'), {})).tree
+  assert.doesNotThrow(() => otherTree.props.onClick())
+  assert.deepEqual(other.openTabCalls, ['taskboard'], 'a foreign active tab must not be hidden')
+  assert.deepEqual(other.hideCalls, [])
+
+  // 3) 没有活动 tab（空右栏 / 会话刚切过来）：照旧打开。
+  const empty = createHarness({ snapshot: makeSnapshot(), sidebarRightExpanded: true })
+  const emptyTree = (await renderComponent(empty.componentOf('conversation.session.header.actions'), {})).tree
+  assert.doesNotThrow(() => emptyTree.props.onClick())
+  assert.deepEqual(empty.openTabCalls, ['taskboard'])
+  assert.deepEqual(empty.hideCalls, [])
+})
+
+test('HeaderBoardAction：hide / active / isExpanded 任一缺失时退回 openTab，不抛错', async () => {
+  for (const method of ['hide', 'active', 'isExpanded']) {
+    const harness = createHarness({
+      snapshot: makeSnapshot(),
+      sidebarRightActive: { id: 'tab-taskboard-1', kind: 'taskboard' },
+      sidebarRightExpanded: true,
+      sidebarRightMissing: [method],
+    })
+    const { tree } = await renderComponent(harness.componentOf('conversation.session.header.actions'), {})
+    assert.doesNotThrow(() => tree.props.onClick(), 'missing ' + method + ' must not throw')
+    assert.deepEqual(harness.openTabCalls, ['taskboard'], 'missing ' + method + ' must fall back to openTab')
+    assert.deepEqual(harness.hideCalls, [], 'missing ' + method + ' must not call hide')
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════
  * 用例：右栏 tab 标题 chip
  * ══════════════════════════════════════════════════════════════ */
 
@@ -897,10 +981,16 @@ test('卡片精简（t-33）：只渲染标题 + 操作按钮，等高样式类/
     assert.equal(nodesWithClass(tree, cls).length, 0, 'card must not render .' + cls)
   }
 
-  // 等高规则：min-height + border-box + 操作行 margin-top:auto + 标题 2 行截断
-  assert.ok(clientSource.includes('.tb-card-fixed{min-height:var(--tb-card-h,108px)'), 'equal-height min-height rule')
+  // 等高规则（t-42）：整卡没有固定高度，等高靠「标题固定 2 行高度」+ 正常 gap 撑出来。
+  // 原先的 min-height:var(--tb-card-h,108px) 会把 2 行标题卡片撑高，多余高度由
+  // 操作行 margin-top:auto 塞成标题与按钮之间的空行——两条都已删除。
+  assert.ok(clientSource.includes('.tb-card-fixed{gap:5px;padding:9px 10px 8px}'), 'card keeps auto height with the tight gap/padding')
+  assert.ok(!/\.tb-card-fixed\{[^}]*min-height/.test(clientSource), 'card must not carry a fixed min-height any more')
+  assert.ok(!clientSource.includes('--tb-card-h'), 'the dead --tb-card-h variable is gone')
+  assert.ok(!/\.tb-card-fixed \.tb-card-actions\{[^}]*margin-top/.test(clientSource), 'action row is no longer pinned with margin-top')
+  assert.ok(!/\.tb-card-actions\{[^}]*margin-top:auto/.test(clientSource), 'no action row uses margin-top:auto')
   assert.ok(clientSource.includes('border-radius:var(--dsw-radius-sm);min-width:0;box-sizing:border-box}'), 'card uses border-box')
-  assert.ok(clientSource.includes('.tb-card-fixed .tb-card-actions{margin-top:auto;'), 'action row pinned to the card bottom')
+  assert.ok(clientSource.includes('min-height:2.8em'), 'title reserves exactly two lines (2.8em = 2 x 1.4em)')
   assert.ok(clientSource.includes('-webkit-line-clamp:2'), 'title clamps to two lines')
 
   // 行内编辑态保持现状：编辑卡片没有 .tb-card-fixed，高度自适应、不受精简影响
@@ -1583,66 +1673,164 @@ function detailSessionButtons(tree) {
   return buttons(row)
 }
 
-test('卡片「对话」按钮：只有关联会话才出现，dispatchedSessionId 优先', async () => {
+test('extractSessionId / workerSessionOf：从装饰过的 assignee 里提取会话 id，普通标签不算会话', () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const { workerSessionOf, extractSessionId } = harness.exported.__test
+  const WORKER_UUID = '5a6b02f1-6f5b-4719-a00c-c27396eff557'
+  const LEAD_SESSION = 'session-6a5f0f02-489d-46c3-b8cc-f537ece53092'
+
+  // ── 纯 id：原有行为不变 ──
+  assert.equal(workerSessionOf(null), '')
+  assert.equal(workerSessionOf({}), '')
+  assert.equal(workerSessionOf({ assignee: '' }), '')
+  assert.equal(workerSessionOf({ assignee: '   ' }), '')
+  assert.equal(workerSessionOf({ assignee: 'session-worker1111' }), 'session-worker1111')
+  assert.equal(workerSessionOf({ assignee: '  session-abc-123  ' }), 'session-abc-123', 'assignee is trimmed')
+  assert.equal(workerSessionOf({ assignee: WORKER_UUID }), WORKER_UUID, 'bare UUID (host subagentId) is a session id')
+  assert.equal(workerSessionOf({ assignee: LEAD_SESSION }), LEAD_SESSION)
+  assert.equal(
+    workerSessionOf({ assignee: '6F1C2A3B-4D5E-4F60-8A7B-9C0D1E2F3A4B' }),
+    '6F1C2A3B-4D5E-4F60-8A7B-9C0D1E2F3A4B',
+    'UUID matching is case-insensitive and keeps the original casing',
+  )
+
+  // ── 装饰形态（t-39 根因）：中/英文后缀、@、前缀都要能提取 ──
+  const decorated = [
+    [WORKER_UUID + '（worker）', WORKER_UUID],
+    [WORKER_UUID + ' (worker)', WORKER_UUID],
+    [WORKER_UUID + '@worker', WORKER_UUID],
+    ['worker: ' + WORKER_UUID, WORKER_UUID],
+    ['  执行者：' + WORKER_UUID + '  ', WORKER_UUID],
+    [LEAD_SESSION + '（子 Agent）', LEAD_SESSION],
+    [LEAD_SESSION + ' (sub-agent)', LEAD_SESSION],
+    ['组长：' + LEAD_SESSION, LEAD_SESSION],
+    ['worker: ' + LEAD_SESSION + '（子 Agent）', LEAD_SESSION],
+    ['session-worker1111 extra', 'session-worker1111'],
+    ['session-abc-123.', 'session-abc-123'],
+  ]
+  decorated.forEach(([text, expected]) => {
+    assert.equal(extractSessionId(text), expected, 'extractSessionId: ' + text)
+    assert.equal(workerSessionOf({ assignee: text }), expected, 'workerSessionOf: ' + text)
+  })
+
+  // ── 不误判：普通标签 / 中文 / 空 / 非字符串 / 被别的词粘住的片段 ──
+  const notSessions = [
+    'worker-42',
+    'main',
+    '组长',
+    '执行者',
+    '',
+    '   ',
+    'session-',
+    'session-（待定）',
+    '6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a',
+    'task-' + WORKER_UUID,
+    WORKER_UUID + '0',
+    'x' + LEAD_SESSION,
+  ]
+  notSessions.forEach((text) => {
+    assert.equal(extractSessionId(text), '', 'not a session: ' + JSON.stringify(text))
+    assert.equal(workerSessionOf({ assignee: text }), '', 'workerSessionOf not a session: ' + JSON.stringify(text))
+  })
+  assert.equal(extractSessionId(null), '')
+  assert.equal(extractSessionId(undefined), '')
+  assert.equal(extractSessionId(42), '')
+  assert.equal(extractSessionId({ assignee: WORKER_UUID }), '')
+  assert.equal(workerSessionOf({ assignee: 42 }), '', 'non-string assignee is not a session')
+})
+
+test('卡片「对话」按钮：优先 worker 子会话，其次组长 / 发起会话；非会话 assignee 不出按钮', async () => {
+  const WORKER_UUID = '6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b'
   const snapshot = makeSnapshot({
     tasks: [
-      { id: 'c-1', title: '有发起会话', status: 'todo', cwd: WS_A, sessionId: 'session-aaaa1111', updatedAt: minutesAgo(2) },
-      { id: 'c-2', title: '有执行会话', status: 'todo', cwd: WS_A, dispatchedSessionId: 'session-bbbb2222', updatedAt: minutesAgo(2) },
+      { id: 'c-1', title: '只有发起会话', status: 'todo', cwd: WS_A, sessionId: 'session-aaaa1111', updatedAt: minutesAgo(2) },
+      { id: 'c-2', title: '只有组长会话', status: 'todo', cwd: WS_A, dispatchedSessionId: 'session-bbbb2222', updatedAt: minutesAgo(2) },
       {
         id: 'c-3',
-        title: '两者都有',
+        title: '三者都有',
         status: 'todo',
         cwd: WS_A,
         sessionId: 'session-cccc3333',
         dispatchedSessionId: 'session-dddd4444',
+        assignee: 'session-worker1111',
         updatedAt: minutesAgo(2),
       },
-      { id: 'c-4', title: '没有会话', status: 'todo', cwd: WS_A, updatedAt: minutesAgo(2) },
+      { id: 'c-4', title: '只有 worker', status: 'todo', cwd: WS_A, assignee: WORKER_UUID, updatedAt: minutesAgo(2) },
+      { id: 'c-5', title: '普通标签执行者', status: 'todo', cwd: WS_A, assignee: 'worker-42', updatedAt: minutesAgo(2) },
+      {
+        id: 'c-6',
+        title: '装饰过的 worker',
+        status: 'todo',
+        cwd: WS_A,
+        sessionId: 'session-aaaa1111',
+        dispatchedSessionId: 'session-bbbb2222',
+        assignee: WORKER_UUID + '（worker）',
+        updatedAt: minutesAgo(2),
+      },
     ],
   })
   const harness = createHarness({ snapshot })
   const { tree } = await renderComponent(harness.componentOf('main'), {})
 
-  assert.equal(nodesWithClass(tree, 'tb-card').length, 4)
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 6)
   const chatButtons = buttons(tree).filter((node) => textOf(node).trim() === '对话')
-  assert.equal(chatButtons.length, 3, 'only tasks with a linked session expose the 对话 action')
+  assert.equal(chatButtons.length, 5, 'only tasks with a real linked session expose the 对话 action')
 
-  const clickChat = (title) => {
+  const clickChat = (title, expectedSessionId) => {
     const card = cardByTitle(tree, title)
     assert.ok(card, 'card must render: ' + title)
     const button = buttons(card).find((node) => textOf(node).trim() === '对话')
     assert.ok(button, 'missing 对话 button on ' + title)
+    assert.equal(button.props.title, expectedSessionId, '对话 title carries the actual target session id')
     button.props.onClick()
   }
 
-  clickChat('有发起会话')
+  clickChat('只有发起会话', 'session-aaaa1111')
   assert.deepEqual(harness.openSessionCalls, ['session-aaaa1111'], 'creator session id is used when no dispatch ran')
-  clickChat('有执行会话')
+  clickChat('只有组长会话', 'session-bbbb2222')
   assert.deepEqual(harness.openSessionCalls, ['session-aaaa1111', 'session-bbbb2222'])
-  clickChat('两者都有')
+  clickChat('三者都有', 'session-worker1111')
   assert.deepEqual(
     harness.openSessionCalls,
-    ['session-aaaa1111', 'session-bbbb2222', 'session-dddd4444'],
-    'dispatchedSessionId wins over the creator session',
+    ['session-aaaa1111', 'session-bbbb2222', 'session-worker1111'],
+    'worker session (assignee) wins over lead and creator session',
+  )
+  clickChat('只有 worker', WORKER_UUID)
+  assert.deepEqual(harness.openSessionCalls, ['session-aaaa1111', 'session-bbbb2222', 'session-worker1111', WORKER_UUID])
+  // t-39 根因回归：assignee 是 `…（worker）` 时仍选 worker，而不是回退到 dispatchedSessionId（组长）
+  clickChat('装饰过的 worker', WORKER_UUID)
+  assert.deepEqual(
+    harness.openSessionCalls,
+    ['session-aaaa1111', 'session-bbbb2222', 'session-worker1111', WORKER_UUID, WORKER_UUID],
+    'decorated assignee still resolves to the worker session, not the lead session',
   )
 
-  const noSessionCard = cardByTitle(tree, '没有会话')
-  assert.ok(noSessionCard)
+  const labelCard = cardByTitle(tree, '普通标签执行者')
+  assert.ok(labelCard)
   assert.ok(
-    !buttons(noSessionCard).some((node) => textOf(node).trim() === '对话'),
-    'task without sessions must not expose the 对话 action',
+    !buttons(labelCard).some((node) => textOf(node).trim() === '对话'),
+    'a plain label assignee (worker-42) must not be treated as a session',
   )
 })
 
-test('详情「关联对话」：发起/执行按钮分别用对应 id 调 openSession，无会话给 muted 文案', async () => {
+test('详情「关联对话」：发起 / 执行（worker）/ 组长三个按钮各自可点，无会话给 muted 文案', async () => {
   const snapshot = makeSnapshot({
     tasks: [
       {
         id: 's-both',
-        title: '两者都有',
+        title: '三者都有',
         status: 'todo',
         cwd: WS_A,
         sessionId: 'session-cccc3333',
+        dispatchedSessionId: 'session-dddd4444',
+        assignee: 'session-worker1111',
+        updatedAt: minutesAgo(2),
+      },
+      {
+        id: 's-lead-only',
+        title: '只有组长',
+        status: 'todo',
+        cwd: WS_A,
         dispatchedSessionId: 'session-dddd4444',
         updatedAt: minutesAgo(2),
       },
@@ -1654,35 +1842,105 @@ test('详情「关联对话」：发起/执行按钮分别用对应 id 调 openS
     sessionId: SESSION_A,
   })
 
-  const opened = await openDetailByTitle(instance, tree, '两者都有')
+  let opened = await openDetailByTitle(instance, tree, '三者都有')
   assert.ok(detailText(opened).includes('关联对话'), 'detail must render the linked-sessions section')
-  const sessionButtons = detailSessionButtons(opened)
-  assert.equal(sessionButtons.length, 2, 'creator + dispatched session buttons')
+  let sessionButtons = detailSessionButtons(opened)
+  assert.deepEqual(
+    sessionButtons.map((node) => textOf(node)),
+    ['发起对话 · cccc3333', '执行对话 · rker1111', '组长对话 · dddd4444'],
+    'creator / worker / lead buttons render in that order',
+  )
 
-  const creator = sessionButtons.find((node) => textOf(node).startsWith('发起对话'))
-  assert.ok(creator, 'creator-session button must render')
-  assert.equal(textOf(creator), '发起对话 · cccc3333')
+  const creator = sessionButtons[0]
+  const runner = sessionButtons[1]
+  const lead = sessionButtons[2]
   assert.equal(creator.props.title, 'session-cccc3333')
-
-  const runner = sessionButtons.find((node) => textOf(node).startsWith('执行对话'))
-  assert.ok(runner, 'dispatched-session button must render')
-  assert.equal(textOf(runner), '执行对话 · dddd4444')
-  assert.equal(runner.props.title, 'session-dddd4444')
+  assert.equal(runner.props.title, 'session-worker1111')
+  assert.equal(lead.props.title, 'session-dddd4444')
 
   creator.props.onClick()
   assert.deepEqual(harness.openSessionCalls, ['session-cccc3333'])
   runner.props.onClick()
-  assert.deepEqual(harness.openSessionCalls, ['session-cccc3333', 'session-dddd4444'])
+  assert.deepEqual(harness.openSessionCalls, ['session-cccc3333', 'session-worker1111'])
+  lead.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, ['session-cccc3333', 'session-worker1111', 'session-dddd4444'])
 
-  // 关闭后打开无会话任务：只有一个 muted 文案，没有会话按钮
+  // 没有 worker、只有 dispatchedSessionId → 不再叫「执行对话」，改为「组长对话」
   const closeButton = buttons(opened).find((node) => node.props['aria-label'] === '关闭')
   closeButton.props.onClick()
   const closed = await instance.run()
-  const noneTree = await openDetailByTitle(instance, closed, '没有会话')
+  opened = await openDetailByTitle(instance, closed, '只有组长')
+  sessionButtons = detailSessionButtons(opened)
+  assert.equal(sessionButtons.length, 1, 'dispatched-only task has a single lead conversation')
+  assert.ok(
+    !sessionButtons.some((node) => textOf(node).startsWith('执行对话')),
+    'dispatchedSessionId must not pose as the worker conversation',
+  )
+  assert.equal(textOf(sessionButtons[0]), '组长对话 · dddd4444')
+  assert.equal(sessionButtons[0].props.title, 'session-dddd4444')
+
+  // 关闭后打开无会话任务：只有一个 muted 文案，没有会话按钮
+  const closeButton2 = buttons(opened).find((node) => node.props['aria-label'] === '关闭')
+  closeButton2.props.onClick()
+  const closed2 = await instance.run()
+  const noneTree = await openDetailByTitle(instance, closed2, '没有会话')
   assert.equal(detailSessionButtons(noneTree).length, 0, 'no session buttons without sessions')
   assert.ok(
     nodesWithClass(noneTree, 'tb-detail-muted').some((node) => textOf(node).includes('（这条任务还没有关联对话）')),
     'no-session muted text must render',
+  )
+})
+
+test('详情「关联对话」：装饰过的 assignee 仍给出「执行对话（worker）」，同会话去重仍生效', async () => {
+  const WORKER_UUID = 'aaaaaaaa-bbbb-4ccc-8ddd-1234567890ab'
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 'd-decorated',
+        title: '装饰 worker',
+        status: 'todo',
+        cwd: WS_A,
+        sessionId: 'session-cccc3333',
+        dispatchedSessionId: 'session-dddd4444',
+        assignee: WORKER_UUID + '（worker）',
+        updatedAt: minutesAgo(2),
+      },
+      {
+        id: 'd-same',
+        title: 'worker 与发起同一会话',
+        status: 'todo',
+        cwd: WS_A,
+        sessionId: 'session-cccc3333',
+        dispatchedSessionId: 'session-dddd4444',
+        assignee: 'session-cccc3333（子 Agent）',
+        updatedAt: minutesAgo(2),
+      },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), {
+    sessionId: SESSION_A,
+  })
+
+  const opened = await openDetailByTitle(instance, tree, '装饰 worker')
+  const sessionButtons = detailSessionButtons(opened)
+  assert.deepEqual(
+    sessionButtons.map((node) => textOf(node)),
+    ['发起对话 · cccc3333', '执行对话 · 567890ab', '组长对话 · dddd4444'],
+    'decorated assignee still yields the worker conversation button',
+  )
+  assert.equal(sessionButtons[1].props.title, WORKER_UUID, 'button title must carry the extracted session id, not the raw text')
+  sessionButtons[1].props.onClick()
+  assert.deepEqual(harness.openSessionCalls, [WORKER_UUID], '执行对话 opens the extracted worker id')
+
+  const closeButton = buttons(opened).find((node) => node.props['aria-label'] === '关闭')
+  closeButton.props.onClick()
+  const closed = await instance.run()
+  const deduped = await openDetailByTitle(instance, closed, 'worker 与发起同一会话')
+  assert.deepEqual(
+    detailSessionButtons(deduped).map((node) => textOf(node)),
+    ['发起对话 · cccc3333', '组长对话 · dddd4444'],
+    'decorated worker equal to the creator session is deduped',
   )
 })
 
@@ -1718,7 +1976,7 @@ test('uiWorkspace 缺失：卡片「对话」/详情会话按钮点击只 warn�
 })
 
 /* ══════════════════════════════════════════════════════════════
- * 用例：进行中任务的「执行对话」兜底（老 Host 派发时没记 dispatchedSessionId）
+ * 用例：进行中任务的「组长对话」兜底（老 Host 派发时没记 dispatchedSessionId）
  * ══════════════════════════════════════════════════════════════ */
 
 const DISPATCH_SESSION = 'session-eeee1111'
@@ -1737,7 +1995,7 @@ function pollWithDispatch(overrides = {}) {
   )
 }
 
-test('doing 兜底 A：只有一条 doing 时用 poll.lastDispatchSessionId 当执行对话', async () => {
+test('doing 兜底 A：只有一条 doing 时用 poll.lastDispatchSessionId 当组长对话', async () => {
   const snapshot = makeSnapshot({
     poll: pollWithDispatch(),
     tasks: [{ id: 'd-1', title: '进行中的任务', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(2) }],
@@ -1755,11 +2013,15 @@ test('doing 兜底 A：只有一条 doing 时用 poll.lastDispatchSessionId 当�
   assert.deepEqual(harness.openSessionCalls, [DISPATCH_SESSION])
 
   const opened = await openDetailByTitle(instance, tree, '进行中的任务')
-  const runSession = detailSessionButtons(opened).find((node) => textOf(node).startsWith('执行对话'))
-  assert.ok(runSession, 'detail must expose 执行对话 from the fallback')
-  assert.equal(textOf(runSession), '执行对话 · eeee1111')
-  assert.equal(runSession.props.title, DISPATCH_SESSION)
-  runSession.props.onClick()
+  const leadSession = detailSessionButtons(opened).find((node) => textOf(node).startsWith('组长对话'))
+  assert.ok(leadSession, 'detail must expose 组长对话 from the fallback')
+  assert.equal(textOf(leadSession), '组长对话 · eeee1111')
+  assert.equal(leadSession.props.title, DISPATCH_SESSION)
+  assert.ok(
+    !detailSessionButtons(opened).some((node) => textOf(node).startsWith('执行对话')),
+    'poll fallback is the lead session, not the worker conversation',
+  )
+  leadSession.props.onClick()
   assert.deepEqual(harness.openSessionCalls, [DISPATCH_SESSION, DISPATCH_SESSION])
 })
 
@@ -1792,7 +2054,7 @@ test('doing 兜底 B：两条 doing 且 lastDispatchTaskId 缺失时都不显示
   assert.deepEqual(harness.openSessionCalls, [])
 })
 
-test('doing 兜底 C：lastDispatchTaskId 精确命中哪条，只有那条显示执行对话', async () => {
+test('doing 兜底 C：lastDispatchTaskId 精确命中哪条，只有那条显示组长对话', async () => {
   const snapshot = makeSnapshot({
     poll: pollWithDispatch({ lastDispatchTaskId: 'd-2' }),
     tasks: [
@@ -1819,10 +2081,10 @@ test('doing 兜底 C：lastDispatchTaskId 精确命中哪条，只有那条显�
   matchedChat.props.onClick()
   assert.deepEqual(harness.openSessionCalls, [DISPATCH_SESSION])
 
-  // 命中的那条详情里有「执行对话」，没命中的那条没有
+  // 命中的那条详情里有「组长对话」（poll 兜底 = 派发到的会话），没命中的那条没有
   const matchedTree = await openDetailByTitle(instance, tree, '进行中乙')
   assert.equal(detailSessionButtons(matchedTree).length, 1)
-  assert.ok(textOf(detailSessionButtons(matchedTree)[0]).startsWith('执行对话'))
+  assert.ok(textOf(detailSessionButtons(matchedTree)[0]).startsWith('组长对话'))
 
   const closeButton = buttons(matchedTree).find((node) => node.props['aria-label'] === '关闭')
   closeButton.props.onClick()
@@ -2270,11 +2532,11 @@ test('doing 兜底 D：dispatchedSessionId 仍然优先于 poll 兜底', async (
   assert.deepEqual(harness.openSessionCalls, ['session-ffff2222'], 'dispatchedSessionId must win over the fallback')
 
   const opened = await openDetailByTitle(instance, tree, '进行中的任务')
-  const runSession = detailSessionButtons(opened).find((node) => textOf(node).startsWith('执行对话'))
-  assert.ok(runSession)
-  assert.equal(textOf(runSession), '执行对话 · ffff2222')
-  assert.equal(runSession.props.title, 'session-ffff2222')
-  runSession.props.onClick()
+  const leadSession = detailSessionButtons(opened).find((node) => textOf(node).startsWith('组长对话'))
+  assert.ok(leadSession)
+  assert.equal(textOf(leadSession), '组长对话 · ffff2222')
+  assert.equal(leadSession.props.title, 'session-ffff2222')
+  leadSession.props.onClick()
   assert.deepEqual(harness.openSessionCalls, ['session-ffff2222', 'session-ffff2222'])
 })
 

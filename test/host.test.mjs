@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  ARCHIVE_RETENTION_MS,
   ATTACHMENT_MEDIA_TYPES,
   BoardError,
   DEFAULT_DISPATCH_MODE,
@@ -73,6 +74,7 @@ import {
   registerLeadAutoHooks,
   requeueTasksOfLead,
   parseRpcEnvelope,
+  pruneArchivedTasks,
   putWorkspaceLead,
   registerTools,
   reloadBoardIfStale,
@@ -2280,6 +2282,144 @@ test('tick replaces an archived workspace lead with a fresh one', async () => {
     assert.equal(task.dispatchedSessionId, 'lead-new')
     assert.equal(createCalls.length, 1)
     assert.equal(state.config.workspaceLeads['w-demo'].sessionId, 'lead-new')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * v0.2.0 归档保留期：archived 满 30 分钟自动删除（§1.2 / §2）
+ * ------------------------------------------------------------------ */
+
+const ARCHIVE_MINUTE_MS = 60 * 1000
+
+test('pruneArchivedTasks deletes only archived tasks past the 30-minute retention window', () => {
+  assert.equal(ARCHIVE_RETENTION_MS, 30 * ARCHIVE_MINUTE_MS)
+  const state = boardWith('todo', 'doing', 'done', 'archived-31m', 'archived-29m', 'archived-30m')
+  state.tasks[1].status = 'doing'
+  state.tasks[2].status = 'done'
+  const stampArchive = (index, minutes) => {
+    const task = state.tasks[index]
+    task.status = 'archived'
+    task.archivedAt = new Date(NOW - minutes * ARCHIVE_MINUTE_MS).toISOString()
+    task.updatedAt = task.archivedAt
+    task.createdAt = task.archivedAt
+  }
+  stampArchive(3, 31)
+  stampArchive(4, 29)
+  stampArchive(5, 30)
+  const nextIdBefore = state.nextId
+
+  const outcome = pruneArchivedTasks(state, NOW)
+
+  assert.equal(outcome.removed, 2)
+  assert.deepEqual(outcome.ids, ['t-4', 't-6'], '31 分钟与正好 30 分钟的归档被删除（满 30 分钟即删）')
+  assert.deepEqual(state.tasks.map((task) => task.id), ['t-1', 't-2', 't-3', 't-5'])
+  assert.equal(state.tasks[0].status, 'todo', 'todo 不删')
+  assert.equal(state.tasks[1].status, 'doing', 'doing 不删')
+  assert.equal(state.tasks[2].status, 'done', 'done 不删（归档清理只认 archived）')
+  assert.equal(state.nextId, nextIdBefore, 'nextId 不回退：已删除任务的 id 不复用')
+  // 再跑一次是 no-op：已删除的任务不会重复计数，也不改状态。
+  assert.deepEqual(pruneArchivedTasks(state, NOW), { removed: 0, ids: [] })
+})
+
+test('pruneArchivedTasks falls back archivedAt → updatedAt → createdAt and keeps unparseable archives', () => {
+  const state = createEmptyBoard()
+  const minutesAgo = (minutes) => new Date(NOW - minutes * ARCHIVE_MINUTE_MS).toISOString()
+  state.tasks.push(
+    // archivedAt 缺失 → 回退 updatedAt（45 分钟前，过期）
+    {
+      id: 't-1',
+      title: 'fallback updatedAt',
+      status: 'archived',
+      archivedAt: null,
+      updatedAt: minutesAgo(45),
+      createdAt: minutesAgo(50),
+    },
+    // archivedAt 空串、updatedAt 不可解析 → 回退 createdAt（60 分钟前，过期）
+    {
+      id: 't-2',
+      title: 'fallback createdAt',
+      status: 'archived',
+      archivedAt: '',
+      updatedAt: 'nope',
+      createdAt: minutesAgo(60),
+    },
+    // 三个字段都不可解析 → 保守保留（宁可不删，也不误删时间坏掉的任务）
+    { id: 't-3', title: 'unparseable', status: 'archived', archivedAt: 'not-a-date', updatedAt: '', createdAt: undefined },
+    // 归档时间新鲜 → 保留
+    {
+      id: 't-4',
+      title: 'fresh',
+      status: 'archived',
+      archivedAt: minutesAgo(5),
+      updatedAt: minutesAgo(5),
+      createdAt: minutesAgo(600),
+    },
+  )
+
+  const outcome = pruneArchivedTasks(state, NOW)
+  assert.equal(outcome.removed, 2)
+  assert.deepEqual(outcome.ids, ['t-1', 't-2'])
+  assert.deepEqual(state.tasks.map((task) => task.id), ['t-3', 't-4'], '时间不可解析 + 未过期都保留')
+
+  // 空板 / 非法入参不抛
+  assert.deepEqual(pruneArchivedTasks(createEmptyBoard(), NOW), { removed: 0, ids: [] })
+  assert.deepEqual(pruneArchivedTasks(null, NOW), { removed: 0, ids: [] })
+
+  // 自定义保留期（未来可配置化）：45 分钟的归档在 60 分钟保留期下仍保留。
+  const slow = createEmptyBoard()
+  slow.tasks.push({
+    id: 't-1',
+    title: 'slow',
+    status: 'archived',
+    archivedAt: minutesAgo(45),
+    updatedAt: minutesAgo(45),
+    createdAt: minutesAgo(45),
+  })
+  assert.equal(pruneArchivedTasks(slow, NOW, 60 * ARCHIVE_MINUTE_MS).removed, 0)
+})
+
+test('tick prunes expired archives even when polling is paused and persists the removal', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-archive-prune-'))
+  try {
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({ pollEnabled: false, dispatchMode: 'workspace-lead' })
+    const now = Date.now()
+    const stale = addTask(state, { title: '归档 31 分钟' }, now)
+    const fresh = addTask(state, { title: '刚归档' }, now)
+    const todoTask = addTask(state, { title: '待派发' }, now)
+    applyTaskUpdate(state, stale.id, { status: 'archived' }, now)
+    stale.archivedAt = new Date(now - 31 * ARCHIVE_MINUTE_MS).toISOString()
+    stale.updatedAt = stale.archivedAt
+    applyTaskUpdate(state, fresh.id, { status: 'archived' }, now)
+
+    const rt = fakeRuntime(state, { get: () => undefined }, join(dir, 'board.json'))
+    const revisionBefore = state.revision
+
+    const result = await tick(rt, {})
+    // 轮询暂停的返回语义不变，但归档清理照跑。
+    assert.equal(result.dispatched, false)
+    assert.equal(result.reason, 'poll-disabled')
+    assert.deepEqual(
+      state.tasks.map((task) => task.id),
+      [fresh.id, todoTask.id],
+      '过期归档被删除；未过期归档与待派发任务保留',
+    )
+    assert.ok(state.revision > revisionBefore, '有删除时 revision 递增（commitBoard）')
+
+    const saved = JSON.parse(readFileSync(join(dir, 'board.json'), 'utf8'))
+    assert.deepEqual(saved.tasks.map((task) => task.id), [fresh.id, todoTask.id], '删除要落盘')
+    assert.equal(saved.revision, state.revision)
+
+    // 第二轮：没有过期归档 → 不写盘、revision 不再增长。
+    const revisionAfter = state.revision
+    await tick(rt, {})
+    assert.equal(state.revision, revisionAfter, '无过期归档时 tick 不额外写盘')
+    assert.deepEqual(
+      state.tasks.map((task) => task.id),
+      [fresh.id, todoTask.id],
+    )
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

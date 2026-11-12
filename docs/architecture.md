@@ -69,6 +69,21 @@ README.md               Lead：安装 / 使用 / 排障
 合法迁移：`todo→doing`、`doing→done|todo`（打回）、`done→archived|doing`（返工）、
 `archived→todo`（重新打开）。**轮询只扫 `todo`。**
 
+**归档生命周期（30 分钟保留期）**：`archived` 任务在归档满 **30 分钟**后由宿主自动从看板删除
+（从 `board.json` 的 `tasks[]` 移除），用户不必手动点「删除」。判定是纯函数
+`pruneArchivedTasks(state, now, ARCHIVE_RETENTION_MS)`（`ARCHIVE_RETENTION_MS = 30 * 60 * 1000`，导出便于单测）：
+
+1. 只处理 `status === 'archived'` 的任务；`todo` / `doing` / `done` 一律不动。
+2. 归档时间优先 `archivedAt`，缺失 / 不可解析时回退 `updatedAt` → `createdAt`；三个字段都解析不出来
+   则**保守保留**（宁可留一条，也不误删时间坏掉的任务）。
+3. `now - 归档时间 >= 30 分钟` 即删除（满 30 分钟，边界即删）。
+4. 删除后 `revision` +1（走 `commitBoard` 落盘）；`nextId` **不回退**——已删除任务的 id 不复用，
+   避免旧引用指到新任务上。
+5. 清理时机：每次 tick 在 `pollEnabled` 判断**之前**（暂停轮询时照常清理，§1.4），
+   以及插件 `apply()` 启动时清理一次（宿主停机期间到期的归档不必等第一个 tick）。
+   没有任务过期时不写盘、不改 `revision`。
+6. 删除是**物理删除**：之后按该 id 调 `update-task` / 模型工具会得到 `not-found`（任务已不在看板上）。
+
 ### 1.3 派单闭环（本插件存在的理由）
 
 v0.2.0 默认链路（`dispatchMode='workspace-lead'`）：
@@ -114,6 +129,8 @@ v0.2.0 默认链路（`dispatchMode='workspace-lead'`）：
 - **完成回执 flush 不受 `pollEnabled` 限制**：tick 末尾仍会尝试 flush（§1.6）——回执是汇报不是派发，
   只在主会话已绑定、live 且 idle 时真正发送；未绑定 / 离线 / 忙时是 no-op（不抛错、不写 `lastError`）。
   这样暂停派发期间已经 done 的任务仍能汇总给用户。
+- **归档清理也不受 `pollEnabled` 限制**：tick 在任何派发判断**之前**先跑 `pruneArchivedTasks()`
+  （归档满 30 分钟自动删除，§1.2），有删除才落盘并 `revision` +1；轮询暂停时归档照样按时消失。
 
 ### 1.5 工作区组长路由（`dispatchMode='workspace-lead'`）
 
@@ -215,7 +232,7 @@ v0.2.0 的默认派发方式。目标不是「某个会话」，而是**任务�
 | `auto` | 忽略创建者，按「同工作区空闲 → 派单模式空闲 → 任意空闲」挑一个会话 |
 
 旧模式下：`new` 模式失败（没有 sessionController、解析不到工作区、工作区创建被拒、预设不可用）会自动退回 `auto` 的挑法，不丢任务。
-创建成功时还会把 `task.dispatchedSessionId` / `dispatchedSessionTitle` 记到任务上（详情里「执行对话」直接跳过去）。
+创建成功时还会把 `task.dispatchedSessionId` / `dispatchedSessionTitle` 记到任务上（详情里「组长对话」直接跳过去）。
 
 旧模式下，任务同时**绑定创建它的对话与工作区**。解析顺序：
 
@@ -291,7 +308,7 @@ v0.2.0 起宿主把这种派发**自动补成一条看板任务**，仍走同一
 | `cwd` | 组长会话的 `session.header.cwd`（= 当前工作区）；取不到用 sessions 服务兜底，再取不到用 `subagent` 入参的 `cwd`。命中 `workspaceRegistry` 时用注册表里的规范 `path`（`workspaceIdForCwd` → `workspacePathForCwd`，看板工作区过滤与注册表一致） |
 | `status` | `doing`（`startedAt` = 建任务时间；自动任务不参与轮询——轮询只扫 `todo`——`notifiedAt` 保持 `null`，`notificationCount` 为 `0`） |
 | `assignee` | worker 会话 id（`subagentId`）——详情浮层「执行者」 |
-| `sessionId` / `dispatchedSessionId` | 组长会话 id（「发起对话」/「组长」都指向它） |
+| `sessionId` / `dispatchedSessionId` | 组长会话 id（「发起对话」/「组长对话」都指向它；真正执行的 worker 会话 id 另记在 `assignee`） |
 | `dispatchedSessionTitle` | 组长会话标题 |
 | `autoDispatch` | 持久化标记 `'lead-dispatch'`（§2）：**只有带这个标记的任务**才会被 `subagent/end` 自动置 `done`。任务回到 `todo`（人工 / 组长打回、组长归档重排）时清空——重新排队后由轮询投递、归组长审核，不再算「宿主自动任务」 |
 
@@ -427,6 +444,12 @@ worker 的 stopReason 不会覆盖它；成功回写也**不清空**它（真实
 被轮询投递，归组长审核，不再是「宿主自动任务」。`done→doing`（组长打回返工）**保留**标记：返工后的
 结束仍按 §1.8 自动写回（组长每次 done 后都能看到结论并决定是否再打回）。只由宿主维护，不是
 `taskboard_update` / `update-task` 的可 patch 字段，也**不进 `taskBrief()`**（§4.4）。
+
+**归档清理（30 分钟保留期，§1.2）**：`pruneArchivedTasks(state, now, ARCHIVE_RETENTION_MS)` 把归档满 30 分钟的
+任务从 `tasks[]` 里**物理删除**并 `commitBoard()`（`revision` +1、`updatedAt` 刷新）；没有过期任务时
+**不写盘、不改 revision**。`nextId` 不回退（删掉的 `t-<n>` 不复用）；`archivedAt` / `updatedAt` / `createdAt`
+都不可解析的任务保守保留。清理点：tick 在 `pollEnabled` 判断之前（§1.4）+ `apply()` 启动时一次。
+清理是 best-effort：纯函数异常 / 写盘失败只 `console.warn`，绝不影响派发与完成回执（§1.2 / §1.4）。
 
 - 原子写：同目录 `board.json.tmp` → `rename`；失败只记 `console.warn`，内存状态不丢。
 - 读坏文件：`console.warn` + 从空板开始（坏文件改名 `board.json.corrupt-<ts>` 保留现场）。
@@ -564,7 +587,7 @@ LeadRef        = { key: string, cwd: string, sessionId: string, title: string, l
     "running": true,                        // 定时器是否在跑
     "lastRunAt": "…ISO…" | null,
     "lastDispatchAt": "…ISO…" | null,
-    "lastDispatchTaskId": "t-3" | null,      // 最近一次成功投递的任务 id（「执行对话」兜底归属判断）
+    "lastDispatchTaskId": "t-3" | null,      // 最近一次成功投递的任务 id（「组长对话」兜底归属判断）
     "lastDispatchSessionId": "…" | null,     // 会话 id（展示用尾 8 位）
     "lastDispatchSessionTitle": "…" | null,  // 会话标题（有则优先展示）
     "lastSkipReason": "no-live-agent" | "agent-busy" | "creator-busy" | "creator-cold" |
@@ -808,9 +831,12 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 | tab 正文 | `ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name:'sidebar.right.pane.tab', key: <定义 id> }, Body))`；`Body` 收到 slot 级 `useTabInfo` prop |
 | tab chip | `sidebar.right.pane.tab.title` 同 key 注册；不注册则用打开时捕获的标题 |
 | 打开 tab | `ctx.inject(['sidebarRight'], s => handle = s.sidebarRight)` → `handle.openTab(kind)` |
+| 收起已展开的看板 | `handle.isExpanded() === true && handle.active()?.kind === TAB_KIND` → `handle.hide(handle.active().id)`：docked 折叠整列、floating 关闭浮层，tab 记录保留（下次展开还在） |
 | 会话 header 入口 | `ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({ name:'conversation.session.header.actions', id:'taskboard', order:40, label }, HeaderAction))`（list 槽） |
 
 - 本插件：`TAB_TYPE_ID='dsh-taskboard'`（= tab 系统身份，也是正文/title 的 key），`TAB_KIND='taskboard'`（openTab 参数）。
+- `TabRecord`（`active()` 的返回）实测形状 `{ id, kind, title, contentId }`，`kind` 即 `openTab` 用的页类型。
+- header 按钮是 **toggle**：看板已展开且就是活动 tab → `hide(tabId)` 收起；其它情况（没开 / 已收起 / 活动 tab 是别的）→ `openTab(TAB_KIND)` 打开并聚焦。`active` / `isExpanded` / `hide` 任一 API 缺失或抛错都退回 `openTab`，不挡打开主路径。
 - `useTabInfo()` 返回 `{ sidebar:{expanded, fullscreen}, panel:{id,isFloating}, tab:{title,visible,navigation,actions,…} }`。
 - 右栏服务缺失时（非 web-app 部署）插件不崩：header 按钮保留但点击只在 console 警告，body/title 注册由 `slots.inject` 自然等待。
 - 引导页入口：类型的 `guide` 数组给右栏引导页贡献一张卡片（`{ id, order, title, description, icon }`），
@@ -820,7 +846,7 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 
 | 槽位 | 注册参数 | 内容 |
 | --- | --- | --- |
-| `conversation.session.header.actions` | `{ name, id:'taskboard', order:40, label: () => t('panel.label') }` | 会话 header 右侧的看板按钮（`.tb-headbtn`），带本工作区 `todo` 数量角标（`.tb-badge`，>99 显示 99+，6s 刷新） |
+| `conversation.session.header.actions` | `{ name, id:'taskboard', order:40, label: () => t('panel.label') }` | 会话 header 右侧的看板按钮（`.tb-headbtn`），带本工作区 `todo` 数量角标（`.tb-badge`，>99 显示 99+，6s 刷新）；看板已展开且是活动 tab 时**再点一次收起**（`sidebarRight.hide`） |
 | `sidebar.right.pane.tab` | `{ name, key:'dsh-taskboard' }` | 本工作区看板正文 `BoardTab` |
 | `sidebar.right.pane.tab.title` | `{ name, key:'dsh-taskboard' }` | chip：看板 glyph + 标题 |
 | `sidebar.panellist` | `{ name:'sidebar.panellist', id:'taskboard-platform', order:25, label: () => t('platform.label'), locale }` | 左侧栏「任务看板」图标（全部工作区），带 `todo+doing` 角标 |
@@ -893,18 +919,37 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
    - 卡片（t-33 起）：**只有标题 + 操作按钮**。标题可点打开**任务详情浮层**，2 行截断、`title` 兜全文；
      备注（note）/ result / 工作区 / `#t-3` / 相对时间 / 组长 / 执行者 / `lastError` 全部收进详情浮层，
      看板上不再展示（宽度不足时靠标题辨认任务）。
+   - **卡片高度 / 等高（t-42）**：整卡**没有固定高度**——`.tb-card-fixed` 不再有 `min-height:108px`
+     （`--tb-card-h` 变量已删），操作行也不再 `margin-top:auto` 贴底。等高改由**标题固定 2 行高度**
+     实现：`.tb-card-fixed .tb-card-title` 用 `min-height:2.8em`（12.5px × 1.4 × 2 = 35px）配合
+     `-webkit-line-clamp:2`，1 行标题与 2 行标题的标题块同高；标题与操作行之间只留
+     `.tb-card-fixed` 的 `gap:5px`（`.tb-card-actions` 在该类下 `padding-top:0`），不再有整块空行。
+     2 行标题 + 单行按钮的卡片约 **81px**（9+35+5+22+8 + 1px 上下边框），同列同按钮行数的卡片等高。
+     1 行标题的卡片里，标题文字下方仍留着第 2 行的高度（这是「1 / 2 行标题等高」的代价：文字到按钮
+     约 22px = 17.5px 预留行 + 5px gap；2 行标题的卡片就是 5px，即原来那块空行已消失）。
+     窄栏下按钮换 2 行时卡片会自然变高（实测 5 按钮换 2 行时 81 → 106px，按钮不裁）——
+     「不裁按钮」的取舍，**不为强行等高裁掉按钮**。
    - 卡片动作（按状态）：
      - todo：`开始`（→doing）、`立即派发`（`dispatch-now`）、`编辑`、`删除`
      - doing：`完成`（→done）、`打回`（→todo）、`编辑`
      - done：`归档`（→archived）、`返工`（→doing）
      - archived：`重新打开`（→todo）、`删除`
+   - **已归档列会自动淘汰**：归档满 30 分钟的任务由宿主动删除（§1.2），用户不必逐个点 `删除`；
+     UI 目前没有额外的倒计时提示（删除是静默的）。
    - 编辑用行内表单（标题 + 备注），保存调 `update-task`。
-   - **跳到关联对话**：卡片动作里「对话」（`task.dispatchedSessionId` 优先，其次 `task.sessionId`）；
-     详情浮层「关联对话」区块里分别有「发起对话 · <尾8>」与「执行对话 · <尾8>」按钮。
+   - **跳到关联对话**：卡片动作里「对话」的优先级是 **worker 子会话**（`task.assignee`，且只在它形如
+     `session-…` 或 UUID 时算会话；`worker-42` / `main` 这类普通标签不算会话，不出现按钮）→ 组长会话
+     （`task.dispatchedSessionId`）→ 发起对话（`task.sessionId`）；按钮 `title` 写实际跳转的会话 id。
+     详情浮层「关联对话」区块分别给出且各自可点：「发起对话 · <尾8>」= `task.sessionId`、
+     「执行对话 · <尾8>」= worker `task.assignee`（仅当像会话 id）、「组长对话 · <尾8>」=
+     `task.dispatchedSessionId`（与 worker / 发起会话相同则不重复显示）；都没有时显示
+     「（这条任务还没有关联对话）」。组长直聊派活时宿主把 worker 会话 id 记进 `assignee`（§1.8），
+     所以「执行对话」指向真正干活的子会话，不再用组长会话冒充。
      点击调用客户端服务 `ctx.get('uiWorkspace').openSession(sessionId)`（官方导航 API，同步 void），
      服务缺失/会话不存在时只 console.warn 不崩。宿主在投递时把 `dispatchedSessionId` / Title 记到任务上。
      老版本 Host 派发的进行中任务没有这个字段时，client 用 `snapshot.poll.lastDispatchSessionId` 兜底：
-     仅当 `poll.lastDispatchTaskId` 命中该任务、或全局只有一条 `doing` 任务时才显示「执行对话」（避免张冠李戴）。
+     仅当 `poll.lastDispatchTaskId` 命中该任务、或全局只有一条 `doing` 任务时才显示「组长对话」
+     （兜底会话是「派发到的会话」，语义上是组长会话，不冒充 worker，避免张冠李戴）。
    - **任务详情浮层**（`Detail`，两块看板共用）：点卡片标题或「详情」按钮打开，展示完整标题 / 状态 /
      工作区 / 创建·开始·完成·归档时间 / 组长 / 执行者 / 创建来源 / 任务 id / 完整备注 /
      完整结论（含 done 但没写结论时的提示）/ 最近错误，并提供按状态的主操作（开始 / 完成 / 归档 / 重新打开）
@@ -956,7 +1001,7 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
    - 条目缺失 / 离线不阻塞看板其它功能；RPC 失败只 `console.warn` + 顶部错误条，不崩。
 3. **任务卡片 / 详情**：卡片只有标题 + 操作按钮（t-33）；「组长」=
    `task.dispatchedSessionTitle || task.dispatchedSessionId`（详情里可点打开）、「执行者」= `task.assignee`
-   （worker 的 label / sessionId）都在详情浮层。详情沿用 §5.2 的「发起对话 / 执行对话」。
+   （worker 的 label / sessionId）都在详情浮层。详情沿用 §5.2 的「发起对话 / 执行对话 / 组长对话」。
 4. **「派发到」选择器**：选项 `workspace-lead`（显示「工作区组长（推荐）」，默认）/ `new` / `creator` / `auto`；
    值直接取 `snapshot.config.dispatchMode`，缺省回退 `'workspace-lead'`（不要回退 `new`）。
 5. **i18n**：组长条文案、三个状态点、新 RPC 错误提示都要 zh/en 双份（`locale` 命名空间 `taskboard`）；
@@ -1011,6 +1056,7 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
    ensure-workspace-lead / upload-attachment / attachment** 全通；错误分支（bad id、非法 status、
    空 title、空 sessionId、空 cwd、非法图片 MIME、路径穿越 id、未知附件 id）返回对应错误码。
 4. Playwright（右侧栏）：会话 header 出现「任务看板」按钮（带角标）→ 点击 → 右栏打开看板 tab →
+   **再点一次 header 按钮 → 右栏收起**（docked 折叠整列 / floating 关闭浮层，tab 记录保留）→ 再点开仍在 →
    窄栏四个纵向 lane 渲染 → 加任务出现在待开始 → 切换轮询开关/间隔 → 编辑/开始/完成/归档/删除各走一遍 →
    全屏/加宽到 ≥680px 切四列 → 刷新页面状态保持 → 左侧菜单没有看板项。
 5. 端到端派单（真实模型，v0.2.0 核心验收）：普通会话绑定主会话 → 加任务 → 插件自动创建该工作区
@@ -1118,6 +1164,11 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 - v0.2.0 修复（会话标题常量）：`sessionTitle()` 引用了未定义的 `SESSION_TITLE_MAX` 常量（v0.1.3 遗留），
   会话标题非空时 tick（投递记账 / 快照）会抛 `ReferenceError`；本版补上常量定义（= 200，与
   `mainSessionTitle` / `workspaceLeads[].title` 的截断长度一致）。
+- v0.2.0 修复（列头/卡片不平齐）：只有「已完成」列的列头带「全部归档」按钮（24px 高、外框约
+  26px），其它列列头只有文字（行高 14px）。列头不固定高度时 flex 行高被按钮撑大 ~10px，于是
+  「已完成」的标题比别的列低、整列卡片也跟着低一截。给 `.tb-colhead` 固定 `height:31px`
+  （`box-sizing:border-box`，窄栏 29px），所有列头的标题、卡片起点同一水平线。
+  本地 2x 复现实测：改前列头 20 / 27px、卡片顶 38 / 45px；改后统一 31px、卡片顶 49px。
 - v0.2.0 修复（右栏 tab 标题被挡）：宿主 dockkit chrome 在 tab hover / active 时，会用标题右侧
   30px 的渐隐遮罩给关闭按钮让位；本插件 tab 默认只有内容宽（图标 + 「任务看板」≈71px，tab ≈100px），
   遮罩从标题 50px 处开始，「板」被一起吃掉、看起来像被关闭按钮挡住。修法不是拉宽 tab，而是
@@ -1179,3 +1230,72 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   协议前缀」，裸引用 `attachment://<uuid>` 的 UUID 被 4000 字符边界切断时会残留半截 id（坏链接 / 死文本）。
   增加第 4 条兜底：前缀完整但 id 不是完整 UUID → 整段丢掉；完整 UUID 照常保留（§2.1 同步口径），
   补 1 条单测（含 `add-task` / `update-task` 同口径断言）。
+- v0.2.0 修复（t-40：header 图标再点一次关闭）：会话 header 的看板按钮原先无论右栏状态都
+  `openTab('taskboard')`，看板已打开时再点没有反应。改为 toggle：`sidebarRight.isExpanded() === true`
+  且 `sidebarRight.active().kind === TAB_KIND` 时调 `sidebarRight.hide(active().id)`——0.2.2-rc.1 实测
+  docked 折叠整列、floating 关闭浮层，tab 记录保留供下次展开；其它情况（没开 / 已收起 / 活动 tab 是别的）
+  仍 `openTab` 打开并聚焦。`active` / `isExpanded` / `hide` 任一缺失或抛错都退回 `openTab`，右栏服务缺失时
+  仍只 `console.warn`、不抛错（打开路径的「会话刚切过来重试一次」保留）。header 的 `onClick` 改成箭头函数，
+  避免把事件对象当 `retry` 传进 `openBoard`（原先重试实际不生效）。§5.0 / §5.1 / §7 同步；
+  `test/client-render.test.mjs` 扩 `sidebarRight` 桩（`active` / `isExpanded` / `hide`）并补 3 条用例。
+- v0.2.0 新增（t-38：归档满 30 分钟自动删除）：`archived` 任务归档满 30 分钟后由宿主自动从
+  `board.json` 的 `tasks[]` 里**物理删除**，用户不必手动点「删除」。新增导出常量
+  `ARCHIVE_RETENTION_MS = 30 * 60 * 1000` 与纯函数 `pruneArchivedTasks(state, now, retentionMs)`：
+  只处理 `status==='archived'`；归档时间优先 `archivedAt`，缺失 / 不可解析时回退 `updatedAt` → `createdAt`，
+  三者都不可解析时**保守保留**（不误删时间坏掉的任务）；`now - 归档时间 >= 30 分钟` 即删（满 30 分钟，边界即删）；
+  删除后 `revision` +1（`commitBoard`），**`nextId` 不回退**（已删除任务的 id 不复用）；未过期任务保持原顺序
+  （原地改写 `state.tasks`，数组引用不变）。清理点：`runTick` 在 `pollEnabled` 判断**之前**
+  （暂停轮询也清理，且不阻塞派发 / 完成回执）+ `apply()` 启动时一次（宿主停机期间到期的归档不必等第一个 tick）；
+  没有过期任务时**不写盘、不改 revision**；清理异常 / 写盘失败只 `console.warn`（best-effort）。
+  UI 侧**没有**加「归档 30 分钟后自动删除」提示：`lib/client.js` 同期由 t-40 改 header 图标 toggle，
+  避免同文件并发冲突，留待后续单独补（不影响功能）。§1.2 增加「归档生命周期」段，§1.4 / §2 同步；
+  `test/host.test.mjs` 补 3 条：纯函数删除窗口（31 分钟删 / 29 分钟留 / 正好 30 分钟删 / 非 archived 不删 /
+  `nextId` 不回退）、时间字段回退与不可解析保留、`pollEnabled=false` 时 tick 仍清理并落盘且无过期不写盘。
+- v0.2.0 修复（t-39：任务「对话」打开真正执行任务的 worker 会话）：原先卡片「对话」与详情「执行对话」
+  都优先 `task.dispatchedSessionId`（= 任务被投递到的组长会话），点进去是组长对话，不是真正干活的子会话。
+  现在新增纯函数 `workerSessionOf(task)`：只有 `task.assignee` 非空且形如 `session-…` 或裸 UUID
+  （宿主 `subagentId`）时才算 worker 会话；`worker-42` / `main` 这类普通标签不算会话（详情「执行者」行照常显示标签）。
+  `sessionOf(task)` 重构为 worker → `dispatchedSessionId`（组长）→ `sessionId`（发起）→ 老 Host 的
+  `poll.lastDispatchSessionId` 兜底（§5.2）；卡片「对话」按钮 `title` 写实际跳转的会话 id。
+  详情「关联对话」拆成三个各自可点的按钮：「发起对话」= `task.sessionId`、「执行对话」= worker
+  `assignee`、「组长对话」= `dispatchedSessionId`（新增 i18n key `detail.leadSession`，zh「组长对话」/
+  en「Lead conversation」；与 worker / 发起会话相同则不重复显示），都没有时保留「（这条任务还没有关联对话）」。
+  poll 兜底语义不变，但按新语义显示为「组长对话」（兜底会话是派发到的组长会话，不再冒充 worker）；
+  发起对话与 doing 兜底 A/C/D 的既有行为保留。只改 Client 半（`lib/client.js`）+ 渲染测试，Host 不动。
+  `test/client-render.test.mjs` 更新卡片用例（worker 优先 / 只有 assignee / 非会话标签不出按钮）与详情用例
+  （三按钮 / dispatched-only 只显示组长对话 / 无会话 muted），补 1 条 `workerSessionOf` 纯函数用例；
+  §1.3 / §2 / §5.2 / §5.5 同步。
+- v0.2.0 修复（t-42：任务卡片标题与按钮之间多出一整块空行）：t-33 的等高靠
+  `.tb-card-fixed{min-height:var(--tb-card-h,108px)}` + `.tb-card-fixed .tb-card-actions{margin-top:auto}`，
+  但 2 行标题 + 单行按钮的内容只有约 79px，卡片被 108px 撑高后 `margin-top:auto` 把多出来的约 29px
+  全变成标题与操作行之间的空行。现在**去掉整卡 `min-height`（连同无写入方的死变量 `--tb-card-h`）与
+  操作行 `margin-top:auto`**，等高改为给标题固定 2 行高度（`.tb-card-fixed .tb-card-title` 加
+  `min-height:2.8em`，保留 `-webkit-line-clamp:2` / `line-height:1.4`）：1 行与 2 行标题的标题块同高，
+  标题与操作行之间只剩 `gap:5px`，卡片高度由内容决定（2 行标题 + 单行按钮约 81px，含边框）。
+  窄栏按钮换 2 行时卡片自然变高——不裁按钮的取舍，不用整卡固定高度硬压。行内编辑态照旧不带
+  `.tb-card-fixed`、高度自适应（实测 142px）。浏览器实测（3080 右栏看板，13 张卡片）：改后
+  全部 81px、标题块到操作行一律 5px、操作行 `margin-top` 为 0；把旧规则在页面上重新套回同一张
+  卡片则是 108px / `margin-top:27px` / 标题块到操作行 32px。5 个按钮在窄列换 2 行时卡片 81 → 106px、
+  间距仍是 5px（按钮不裁）。`test/client-render.test.mjs` 把原先断言 `min-height:var(--tb-card-h,108px)`
+  与 `margin-top:auto` 的两条改为：整卡规则无 `min-height`、无 `--tb-card-h`、操作行无 `margin-top`、
+  标题 `min-height:2.8em`；`test/` 全绿。§5.2「看板主体」补「卡片高度 / 等高」段。只改 Client 半 + 文档，
+  Host 不动。
+- v0.2.1（发布汇总）：本批集中发布列头 / 会话 header / 卡片 / 对话跳转 / 归档清理与 t-34 收尾，
+  `node --test` 189 pass / 0 fail。主要内容：
+  - 列头高度 CSS：`.tb-colhead` 固定 `height:31px`（`box-sizing:border-box`，窄栏 29px），
+    「全部归档」按钮不再把「已完成」列头撑高；四列标题与卡片起点对齐。
+  - header 图标再点收起：看板已展开且是活动 tab 时，header 按钮调 `sidebarRight.hide()` 收起
+    （docked 折叠整列 / floating 关闭浮层，tab 记录保留）；其它情况仍 `openTab`，API 缺失或异常时
+    回退 `openTab`，不挡打开主路径。
+  - 卡片 2 行标题等高 / 去掉空行：去掉整卡 `min-height`（含 `--tb-card-h`）与操作行 `margin-top:auto`，
+    标题块固定 `min-height:2.8em`，1 行 / 2 行标题的标题块同高，标题与操作行之间只留 `gap:5px`；
+    窄栏按钮换 2 行时卡片自然增高、不裁按钮。
+  - 对话优先跳 worker 会话：卡片「对话」与详情「执行对话」优先 `task.assignee` 中形如
+    `session-…` / UUID 的 worker 子会话；详情拆为「发起对话 / 执行对话 / 组长对话」三个可点按钮，
+    普通标签不算会话，老 Host 的 poll 兜底按「组长对话」展示。
+  - 归档满 30 分钟自动清理：`pruneArchivedTasks()` 物理删除归档满 30 分钟的任务，清理点在 tick
+    的 `pollEnabled` 判断之前（暂停轮询也清理）与 `apply()` 启动时；`nextId` 不回退，时间字段
+    不可解析时保守保留，无过期任务不写盘、不改 revision。
+  - t-34 文档 / 附件边界收尾：§5.1 / §5.1.1 的卡片字段与实现对齐；删除无引用 locale 键与
+    卡片相对时间的死定时器；补齐 5 MB 预检、8 引用上限、单批 4 张、上传计数、部分失败保留，
+    以及 `truncateNote()` 不切断 `attachment://` 引用的文档与回归测试。
