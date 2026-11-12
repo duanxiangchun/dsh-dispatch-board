@@ -1265,6 +1265,19 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   状态强调色用 `--dsw-alias-state-*`；唯一允许的硬编码色是列头小圆点（4 个状态的固定色，
   见 `docs/client-notes.md` 的调色板建议）。
 - CSS 通过 `<style data-plugin-css="dsh-taskboard/client.css">` 幂等注入一次。
+- 左侧栏「任务看板」入口图标（`.tb-icon`）：`position:relative + inline-flex + line-height:0`
+  让字形盒子收紧到 `svg` 并与条目垂直居中（不写死宽高——宿主传的 `size` 展开时 16 / 收起时 18，
+  写死会撑宽图标列），`.tb-icon>svg` 用 `display:block` 去掉基线间隙。
+- 侧栏两枚角标收在一个 `.tb-badges` 组里（t-89）：蓝「未完成」+ 红「待你处理」，12px、
+  `pointer-events:none`（不挡行按钮点击）。宿主契约 `sidebar.panellist` 只给
+  `{ size, active }`（`SidebarPanelIconOwnerProps`，没有 badge / count / trailing 挂载点），
+  文字标签 `span.panelTitle` 由宿主渲染在图标后面，所以位置靠量：`PlatformPanelIcon` 用
+  `.tb-icon.closest('button')` 找到宿主行、取行里「不含图标 + 有文字」的子节点当标签，
+  把标签 rect 换算成相对 `.tb-icon` 的 `--tb-badge-x/--tb-badge-y`（纯函数 `labelBadgeAnchor`：
+  左缘 = 文字右缘 − 1px、上缘 = 文字上缘 − 6px），`data-badge-anchor=label` 时整组贴到
+  「任务看板」文字右上角；量不到标签（侧栏收起成 36px 图标列 / 宿主结构变化）→
+  `data-badge-anchor=icon`，退回图标右上角，不跑位。窗口 resize / ResizeObserver（图标、行、标签）
+  + 2s 兜底轮询重算，亚像素抖动不触发重渲染。会话 header 的 `.tb-badge` 仍走自己的绝对定位，不受影响。
 
 ### 5.5 组长条与主会话绑定（v0.2.0）
 
@@ -1909,4 +1922,72 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   §1.8 / §3.2 / §4.6 / §5.2 / §6 / §7 / README / AGENTS.md / preset persona 同步。
   发布流程：`package.json` bump 到 `0.2.4` → 与 `main` 一起推送 annotated tag `v0.2.4`，触发
   `.github/workflows/publish.yml`（校验 tag 与 `package.json` 版本一致 → `node --test`
+  → `npm publish --access public --provenance` → 建 GitHub Release）；push `main` 触发 `ci.yml`（Node 20/22）。
+
+- v0.2.5——左侧栏「任务看板」入口图标上下不居中（t-87）：用户反馈入口图标在条目里没对齐
+  （截图 2026-11-12）。真机复现（测试 profile `taskboard` + 临时 `DSH_HOME` / `DSH_TASKBOARD_PATH` +
+  Playwright、1280 与 1600 宽）：`.tb-icon` 在整份 CSS 里**没有任何规则**，宿主 `.hHd-Xa_panelGlyph` 是
+  `inline-flex`，会把 `span.tb-icon` 块级化；里面的内联 `<svg>` 按行盒基线排布、继承条目的
+  `line-height:22px`，行盒底部留下 6px 的 strut 下降部 → 16px 字形贴行盒顶：字形中心 205 /
+  条目（`.hHd-Xa_panelRow`）中心 208，**偏高 3px**；同排宿主图标（插件 / 自动化任务 / 更多）都是 208。
+  注意 `span.tb-icon` 自身的 rect 高 22px、中心恰好 208 —— 偏移被行盒吸收进盒子高度，所以按 span 盒子量
+  `deltaCenterY` 是 0，只有按可见 `svg` 量才暴露。同一根因还有第二个可见缺陷：`.tb-badge` 是
+  `position:absolute` 但当时没有任何定位祖先，两枚角标被钉到视口右上 / 右下
+  （rect `x=1265`/`1585`、`y=-3`/`889`），侧栏里根本看不见。
+  修法（只改 Client 半 `lib/client.js` 的 `CSS` 数组）：`.tb-icon` 照 `.tb-headbtn` 的做法改成
+  `position:relative;display:inline-flex;align-items:center;justify-content:center;line-height:0`
+  （**不写死宽高**：宿主传的 `size` 展开时 16、侧栏收起时 18，写死会撑宽图标列 / 裁字），
+  `.tb-icon>svg` 加 `display:block`；角标改为相对 `.tb-icon` 定位——侧栏图标只有 16px，宿主
+  `.tb-badge` 的内容盒会撑到 20px 宽、盖住大半个字形，故 `.tb-icon .tb-badge` 收成
+  `box-sizing:border-box` 的 12px 贴右上，`.tb-icon .tb-badge-needs` 贴右下。宿主样式 / 组件结构不做改动。
+  真机复测（同一组测量）：字形与图标中心 208 == 条目中心 208，`deltaCenterY_icon = deltaCenterY_svg = 0`
+  （修复前 svg -3），`deltaCenterX = 0`（对宿主 `.hHd-Xa_panelGlyph` 图标列）；1280 / 1600 宽、
+  展开 / 收起侧栏、有角标 / 无角标全部为 0；角标固定在图标右上（右缘 +6、上缘 -4）/ 右下（右缘 +6、下缘 +4），
+  不再跑到视口角。
+  测试：`test/client-render.test.mjs` 新增 1 条 CSS 形状守卫（`.tb-icon` 规则含 `inline-flex` /
+  `align-items:center` / `line-height:0` / `position:relative`，svg `display:block`，侧栏角标
+  `border-box` 12px）；VM + React 桩没有 CSS 引擎，**真实几何以真机测量为准**，不在单测里写假几何断言。
+  `node --test` 全量 **274 pass / 0 fail**（v0.2.4 发布基线 273 → 274）；§5.4 同步。
+  `package.json` 版本号不在本任务里 bump（发布流程统一处理）。
+
+- v0.2.5——侧栏角标应在「任务看板」**文字**右上角（t-89）：用户验收 t-87 时反馈
+  「那个信息应该在任务看板文字的右上角，但是你现在好像放在了左侧图标的右上角」（t-87 把 `.tb-badge`
+  锚到图标右上 / 右下）。先查宿主能力：`dsh-client-ui-sidebar` 的槽位契约
+  （`SidebarPanelIconOwnerProps = { size, active }`，见该包 `src/client/contract/slots.ts`）**没有**
+  badge / count / trailing 挂载点；宿主 `PanelRow` 的 DOM 是
+  `button[aria-label=面板名] > span.panelGlyph > [data-slot] > span.tb-icon` + 同级 `span.panelTitle`，
+  rc.1（npm 全局 0.2.2-rc.1）行 36px / `panelTitle` (42,197,56×22)，rc.2（桌面 runtime）行 32px /
+  `panelTitle` (42,189,56×22) + `div.panelEntry{position:relative}`；两个版本的标签相对图标偏移一致
+  （右缘 +78、上缘 −3），但**插件拿不到标签槽位**，只能自己量。
+  修法（只改 `lib/client.js`）：两枚角标并进 `.tb-badges` 组（`position:absolute`、默认
+  `top:-4px;right:-6px` 贴图标右上角＝折叠态降级，`pointer-events:none`）；`PlatformPanelIcon` 用
+  `useRef` 拿 `.tb-icon`，`closest('button')` 找宿主行、按「不含图标 + 有文字」（先认 `*_panelTitle`）
+  找标签节点，纯函数 `labelBadgeAnchor(labelRect, iconRect)` 算出相对图标的
+  `--tb-badge-x/--tb-badge-y`（左缘 = 文字右缘 − 1px、上缘 = 文字上缘 − 6px），
+  `data-badge-anchor=label` 时整组贴到文字右上角；量不到标签（侧栏收起 / 宿主改结构 / rect 为 0）
+  返回 null → `data-badge-anchor=icon` 退回图标角，不报错。重算时机：`size` 变化（展开↔收起）、
+  window resize、ResizeObserver（图标 / 行 / 标签）、2s 兜底轮询；亚像素抖动（<0.5px）不重渲染。
+  真机验证（测试 profile `taskboard` + 临时 `DSH_HOME` / `DSH_TASKBOARD_PATH` + 临时 board：1 todo +
+  1 needsUser；Playwright + 显式 chromium 1243；端口 3087 = npm 0.2.2-rc.1、3088 = 桌面 runtime
+  0.2.2-rc.2；1280 / 1600 宽）：**4/4 场景 PASS**——展开态 badge (97,191) 12×12，
+  `label.right=98 / label.top=197`（rc.1）与 (97,183) / 98 / 189（rc.2），`dx = dy = 0`，
+  与文字 rect 重叠 6px²（只压住右上角 1×6px 的一条）、与文字 ink 5px²，两枚角标间距 2px；
+  2 位数（"12" 14×12）仍左缘 97 向右生长、不压字；图标 ΔcenterY = 0（t-87 不回归）；
+  折叠态无标签 → `data-badge-anchor=icon`，角标 (31,215)/(31,229) 贴 18px 图标右上（不跑视口角），
+  ΔcenterY = 0；`pageerror` / console error 全空；展开→收起→再展开后 dx/dy 仍 0。
+  测试：`test/client-render.test.mjs` 更新 t-87 守卫 + 新增 `.tb-badges` / `data-badge-anchor=label`
+  形状守卫与 `.tb-badges` 组渲染断言；`test/client.test.mjs` 新增 2 条纯函数用例
+  （`labelBadgeAnchor` 三组 rect 换算、`hostLabelNode` 展开 / 折叠 / 异常结构）。
+  `node --test` 全量 **276 pass / 0 fail**（v0.2.4 发布基线 273 → 274(t-87) → 276）；§5.4 同步。
+  `package.json` 版本号不在本任务里 bump（发布流程统一处理）。
+
+- v0.2.5（发布汇总）：发布 ① 左侧栏「任务看板」入口图标垂直居中（`.tb-icon`
+  `position:relative;display:inline-flex;align-items:center;justify-content:center;line-height:0` +
+  `.tb-icon>svg{display:block}`，修掉此前无任何规则、内联 svg 按行盒基线排布导致的字形偏高 3px）、
+  ② 两枚数量角标定位到「任务看板」**文字**右上角（`.tb-badges` 组 + `labelBadgeAnchor` 测量写
+  `--tb-badge-x/--tb-badge-y`，`left = label.right − icon.left − 1` / `top = label.top − icon.top − 6`；
+  折叠态无标签自动降级回图标右上角，纯函数 `labelBadgeAnchor` / `hostLabelNode` 有单测）。
+  `node --test` **276 pass / 0 fail**（v0.2.4 发布基线 273 → +1 t-87 渲染/CSS 守卫 = 274 → +2 t-89
+  纯函数用例 = 276）；§5.4 同步。发布流程：`package.json` bump 到 `0.2.5` → 与 `main` 一起推送 annotated tag
+  `v0.2.5`，触发 `.github/workflows/publish.yml`（校验 tag 与 `package.json` 版本一致 → `node --test`
   → `npm publish --access public --provenance` → 建 GitHub Release）；push `main` 触发 `ci.yml`（Node 20/22）。

@@ -584,3 +584,51 @@ test('v0.2.2 待你处理：i18n 保持无 needsUser.empty 死键', () => {
   }
   assert.equal(clientSource.includes('needsUser.empty'), false, '源码不得引用 needsUser.empty')
 })
+
+/* ══════════════════════════════════════════════════════════════
+ * t-89：侧栏角标贴「任务看板」文字右上角
+ * 宿主契约只给 { size, active }，位置靠「量宿主标签 rect」换算；真实几何在真机测，
+ * 这里守纯函数：标签 rect → 相对 .tb-icon 的角标左上角、以及宿主标签节点识别。
+ * ══════════════════════════════════════════════════════════════ */
+
+test('t-89 labelBadgeAnchor：标签 rect 换算成相对 .tb-icon 的角标左上角（左缘回缩 1px、上缘上提 6px）', () => {
+  const { exported } = loadClient()
+  const { labelBadgeAnchor } = exported.__test
+  // 真机 1280 展开态实测（rc.1 / rc.2 相对偏移一致）：icon(20,200,16x16) / label(42,197,56x22)
+  assert.deepEqual({ ...labelBadgeAnchor({ left: 42, top: 197, right: 98, bottom: 219 }, { left: 20, top: 200 }) }, {
+    left: 77,
+    top: -9,
+  })
+  // 侧栏宽度 / 行高变化只改 rect，不改公式
+  assert.deepEqual({ ...labelBadgeAnchor({ left: 100, top: 300, right: 160, bottom: 322 }, { left: 80, top: 304 }) }, {
+    left: 79,
+    top: -10,
+  })
+  // 亚像素四舍五入到 0.01px（避免 React 每次重渲染都写新 style）
+  assert.deepEqual({ ...labelBadgeAnchor({ left: 42.333, top: 197.666, right: 98.777, bottom: 219 }, { left: 20.111, top: 200.4 }) }, {
+    left: 77.67,
+    top: -8.73,
+  })
+})
+
+test('t-89 hostLabelNode：认出宿主行里的文字标签，折叠态（无标签）/ 结构异常返回 null', () => {
+  const { exported } = loadClient()
+  const { hostLabelNode } = exported.__test
+  const icon = {}
+  const glyph = { className: 'hHd-Xa_panelGlyph', textContent: '11', contains: (node) => node === icon }
+  const title = { className: 'hHd-Xa_panelTitle hHd-Xa_wide', textContent: '任务看板', contains: () => false }
+
+  // 展开态：图标在 panelGlyph 里，文字标签是同一按钮的另一个子节点
+  assert.equal(hostLabelNode({ children: [glyph, title] }, icon), title)
+  // 类名变了（宿主换构建哈希前缀）仍按「不含图标 + 有文字」兜底
+  const plain = { className: '', textContent: '任务看板', contains: () => false }
+  assert.equal(hostLabelNode({ children: [glyph, plain] }, icon), plain)
+  // 折叠态：宿主不渲染标签，只剩图标 → null（CSS 退回图标右上角）
+  assert.equal(hostLabelNode({ children: [glyph] }, icon), null)
+  // 空文字 / 缺失节点 / 没有 children 都不抛错
+  const empty = { className: 'x_panelTitle', textContent: '   ', contains: () => false }
+  assert.equal(hostLabelNode({ children: [glyph, empty] }, icon), null)
+  assert.equal(hostLabelNode(null, icon), null)
+  assert.equal(hostLabelNode({ children: [title] }, null), null)
+  assert.equal(hostLabelNode({}, icon), null)
+})

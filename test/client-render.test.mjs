@@ -1196,6 +1196,13 @@ test('PlatformPanelIcon：todo+doing 角标 + 6s 轮询 snapshot', async () => {
   assert.equal(badge.length, 1, 'todo + doing = 3 must show a badge')
   assert.equal(textOf(badge[0]), '3')
 
+  // t-89：两枚角标收在一个 .tb-badges 组里；量到宿主标签前 data-badge-anchor=icon（CSS 退回图标角）。
+  const group = nodesWithClass(tree, 'tb-badges')
+  assert.equal(group.length, 1, 'badges must be wrapped in one .tb-badges group')
+  assert.equal(tree.props['data-badge-anchor'], 'icon')
+  assert.equal(tree.props.style, undefined, 'no label anchor before any DOM measurement')
+  assert.equal(group[0].props['aria-hidden'], 'true')
+
   assert.equal(countCalls(harness, 'snapshot'), 1)
   assert.equal(harness.intervals.length, 1)
   assert.equal(harness.intervals[0].ms, 6000)
@@ -1209,9 +1216,49 @@ test('PlatformPanelIcon：RPC 失败时不崩、不显示角标', async () => {
   })
   const result = await renderComponent(harness.componentOf('sidebar.panellist'), { size: 20 })
   assert.equal(nodesWithClass(result.tree, 'tb-badge').length, 0)
+  assert.equal(nodesWithClass(result.tree, 'tb-badges').length, 0, '无角标时连角标组都不渲染')
   assert.equal(result.tree.props.title, '任务看板')
   const svg = collect(result.tree).find((node) => node.type === 'svg')
   assert.equal(svg.props.width, 20)
+})
+
+test('PlatformPanelIcon（t-87 / t-89）：.tb-icon 居中 + 角标组贴宿主标签右上角', () => {
+  // 真实几何（字形中心 == 条目中心、角标在「任务看板」文字右上角）只有浏览器能算：这里是 VM + React 桩，
+  // 没有 CSS 引擎，所以只守「规则形状」。回归点：不加规则时 span 被宿主 inline-flex 块级化，
+  // 内联 <svg> 按行盒基线排布、继承条目 line-height:22px，字形比条目中心高 3px（真机 1280 实测
+  // 205 vs 208）；同时 .tb-badge 没有定位祖先，角标被钉到视口角上。
+  const iconCss = clientSource.match(/\.tb-icon\{[^}]*\}/)
+  assert.ok(iconCss, '.tb-icon 规则必须存在（缺失时入口图标按行盒基线排布、偏高 3px）')
+  assert.match(iconCss[0], /position:relative/, '角标需要 .tb-icon 作为定位上下文')
+  assert.match(iconCss[0], /display:inline-flex/)
+  assert.match(iconCss[0], /align-items:center/)
+  assert.match(iconCss[0], /line-height:0/)
+
+  const svgCss = clientSource.match(/\.tb-icon>svg\{[^}]*\}/)
+  assert.ok(svgCss, '图标 svg 需要自己的规则去掉基线间隙')
+  assert.match(svgCss[0], /display:block/)
+
+  // 侧栏图标只有 16/18px：角标按内容盒会撑到 20px 宽，收成 border-box 的 12px 才不盖住字形；
+  // 定位统一交给 .tb-badges 组（单个角标 position:static），宿主 header 的 .tb-badge 不受影响。
+  const badgeCss = clientSource.match(/\.tb-icon \.tb-badge\{[^}]*\}/)
+  assert.ok(badgeCss, '侧栏角标需要按 .tb-icon 收敛尺寸')
+  assert.match(badgeCss[0], /box-sizing:border-box/)
+  assert.match(badgeCss[0], /height:12px/)
+  assert.match(badgeCss[0], /position:static/)
+
+  // t-89：默认（量不到宿主标签 / 侧栏收起）贴图标右上角；量到标签后整组按 CSS 变量移到标签右上角。
+  const groupCss = clientSource.match(/\.tb-badges\{[^}]*\}/)
+  assert.ok(groupCss, '.tb-badges 角标组规则必须存在')
+  assert.match(groupCss[0], /position:absolute/)
+  assert.match(groupCss[0], /top:-4px/, '折叠态（无标签）退回图标右上角')
+  assert.match(groupCss[0], /right:-6px/)
+  assert.match(groupCss[0], /pointer-events:none/, '角标不能挡住行按钮的点击')
+
+  const anchored = clientSource.match(/\.tb-icon\[data-badge-anchor=label\] \.tb-badges\{[^}]*\}/)
+  assert.ok(anchored, '量到宿主标签时需要 data-badge-anchor=label 的定位规则')
+  assert.match(anchored[0], /left:var\(--tb-badge-x\)/, '角标左缘由标签 rect 换算（t-89）')
+  assert.match(anchored[0], /top:var\(--tb-badge-y\)/, '角标上缘由标签 rect 换算（t-89）')
+  assert.match(anchored[0], /right:auto/, '贴标签时不能同时保留 right:-6px')
 })
 
 /* ══════════════════════════════════════════════════════════════
