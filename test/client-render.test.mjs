@@ -1024,6 +1024,16 @@ test('卡片精简（t-33）：只渲染标题 + 操作按钮，等高样式类/
   assert.equal(collect(await instance.run()).filter((node) => hasClass(node, 'tb-edit')).length, 0, '保存 closes the inline editor')
 })
 
+test('待你处理卡片：问题最多两行（.tb-needs-card-q 带 -webkit-line-clamp:2）', () => {
+  const rule = clientSource.match(/\.tb-needs-card-q\{[^}]*\}/)
+  assert.ok(rule, '.tb-needs-card-q 规则必须存在')
+  assert.match(rule[0], /-webkit-line-clamp:2/, '问题最多两行，与文档「最多两行」一致')
+  assert.match(rule[0], /overflow:hidden/, 'line-clamp 需要 overflow:hidden 才生效')
+  assert.match(rule[0], /-webkit-box-orient:vertical/, 'line-clamp 需要 vertical box 才生效')
+  // 渲染侧确实用了这个类（不是只有 CSS 没有 DOM）
+  assert.ok(clientSource.includes("className: 'tb-needs-card-q'"), '卡片仍渲染 .tb-needs-card-q')
+})
+
 test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boardPath，且没有「派发给」选择器', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
   const BoardTab = harness.componentOf('sidebar.right.pane.tab')
@@ -3045,4 +3055,288 @@ test('BoardTab：同批上传单项失败（读取 / 上传）不丢已成功的
   assert.equal(nodesWithClass(tree, 'tb-attach-thumb').length, 1, 'the successful upload must survive the batch')
   assert.ok(noteTextarea(tree).props.value.includes('attachment://' + ATTACHMENT_ID), 'successful short ref must stay in the note')
   assert.ok(includesText(tree, '图片解析失败'), 'the concrete upload error is surfaced')
+})
+
+/* ══════════════════════════════════════════════════════════════
+ * 用例：待你处理（v0.2.2，§1.9）——顶部条 / 第五列 / 详情回答 / 角标
+ * ══════════════════════════════════════════════════════════════ */
+
+function needsTask(overrides = {}) {
+  return Object.assign(
+    {
+      id: 't-needs-1',
+      title: '需要你选方案',
+      status: 'todo',
+      cwd: WS_A,
+      needsUser: true,
+      question: '方案 A 还是方案 B？',
+      questionOptions: ['方案 A', '方案 B'],
+      askedAt: minutesAgo(20),
+      updatedAt: minutesAgo(20),
+    },
+    overrides,
+  )
+}
+
+/** 按端点分派的 RPC 桩：snapshot / session-info / answer-task 各管各的。 */
+function needsRpc(snapshot, answerResult, calls) {
+  return (channel, endpoint, payload) => {
+    calls.push({ endpoint, payload })
+    if (endpoint === 'session-info') {
+      return Promise.resolve({ ok: true, value: { sessionId: payload && payload.sessionId, cwd: WS_A } })
+    }
+    if (endpoint === 'answer-task') return Promise.resolve(answerResult)
+    return Promise.resolve({ ok: true, value: snapshot })
+  }
+}
+
+function answerTextarea(tree) {
+  return collect(tree).find((node) => node.type === 'textarea' && hasClass(node, 'tb-answer')) || null
+}
+
+function answerSubmitButton(tree) {
+  return buttons(tree).find((node) => textOf(node).trim() === '回复并继续') || null
+}
+
+async function openNeedsDetail(instance, tree) {
+  const item = nodesWithClass(tree, 'tb-needs-item')[0]
+  assert.ok(item, '待你处理条必须渲染可点条目')
+  item.props.onClick()
+  return instance.run()
+}
+
+test('待你处理：flagged 任务出现在顶部条与第五列，且不在普通列', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      needsTask(),
+      { id: 't-plain-1', title: '普通待开始', status: 'todo', cwd: WS_A, updatedAt: minutesAgo(5) },
+    ],
+  })
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const banner = nodesWithClass(tree, 'tb-needs')
+  assert.equal(banner.length, 1, '右栏顶部必须有「待你处理」条')
+  const bannerText = textOf(banner[0])
+  assert.ok(bannerText.includes('待你处理'), 'banner title')
+  assert.ok(bannerText.includes('需要你选方案'), 'banner lists the task title')
+  assert.ok(bannerText.includes('方案 A 还是方案 B？'), 'banner shows the question')
+  assert.equal(nodesWithClass(tree, 'tb-needs-item').length, 1)
+  assert.equal(cardTitleNode(tree, '需要你选方案'), null, 'flagged 任务不得出现在普通 lane 里')
+  assert.ok(cardTitleNode(tree, '普通待开始'), '普通任务照常渲染')
+
+  // 平台看板：第五列在最左（待开始之前），flagged 不重复进普通四列
+  const platform = createHarness({ snapshot })
+  const platformTree = (await renderComponent(platform.componentOf('main'), {})).tree
+  const board = nodesWithClass(platformTree, 'tb-board')[0]
+  assert.equal(board.props['data-needs'], 'true', '有 flagged 时看板切五列')
+  const cols = nodesWithClass(platformTree, 'tb-col')
+  assert.equal(cols[0].props['data-status'], 'needsUser', '第五列放在最左（待开始之前）')
+  const needsColText = textOf(cols[0])
+  assert.ok(needsColText.includes('待你处理'))
+  assert.ok(needsColText.includes('需要你选方案'))
+  assert.ok(needsColText.includes('方案 A 还是方案 B？'), '第五列卡片显示问题一行')
+  assert.ok(needsColText.includes('处理'), '第五列卡片带「处理」按钮')
+  const todoCol = cols.find((col) => col.props['data-status'] === 'todo')
+  assert.ok(!textOf(todoCol).includes('需要你选方案'), 'flagged 任务不得出现在普通四列')
+  assert.ok(textOf(todoCol).includes('普通待开始'))
+})
+
+test('待你处理：没有 flagged 任务时不渲染顶部条与第五列', async () => {
+  const snapshot = makeSnapshot()
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  assert.equal(nodesWithClass(tree, 'tb-needs').length, 0, '空列表时整块不渲染')
+
+  const platform = createHarness({ snapshot })
+  const platformTree = (await renderComponent(platform.componentOf('main'), {})).tree
+  const board = nodesWithClass(platformTree, 'tb-board')[0]
+  assert.equal(board.props['data-needs'], 'false')
+  const cols = nodesWithClass(platformTree, 'tb-col')
+  assert.equal(cols.length, 4, '没有 flagged 时仍是四列')
+  assert.equal(cols.filter((col) => col.props['data-status'] === 'needsUser').length, 0)
+})
+
+test('待你处理：点条目打开详情，选选项 + 回复并继续 调用 answer-task 并关闭浮层', async () => {
+  const snapshot = makeSnapshot({ tasks: [needsTask()] })
+  const calls = []
+  const answered = Object.assign({}, snapshot.tasks[0], { needsUser: false, question: '', questionOptions: [] })
+  const harness = createHarness({
+    snapshot,
+    rpc: needsRpc(snapshot, { ok: true, value: { task: answered, sessionId: 'session-lead' } }, calls),
+  })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  let next = await openNeedsDetail(instance, tree)
+  assert.ok(detailMask(next), '点条目必须打开详情浮层')
+  const needsBox = nodesWithClass(next, 'tb-detail-needs')[0]
+  assert.ok(needsBox, 'flagged 任务详情必须有「需要你处理」区')
+  assert.ok(textOf(needsBox).includes('需要你处理'))
+  assert.ok(textOf(needsBox).includes('方案 A 还是方案 B？'))
+
+  // 选项按钮把答案填进输入框（不直接提交）
+  const optionButton = buttons(needsBox).find((node) => textOf(node).trim() === '方案 B')
+  assert.ok(optionButton, 'questionOptions 必须渲染成可点按钮')
+  optionButton.props.onClick()
+  next = await instance.run()
+  let textarea = answerTextarea(next)
+  assert.ok(textarea, '回答输入框必须渲染')
+  assert.equal(textarea.props.value, '方案 B')
+
+  // 自由编辑同样生效
+  textarea.props.onChange({ target: { value: '方案 B（补充说明）' } })
+  next = await instance.run()
+  textarea = answerTextarea(next)
+  assert.equal(textarea.props.value, '方案 B（补充说明）')
+
+  const submit = answerSubmitButton(next)
+  assert.ok(submit, '回复并继续按钮必须渲染')
+  assert.equal(submit.props.disabled, false, '有草稿时可提交')
+  submit.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  next = await instance.run()
+
+  const answerCalls = calls.filter((call) => call.endpoint === 'answer-task')
+  assert.equal(answerCalls.length, 1)
+  // 注意：payload 是 vm 沙箱里的对象，deepEqual 会因跨 realm 原型不同而失败，逐字段断言。
+  assert.equal(answerCalls[0].payload.id, 't-needs-1')
+  assert.equal(answerCalls[0].payload.answer, '方案 B（补充说明）')
+  assert.equal(detailMask(next), null, '回答成功后关闭浮层')
+  assert.ok(includesText(next, '已回复，任务继续处理'))
+})
+
+test('待你处理：回答失败时保留浮层与输入并显示错误', async () => {
+  const snapshot = makeSnapshot({ tasks: [needsTask()] })
+  const calls = []
+  const harness = createHarness({
+    snapshot,
+    rpc: needsRpc(
+      snapshot,
+      { ok: false, error: { code: 'conflict', message: '找不到可以接收回复的会话：session-lead 不在线' } },
+      calls,
+    ),
+  })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  let next = await openNeedsDetail(instance, tree)
+  const textarea = answerTextarea(next)
+  textarea.props.onChange({ target: { value: '自定义回答' } })
+  next = await instance.run()
+
+  answerSubmitButton(next).props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  next = await instance.run()
+
+  assert.ok(detailMask(next), '失败时不得关闭浮层')
+  assert.equal(answerTextarea(next).props.value, '自定义回答', '失败时不丢用户输入')
+  const error = nodesWithClass(next, 'tb-needs-error')[0]
+  assert.ok(error, '失败时显示行内错误')
+  assert.ok(textOf(error).includes('回复发送失败'))
+  assert.ok(textOf(error).includes('找不到可以接收回复的会话'))
+  assert.equal(calls.filter((call) => call.endpoint === 'answer-task').length, 1)
+})
+
+test('待你处理：空回答禁用提交，超长回答内联报错且不发请求', async () => {
+  const snapshot = makeSnapshot({ tasks: [needsTask()] })
+  const calls = []
+  const harness = createHarness({
+    snapshot,
+    rpc: needsRpc(snapshot, { ok: true, value: { task: snapshot.tasks[0] } }, calls),
+  })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  let next = await openNeedsDetail(instance, tree)
+  assert.equal(answerSubmitButton(next).props.disabled, true, '空回答时按钮禁用')
+
+  answerTextarea(next).props.onChange({ target: { value: 'x'.repeat(1001) } })
+  next = await instance.run()
+  const submit = answerSubmitButton(next)
+  assert.equal(submit.props.disabled, false, '超长文本仍可点（点后给内联提示）')
+  submit.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  next = await instance.run()
+  assert.equal(calls.filter((call) => call.endpoint === 'answer-task').length, 0)
+  const error = nodesWithClass(next, 'tb-needs-error')[0]
+  assert.ok(error)
+  assert.ok(textOf(error).includes('回答不能超过 1000 字'))
+})
+
+test('待你处理：详情显示最近回答留档', async () => {
+  const snapshot = makeSnapshot({ tasks: [needsTask({ lastAnswer: '上次答的是方案 A' })] })
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  const next = await openNeedsDetail(instance, tree)
+  const box = detailBox(next)
+  assert.ok(textOf(box).includes('最近回答'))
+  assert.ok(textOf(box).includes('上次答的是方案 A'))
+})
+
+test('待你处理：header 按钮与左栏图标增加独立红色角标，todo/doing 角标不重复计数', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      needsTask(),
+      { id: 't-plain-1', title: '普通待开始', status: 'todo', cwd: WS_A, updatedAt: minutesAgo(5) },
+      { id: 't-doing-1', title: '普通进行中', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(6) },
+    ],
+  })
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const header = (
+    await renderComponent(harness.componentOf('conversation.session.header.actions'), { sessionId: SESSION_A })
+  ).tree
+  const needsBadge = nodesWithClass(header, 'tb-badge-needs')
+  assert.equal(needsBadge.length, 1, 'header 必须渲染独立的待你处理角标')
+  assert.equal(textOf(needsBadge[0]), '1')
+  const todoBadge = nodesWithClass(header, 'tb-badge').filter((node) => !hasClass(node, 'tb-badge-needs'))
+  assert.equal(todoBadge.length, 1)
+  assert.equal(textOf(todoBadge[0]), '1', 'todo 角标不含 flagged（只剩普通待开始）')
+  assert.ok(String(header.props.title).includes('1 条待你处理'))
+
+  const iconHarness = createHarness({ snapshot })
+  const icon = (await renderComponent(iconHarness.componentOf('sidebar.panellist'), { size: 18 })).tree
+  const iconNeeds = nodesWithClass(icon, 'tb-badge-needs')
+  assert.equal(iconNeeds.length, 1, '左栏图标必须渲染独立待你处理角标')
+  assert.equal(textOf(iconNeeds[0]), '1')
+  const iconOpen = nodesWithClass(icon, 'tb-badge').filter((node) => !hasClass(node, 'tb-badge-needs'))
+  assert.equal(textOf(iconOpen[0]), '2', 'todo+doing 角标不含 flagged')
+})
+
+test('待你处理：回答成功后（needsUser=false）详情仍显示最近回答', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      needsTask({
+        status: 'done',
+        needsUser: false,
+        question: '',
+        questionOptions: [],
+        lastAnswer: '上次答的是方案 A',
+        answeredAt: minutesAgo(1),
+      }),
+    ],
+  })
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  const next = await openDetailByTitle(instance, tree, '需要你选方案')
+  const box = detailBox(next)
+  assert.ok(box, '详情浮层必须打开')
+  assert.equal(nodesWithClass(box, 'tb-detail-needs').length, 0, '回答后不再显示回答区')
+  assert.ok(textOf(box).includes('最近回答'), '最近回答必须移到 flagged 分支外')
+  assert.ok(textOf(box).includes('上次答的是方案 A'))
+})
+
+test('待你处理：header 角标与右栏看板同一过滤（本会话创建的无 cwd 任务也计数）', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      needsTask({ id: 't-needs-nocwd', cwd: null, sessionId: SESSION_A }),
+      { id: 't-other-workspace', title: '别的工作区待办', status: 'todo', cwd: WS_B, sessionId: 'other-session' },
+    ],
+  })
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const header = (
+    await renderComponent(harness.componentOf('conversation.session.header.actions'), { sessionId: SESSION_A })
+  ).tree
+  const needsBadge = nodesWithClass(header, 'tb-badge-needs')
+  assert.equal(needsBadge.length, 1)
+  assert.equal(textOf(needsBadge[0]), '1', '无 cwd 但创建于本会话的 flagged 任务必须计数（与 banner 一致）')
+  const todoBadge = nodesWithClass(header, 'tb-badge').filter((node) => !hasClass(node, 'tb-badge-needs'))
+  assert.equal(todoBadge.length, 0, '别的工作区的 todo 不计入本会话 header 角标')
 })

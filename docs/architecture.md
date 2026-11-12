@@ -69,6 +69,10 @@ README.md               Lead：安装 / 使用 / 排障
 合法迁移：`todo→doing`、`doing→done|todo`（打回）、`done→archived|doing`（返工）、
 `archived→todo`（重新打开）。**轮询只扫 `todo`。**
 
+**`needsUser`（v0.2.2，不新增 status）**：任务上有一个「等待用户回复」标记 `needsUser`（§1.9）。
+它**不改变** `status`（仍为 `todo` / `doing`），但会让轮询跳过该任务，并在看板的「待你处理」区显示；
+用户回答后宿主把回答 followup 给组长会话并清掉标记，任务继续。
+
 **归档生命周期（30 分钟保留期）**：`archived` 任务在归档满 **30 分钟**后由宿主自动从看板删除
 （从 `board.json` 的 `tasks[]` 移除），用户不必手动点「删除」。判定是纯函数
 `pruneArchivedTasks(state, now, ARCHIVE_RETENTION_MS)`（`ARCHIVE_RETENTION_MS = 30 * 60 * 1000`，导出便于单测）：
@@ -117,6 +121,9 @@ v0.2.0 默认链路（`dispatchMode='workspace-lead'`）：
   workspace-lead 模式下目标 Agent = 该工作区的组长；旧模式 = §1.7 解析出的会话。
   **投递成功即自动把任务置为 `doing`**（写 `startedAt`、清 `lastError`）：看板立刻反映「已派发」，
   不再依赖组长 / 主 Agent 记得调 `taskboard_update`（再调一次 doing 也合法）。
+- **`needsUser` 任务不投递**（v0.2.2，§1.9）：`selectDispatchCandidates` / tick 过滤
+  `needsUser === true` 的任务——问题没回答前不重复派发、也不占用「每轮 1 条」的派发名额；
+  `dispatch-now` 显式指向这类任务直接 `conflict`。回答后标记清除，任务照常回到候选列表。
 - 每个任务同一时刻最多一条未失效通知：`notifiedAt` 之后 `min(2×intervalMs, 120s)` 内不重复投递；
   超过冷却且仍未变化则重投（`notificationCount++`），`notificationCount >= 5` 后停手：任务留在 `todo`、
   不再自动投递（卡片与详情浮层都没有「派发超时」标记，需人工处理）。
@@ -363,6 +370,58 @@ worker 的 stopReason 不会覆盖它；成功回写也**不清空**它（真实
 无变化）；`tools/result` 里**不是派发结果**的事件（别的工具、失败的 `subagent` 调用）在监听器入口
 就 return，不计数——这类事件量太大，计数没有意义。
 
+### 1.9 待你处理（`needsUser`，v0.2.2 补充）
+
+组长在派活 / 审核过程中遇到**必须由用户决策**的问题（选方案、确认范围、补凭据……）时，
+不应该把它塞进 `lastError`、也不应该只在聊天里问——聊天消息会被历史淹没，用户也看不到。
+改为在任务上打 `needsUser` 标记并写 `question`：看板把这条任务提升到「待你处理」区；
+用户回答后宿主把回答 followup 给组长会话，清掉标记，任务继续。**全程不新增 status。**
+
+**闭环**
+
+1. 组长 `taskboard_update {id, needsUser:true, question, questionOptions?, status?}`。
+   - `question` 必填（trim 后非空，≤500 字符），否则 `bad-request`；
+     `questionOptions` 可选，最多 4 个、每个 ≤80 字符，非法项被过滤。
+   - 宿主补 `askedAt`（已是 flagged 的重复更新保留最早的 `askedAt`，用它可以按「谁等得久」排序），
+     `askedBy` = 提问的会话：`taskboard_update` 工具取 `exec.agent.session.id`（拿不到为 `null`），
+     正常由工具自动填。`add-task` / `update-task` 也接受可选的 `askedBy`（本机 loopback RPC；工具
+     参数里没有这个字段，模型不能伪造别的会话），但**只在同一次调用里同时设置 `question` /
+     `needsUser:true` 时生效**；单独传 `askedBy` 会被忽略（没有新问题就没有「谁在问」，不该改写已有
+     `askedBy`）。
+   - **重设问题必须重传选项**：`question` 变了但没带 `questionOptions` → 清空旧选项，避免用户看到
+     与新闻题不对应的按钮；只想补/换选项而不改问题就只传 `questionOptions`。
+   - 任务 `status` 不变（`todo` / `doing` 都能 flag；`done` 后返工前也可以先问）。
+2. **轮询跳过**（§1.4）：`selectDispatchCandidates` / tick 过滤 `needsUser === true` 的任务；
+   `dispatch-now` 也拒绝（`conflict`）。问题没回答前不重复投递，也不占用每轮 1 条的派发名额。
+3. **看板派生「待你处理」**：右栏看板顶部固定条 + 平台看板最左第五列；这些任务**不重复**出现在
+   普通四列（§5.1.1 / §5.2）。排序按 `askedAt` 升序（最旧优先），缺 `askedAt` 的排最后。
+4. **用户回答** → RPC `answer-task {id, answer}`（§3.1）：
+   宿主按 `task.dispatchedSessionId` → `task.askedBy` → `task.sessionId` 依次找目标会话（去重、
+   跳过空值；已归档的候选跳过），复用 `agents.get` / `sessionController.resolveAgent`，
+   followup 一条「【任务看板 · 用户回复】…」；
+   `sessions.flush` **成功后才**清 `needsUser` / `question` / `questionOptions` / `askedAt` /
+   `askedBy`，写 `lastAnswer` / `answeredAt` / `updatedAt`（`sessions` 服务缺失时与派发路径一致：
+   只做 followup、不阻塞清标记）。
+   失败（候选会话都不可用 / 投递异常）**保留标记**、把原因写进任务 `lastError`，用户可以重试。
+5. 组长收到回复消息后继续原任务（任务仍在原状态）：能直接收尾的就 `taskboard_update status=done`，
+   还要干的继续派 worker；用户不需要重新加任务。
+
+**字段（§2）**：`needsUser` / `question` / `questionOptions` / `askedAt` / `askedBy` /
+`lastAnswer` / `answeredAt`。`lastAnswer` / `answeredAt` 是留档：回答成功后写入，之后再次 flag
+**不清空**（详情浮层能显示「最近回答」）；`needsUser:false` 只清问题相关的四个字段。
+任务进入 `archived`（`update-task {status:'archived'}` 或 `archive-done`）时**同样清问题四字段**、
+保留 `lastAnswer` / `answeredAt`——归档是终态，不该再留着「等待用户回答」的标记。
+**归档优先**：`update-task {status:'archived', needsUser:true}` 即使漏了 `question` 也照样归档
+（跳过 needsUser / question / options 校验，标记直接清空），不返回 `bad-request`；模型漏参数不该
+让任务卡住无法归档。已归档任务再调 `answer-task` 直接 `conflict`（「任务已归档，不能再回答」），
+不投递、不写 `lastAnswer`——正常路径走不到（归档已清标记），属纵深防御。
+`requeueTasksOfLead`（组长归档、任务退回 `todo`）也清问题四字段：任务改由新组长接单，
+旧的问题 / 提问者不再有效。
+
+**与 `lastError` 的分工**：`lastError` 是故障（派发失败 / 组长不可用 / worker 异常），
+`needsUser` 是待决策。组长 persona 要求决策类问题必须走 `needsUser`（§6），
+不要把问题塞进 `lastError`——`lastError` 只写「为什么没做成」。
+
 ---
 
 ## 2. 持久化
@@ -403,6 +462,13 @@ worker 的 stopReason 不会覆盖它；成功回写也**不清空**它（真实
       "dispatchedSessionTitle": "",
       "reportedAt": "…ISO…" | null,      // v0.2.0：完成回执推给主会话的时间；null = 未推送
       "autoDispatch": "lead-dispatch" | null, // v0.2.0：宿主挂钩自动建的任务标记（§1.8）；null = 普通任务
+      "needsUser": false,                // v0.2.2：等待用户回复（不新增 status，§1.9）
+      "question": "",                    // needsUser=true 时必填（≤500）
+      "questionOptions": [],             // 可选选项（≤4 个，每个 ≤80）
+      "askedAt": "…ISO…" | null,         // 提问时间（「待你处理」按它排序）
+      "askedBy": "…" | null,             // 提问的组长会话 id
+      "lastAnswer": "",                  // 用户最近一次回答（≤1000，留档）
+      "answeredAt": "…ISO…" | null,      // 最近一次回答时间
       "assignee": "…",           // 子 Agent 的 label / sessionId，组长填
       "result": "…",             // 审核结论 / 子 Agent 汇报摘要
       "createdAt": "…ISO…",
@@ -444,6 +510,28 @@ worker 的 stopReason 不会覆盖它；成功回写也**不清空**它（真实
 被轮询投递，归组长审核，不再是「宿主自动任务」。`done→doing`（组长打回返工）**保留**标记：返工后的
 结束仍按 §1.8 自动写回（组长每次 done 后都能看到结论并决定是否再打回）。只由宿主维护，不是
 `taskboard_update` / `update-task` 的可 patch 字段，也**不进 `taskBrief()`**（§4.4）。
+
+**任务字段 `needsUser` / `question` / `questionOptions` / `askedAt` / `askedBy` / `lastAnswer` / `answeredAt`（v0.2.2，§1.9）**：
+`needsUser` 只认 `true`（其它 → `false`）；`question` trim 截 500；`questionOptions` 过滤非字符串 /
+空串并逐个截 80，最多保留 4 个（去重）；`askedAt` / `answeredAt` / `askedBy` 非字符串 → `null`；
+`lastAnswer` trim 截 1000。**`needsUser=true` 但 `question` 为空**：写入端（`add-task` /
+`update-task` / `taskboard_update`）抛 `bad-request`（不写盘）；
+读盘端（`normalizeTask`）保守降级为 `needsUser=false` 并清空问题字段（不丢整条任务）。
+**`status='archived'` 的旧数据**在读盘时也降级为 `needsUser=false`（归档是终态，§1.9）。
+`needsUser:false` 清空 `question` / `questionOptions` / `askedAt` / `askedBy`，**保留**
+`lastAnswer` / `answeredAt`；`lastAnswer` / `answeredAt` 只由 `answer-task` 写。
+`askedAt` / `askedBy` 由宿主 / 工具设置：`taskboard_update` 工具固定取 `exec.agent.session.id`，
+`add-task` / `update-task` 也接受可选的 `askedBy`（本机 loopback RPC；UI 不传），但它**只在同一次
+调用里同时设置 `question` / `needsUser:true` 时生效**，单独传会被忽略（`applyTaskUpdate` 只在
+needsTouched 分支读它）；正常由 `taskboard_update` 工具自动填当前组长会话。
+`update-task` 在**未 flag** 的任务上单独传 `questionOptions`（既没有 `question` 也没有
+`needsUser:true`）→ `bad-request`，不静默丢选项（已 flagged 的任务只补选项是合法更新）；
+**重设 `question` 但没带 `questionOptions` → 清空旧选项**（旧按钮与新闻题无关）；显式传
+`questionOptions` 才更新/保留。任务进入 `archived` 时清问题四字段（保留 `lastAnswer` /
+`answeredAt`），且**归档优先**：`{status:'archived', needsUser:true}` 即使漏 `question` 也照样归档，
+跳过 needsUser / question / options 校验。
+`Snapshot.tasks` 与 `board.json` 都带这些字段；`taskBrief()` 只暴露 `needsUser` / `question` /
+`questionOptions`（§4.4），`askedBy` / `lastAnswer` / `answeredAt` 不进模型工具输出。
 
 **归档清理（30 分钟保留期，§1.2）**：`pruneArchivedTasks(state, now, ARCHIVE_RETENTION_MS)` 把归档满 30 分钟的
 任务从 `tasks[]` 里**物理删除**并 `commitBoard()`（`revision` +1、`updatedAt` 刷新）；没有过期任务时
@@ -513,8 +601,9 @@ Content-Type: application/json
 | endpoint | payload | value | 说明 |
 | --- | --- | --- | --- |
 | `snapshot` | `{}` | `Snapshot` | 全量看板 + 运行时状态，client 每 2s 轮一次 |
-| `add-task` | `{title, note?, sessionId?, cwd?}` | `{task}` | 新建到 `todo`，`source='user'`；右栏传 `sessionId`（宿主解析 cwd），平台看板传 `cwd`（用户选的工作区） |
-| `update-task` | `{id, status?, title?, note?, result?, assignee?, lastError?}` | `{task}` | 局部更新；非法状态迁移 → `conflict` |
+| `add-task` | `{title, note?, sessionId?, cwd?, needsUser?, question?, questionOptions?, askedBy?}` | `{task}` | 新建到 `todo`，`source='user'`；右栏传 `sessionId`（宿主解析 cwd），平台看板传 `cwd`（用户选的工作区）。v0.2.2 起也接受可选的 `needsUser` / `question` / `questionOptions`（宿主 / 测试建「待你处理」任务用；UI 新建行不传），`askedBy` 可显式指定提问会话（仅与 `needsUser:true` / `question` 同传时生效） |
+| `update-task` | `{id, status?, title?, note?, result?, assignee?, lastError?, needsUser?, question?, questionOptions?, askedBy?}` | `{task}` | 局部更新；非法状态迁移 → `conflict`；`needsUser:true` 缺 `question` → `bad-request`；只传 `questionOptions` 不带 `question` / `needsUser:true` → `bad-request`；重设 `question` 不带 `questionOptions` → 清空旧选项；`askedBy` 仅在同时设置 `question` / `needsUser:true` 时生效；校验全部在写字段之前完成（失败不留部分修改）；`status:'archived'` **优先**：跳过 needsUser / question / options 校验并清问题四字段（§1.9） |
+| `answer-task` | `{id, answer}` | `{task, sessionId}` | **v0.2.2**：回答 `needsUser` 问题（§1.9）。`answer` 非空 ≤1000；任务已归档 → `conflict`（「任务已归档，不能再回答」，不投递、不写回答）；目标会话按 `dispatchedSessionId` → `askedBy` → `sessionId` 依次尝试（跳过已归档 / 不在线的候选）；followup + `sessions.flush` 成功后清标记并写 `lastAnswer` / `answeredAt`；全部候选不可用 → `conflict`（错误信息列出尝试过的会话），失败**保留**标记与问题，任务 `lastError` 写原因 |
 | `delete-task` | `{id}` | `{deleted:true,id}` | 物理删除（仅限 UI 手动） |
 | `dispatch-now` | `{id}` | `{dispatched, sessionId, task}` | 立即投递一次（不等轮询、无视冷却）；路由按当前 `dispatchMode` |
 | `set-config` | `{pollEnabled?, pollIntervalMs?, dispatchMode?}` | `{config}` | 开关 / 间隔 / 派发去处（`workspace-lead` / `new` / `creator` / `auto`）；非法 `dispatchMode` 按 `normalizeConfig` 回落默认 `workspace-lead` |
@@ -681,6 +770,17 @@ v0.2.0 新增端点的错误分支：
 - `attachment`：`id` 缺失 / 非字符串 / 不是 UUID → `bad-request`；UUID 不在索引 / 文件缺失 → `not-found`；
   索引损坏 / 读取失败 → `internal`。
 - `add-task` / `update-task`：note 中不同 `attachment://<uuid>` 引用超过 8 个 → `bad-request`（§2.1）。
+- `add-task` / `update-task` / `taskboard_update` 的 `needsUser:true` 缺 `question`（或 `question`
+  非法 / 空串）→ `bad-request`，不写盘（§1.9 / §2）。`update-task` / `taskboard_update` 在**未 flag**
+  的任务上只给 `questionOptions`、既不 `flag` 也不带 `question` → `bad-request`（已 flagged 的任务
+  只补选项合法；不静默丢选项）；`update-task` 抛错前已完成全部校验，不会留下部分字段修改。
+- `answer-task`（v0.2.2，§1.9）：`answer` 缺失 / 非字符串 / trim 后为空 / 超过 1000 字符 →
+  `bad-request`；`id` 不存在 → `not-found`；任务没有 `needsUser` 标记 → `conflict`；
+  候选会话（`dispatchedSessionId` → `askedBy` → `sessionId`，去重）全部不可用
+  （都已归档 / `agents.get` 与 `sessionController.resolveAgent` 都拿不到 live Agent / 三个字段都为空）
+  → `conflict`，错误信息列出尝试过的会话；followup / `sessions.flush` 抛错 → `internal`。
+  **候选不可用与投递失败这两种情况都保留标记**、把原因写进任务 `lastError`（用户可以重试）。
+- `dispatch-now` 指向 `needsUser === true` 的任务 → `conflict`（等用户回答；回答后自动恢复派发）。
 - 工具 `taskboard_add` 的 `workspace` 解析失败是**工具调用错误**（不是 RPC 错误码），错误文本 `未知工作区：<入参>`。
 
 ---
@@ -727,9 +827,9 @@ ctx.effect(() => ctx.webServer.register({
 
 | 工具 | 参数 | 行为 |
 | --- | --- | --- |
-| `taskboard_list` | `{status?}` | 返回文本清单（id / 状态 / 标题 / 备注 / assignee / result）+ 结构化 `tasks[]`；v0.2.0 不变 |
+| `taskboard_list` | `{status?}` | 返回文本清单（id / 状态 / 标题 / 备注 / assignee / result / 待回答的问题）+ 结构化 `tasks[]`；v0.2.2 起 `tasks[]` 额外带 `needsUser` / `question` / `questionOptions` |
 | `taskboard_add` | `{title, note?, workspace?}` | 新建任务（`source='agent'`，`sessionId=exec.agent.session.id`）；`workspace` v0.2.0 新增，见下 |
-| `taskboard_update` | `{id, status?, result?, assignee?, note?}` | 更新任务；`status` 非法迁移返回错误文本 |
+| `taskboard_update` | `{id, status?, result?, assignee?, note?, needsUser?, question?, questionOptions?}` | 更新任务；`status` 非法迁移返回错误文本；v0.2.2 起 `needsUser:true` + `question` 用来「问用户」（§1.9），`needsUser:false` 取消提问，`askedBy` 取 `exec.agent.session.id`（工具不暴露该参数；RPC 层单独传 `askedBy` 也不生效，见 §2） |
 
 **`taskboard_add.workspace`（v0.2.0，可选）**：工作区 id / 名称 / 绝对路径，用于主会话往任意工作区派任务。
 
@@ -756,9 +856,12 @@ ctx.effect(() => ctx.webServer.register({
   `test/host.test.mjs` 的封闭性回归**（`TASK_LIST_OUTPUT_SCHEMA` / `TASK_ONE_OUTPUT_SCHEMA` /
   `taskBrief` 已 export 供单测）。v0.1.2 的 `dispatchedSessionId` 事故就是跳过了第一步。
 - v0.2.0 新增的任务字段 `reportedAt` 是 UI / 回执记账字段：出现在 `board.json`、`Snapshot.tasks`
-  与返回完整任务的 UI RPC 响应（`add-task` / `update-task` / `dispatch-now` 的 `value.task`），
-  **绝不进 `taskBrief` / 模型工具输出**；`taskBrief` 保持 7 个已声明键
-  （id / title / status / note / assignee / result / updatedAt）。
+  与返回完整任务的 UI RPC 响应（`add-task` / `update-task` / `dispatch-now` / `answer-task`
+  的 `value.task`），**绝不进 `taskBrief` / 模型工具输出**。
+- v0.2.2 起 `taskBrief` 有 **10 个已声明键**：id / title / status / note / assignee / result /
+  updatedAt + `needsUser` / `question` / `questionOptions`（flagged 任务必须在模型工具输出里可见，
+  组长才能确认自己在等什么；`askedBy` / `askedAt` / `lastAnswer` / `answeredAt` 仍只出现在
+  `board.json` 与 `Snapshot.tasks`，不进工具输出）。
 
 ### 4.5 模式状态（预设声明 + 读回）
 
@@ -846,10 +949,10 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 
 | 槽位 | 注册参数 | 内容 |
 | --- | --- | --- |
-| `conversation.session.header.actions` | `{ name, id:'taskboard', order:40, label: () => t('panel.label') }` | 会话 header 右侧的看板按钮（`.tb-headbtn`），带本工作区 `todo` 数量角标（`.tb-badge`，>99 显示 99+，6s 刷新）；看板已展开且是活动 tab 时**再点一次收起**（`sidebarRight.hide`） |
+| `conversation.session.header.actions` | `{ name, id:'taskboard', order:40, label: () => t('panel.label') }` | 会话 header 右侧的看板按钮（`.tb-headbtn`），带本工作区 `todo` 数量角标（`.tb-badge`，>99 显示 99+，6s 刷新）+ **待你处理数量角标**（`.tb-badge.tb-badge-needs`，红点样式的独立 badge，v0.2.2）。两个角标与右栏看板用**同一过滤**（`tasksForWorkspace`：cwd 属于本工作区，或任务创建于本对话），不会出现「banner 有、角标为 0」；看板已展开且是活动 tab 时**再点一次收起**（`sidebarRight.hide`） |
 | `sidebar.right.pane.tab` | `{ name, key:'dsh-taskboard' }` | 本工作区看板正文 `BoardTab` |
 | `sidebar.right.pane.tab.title` | `{ name, key:'dsh-taskboard' }` | chip：看板 glyph + 标题 |
-| `sidebar.panellist` | `{ name:'sidebar.panellist', id:'taskboard-platform', order:25, label: () => t('platform.label'), locale }` | 左侧栏「任务看板」图标（全部工作区），带 `todo+doing` 角标 |
+| `sidebar.panellist` | `{ name:'sidebar.panellist', id:'taskboard-platform', order:25, label: () => t('platform.label'), locale }` | 左侧栏「任务看板」图标（全部工作区），带 `todo+doing` 角标 + **待你处理角标**（`.tb-badge-needs`，v0.2.2） |
 | `main` | `{ name:'main', key:'taskboard-platform', locale }` | 平台任务看板整页 `PlatformBoard` |
 
 > `label` 必须是 thunk（`string | (() => string)`），语言切换后无需重注册。
@@ -872,7 +975,14 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 3. **工作区过滤**：`全部工作区`（默认）/ 单个工作区——只影响显示。
 4. **四列看板**：复用 `Col`（宽度足够时四列）；卡片只显示标题 + 操作按钮（t-33 起，
    工作区 / 备注 / 结论 / 时间 / 组长 / 执行者都在详情浮层）；`cwd=null` 的老任务也显示（详情里工作区为空）。
-5. **空态**：「没有任务。选个工作区加一条，主 Agent 会自动接手。」
+   **未归档的 `needsUser` 任务不在四列里重复显示**（见下一条）；已归档的 flagged 任务照常留在「已归档」列。
+5. **「待你处理」第五列（v0.2.2，§1.9）**：有 flagged 任务时在「待开始」**之前**插入第五列
+   `待你处理 N`（`.tb-board[data-needs="true"]` 五列网格，`.tb-col[data-status="needsUser"]`）；
+   没有 flagged 任务时**整列不渲染**（仍是四列）。列内卡片（`.tb-needs-card`）显示
+   标题 + 问题**最多两行**（`.tb-needs-card-q` 的 `-webkit-line-clamp:2`，截断）+「处理」按钮：
+   点标题或按钮都打开详情浮层的「需要你处理」区。
+   列头带问题数量角标；列里只放 flagged 任务，按 `askedAt` 最旧优先。
+6. **空态**：「没有任务。选个工作区加一条，主 Agent 会自动接手。」
 
 派发：`workspace-lead`（默认）下平台任务按 `cwd` 投给该工作区的常驻组长（§1.5）；旧模式下
 宿主优先找同工作区的空闲会话（`workspace-session`），找不到就等（`workspace-offline` / `workspace-busy`），
@@ -914,7 +1024,12 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
      （`uploading` 为计数，连续粘贴不会提前解除禁用）。提交前统计 note 里不同引用数 > 8 时给具体提示
      （与服务端同源，§2.1）。提交时只把含短引用的 note 交给 `add-task`，不传 base64。左侧栏平台看板
      用同一逻辑（§5.1.1 第 2 条）。
-3. **看板主体**（布局见上）：待开始（蓝）/ 进行中（黄）/ 已完成（绿）/ 已归档（灰）。
+3. **「待你处理」条（v0.2.2，§1.9）**：右栏看板顶部固定区（头部 / 新建行之后、看板主体之前），
+   **仅在 `needsUser` 任务非空时渲染**。标题「待你处理 N」+ 条目列表（`.tb-needs`）：每条显示
+   任务标题 + 问题（单行截断，`title` 属性兜全文），点条目打开该任务的详情浮层。
+   flagged 任务**不再出现在**下面四个 lane / 四列里（避免重复；已归档的 flagged 留在归档列，不进此条）；
+   空时整块不渲染。
+4. **看板主体**（布局见上）：待开始（蓝）/ 进行中（黄）/ 已完成（绿）/ 已归档（灰）。
    - 每块头部：列名 + 计数 + 快捷动作（待开始：`全部派发`；已完成：`全部归档`）。
    - 卡片（t-33 起）：**只有标题 + 操作按钮**。标题可点打开**任务详情浮层**，2 行截断、`title` 兜全文；
      备注（note）/ result / 工作区 / `#t-3` / 相对时间 / 组长 / 执行者 / `lastError` 全部收进详情浮层，
@@ -959,6 +1074,24 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
    - 空块显示空态文案（如「没有待开始的任务。加一条，工作区组长会自动派发。」）。
 4. **页脚**：宽栏显示数据文件路径 + 「看板数据存储在本机」 + 版本号；窄栏只显示版本号。
 
+**任务详情浮层里的「需要你处理」区（v0.2.2，§1.9）**：`task.needsUser === true` 时，详情浮层在
+「完成结论」之前插入一块回答区（`.tb-detail-needs`）：
+
+1. 问题正文（`task.question`，自动换行）；
+2. `questionOptions` 非空时先列选项按钮（点一下把该选项填入输入框，不直接提交）；
+3. 自由输入 `textarea`（`needsUser.answerPlaceholder`，≤1000 字符）+「回复并继续」按钮
+   （空回答禁用）；
+4. 点提交 → `answer-task {id, answer}`：成功后关闭浮层并刷新（任务从「待你处理」消失、回到原列）；
+   失败**不关闭、不丢输入**，浮层内显示错误（`bad-request` / `conflict` / `internal` 文案同源），
+   用户可以改答案重试。
+
+「最近回答」（`task.lastAnswer`，留档见 §1.9）**不在 flagged 分支里**：只要字段非空，
+详情浮层就显示一块「最近回答」（`.tb-detail-answer` / `.tb-detail-lastanswer`）——
+回答成功后 `needsUser` 已清，用户 / 组长回看任务时仍要能看到上次拍板的答案。
+
+草稿 / 错误 / 提交中状态放在看板组件里、经 `bind` 传给浮层（浮层本身不调 hooks），
+关闭浮层时清空草稿。
+
 ### 5.3 数据与交互
 
 - 挂载后立即 `snapshot`，之后每 **2000ms** 轮询一次；页面不可见（`document.visibilityState!=='visible'`）
@@ -971,6 +1104,12 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 - 所有写操作：乐观更新不做，等 RPC 返回后用返回值替换该任务（简单、无回滚逻辑）。
 - 键盘可达：按钮有 focus ring；新建输入 Enter 提交、Esc 清空；编辑表单 Enter 保存、Esc 取消。
 - i18n：`ctx.get('locale')` 注册 `taskboard` 命名空间，zh/en 两套；locale 不可用则内置中文。
+  v0.2.2 新增「待你处理」文案：`column.needsUser`（待你处理 / Needs you）、`needsUser.title` /
+  `needsUser.question` / `needsUser.answerPlaceholder` / `needsUser.submit` /
+  `needsUser.badge` / `needsUser.open` / `needsUser.lastAnswer` / `needsUser.answerOk` /
+  `needsUser.answerFailed` / `needsUser.answerEmpty` / `needsUser.answerTooLong` /
+  `needsUser.pickOption`，中英双份（没有空态文案键：条 / 列空时整块不渲染）；CSS 适配窄栏
+  （「待你处理」条在窄栏也固定显示在 lane 之前）。
 
 ### 5.4 样式
 
@@ -1038,6 +1177,12 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
      **不要**为了记录再手动 `taskboard_add` 一条（会与自动任务重复）。只有真正需要另立任务（别的后续安排、
      跨工作区拆分记账）才用 `taskboard_add`。注意自动收尾**只对宿主自动建的任务生效**：轮询投递来的任务
      （`autoDispatch` 为 `null`）始终由组长 `taskboard_update` 写回 `done` / 打回 `doing`。
+  7. v0.2.2 补充（需要用户决策时）：**不要**把问题写进 `lastError`、也不要只在聊天里问。改用
+     `taskboard_update {id, needsUser:true, question:"…", questionOptions?:["A","B"]}` 在任务上提一个
+     具体问题（`question` ≤500 字、选项 ≤4 个 / 每个 ≤80 字），任务 `status` 保持原样；
+     看板会把这条任务提到「待你处理」（§1.9），用户回答后宿主把回答 followup 给你，你继续原任务。
+     任务已 `done` 又被用户打回、或发现验收标准需要用户确认时同样适用。`lastError` 只写故障原因
+     （派发失败 / 组长不可用 / worker 异常），**不写提问**。
 - 不在预设里写死 `agentOptions.provider/model`（可移植性）：子 Agent 继承主 Agent 路由。
 - 已知坑（都已在 patch 里修掉，改预设时别踩）：`dsh-plan-mode` 的 `section` 必填；
   `dsh-tool-todo` 的 `allowParallelInProgress` 必填；`tool-subagent` 的 `persona/toolFilter/backgroundMode`
@@ -1087,6 +1232,16 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 11. 粘贴图片（v0.2.0）：两个看板的新建备注 textarea 粘贴 PNG → 出现缩略图 → 提交 → 详情浮层渲染
     `<img>`；删除待提交图片后引用消失；普通文本粘贴不受影响。Host 单测覆盖上传成功 / 非法 MIME /
     超 5 MB / 路径穿越 / 未知 id / 非 loopback 与错误码；真实设备验证需要宿主重启加载新 RPC 后进行。
+12. 待你处理（v0.2.2，§1.9）：`taskboard_update {id, needsUser:true, question:"…"}` → 任务字段落盘
+    （`askedAt` / `askedBy` 由宿主补）、`taskboard_list` 能看到 `needsUser` / `question`、轮询
+    **不再派发**这条任务（`tick` 候选为空、`dispatch-now` 返回 `conflict`）→ 看板右栏出现
+    「待你处理」条、平台看板出现第五列，且普通四列里**没有**它 → 详情浮层选选项 / 输入答案 →
+    点「回复并继续」→ `answer-task` 成功：标记清空、`lastAnswer` / `answeredAt` 写入、组长会话收到
+    「【任务看板 · 用户回复】」followup → 任务回到候选列表并被正常派发。
+    失败分支：把目标会话关掉（无 live Agent）时回答 → `conflict`、标记**保留**、`lastError` 有原因，
+    重试可成功。Host 单测覆盖字段规范化 / 缺 question 拒绝 / tick 跳过 / 清 flag 后可派发 /
+    answer-task 成功与两类失败 / answer 空与超长；Client 单测覆盖「待你处理」条与第五列的渲染、
+    不在普通列、回答调用与成功清空、错误提示、两处角标。
 
 ---
 
@@ -1299,3 +1454,58 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   - t-34 文档 / 附件边界收尾：§5.1 / §5.1.1 的卡片字段与实现对齐；删除无引用 locale 键与
     卡片相对时间的死定时器；补齐 5 MB 预检、8 引用上限、单批 4 张、上传计数、部分失败保留，
     以及 `truncateNote()` 不切断 `attachment://` 引用的文档与回归测试。
+- v0.2.2 新增（t-51：看板「待你处理」闭环，组长提问 + 用户回复继续）：组长在需要用户决策时用
+  任务上的 `needsUser` 标记 + `question` / `questionOptions` 提问，看板派生「待你处理」区
+  （右栏顶部条 + 平台看板最左第五列，不重复出现在普通四列），用户回答后宿主 followup 给组长会话、
+  清标记、任务继续；**不新增 status**，`todo` / `doing` 保持原样。
+  - 任务字段（§2）：`needsUser` / `question`（≤500）/ `questionOptions`（≤4 个、每个 ≤80）/
+    `askedAt` / `askedBy` / `lastAnswer`（≤1000）/ `answeredAt`。`needsUser:true` 缺 `question`
+    写入端 `bad-request`、读盘端降级为未 flag；`needsUser:false` 清问题四字段、保留回答留档。
+  - Host：`selectDispatchCandidates` / tick 过滤 flagged 任务（`dispatch-now` 返回 `conflict`）；
+    新 RPC `answer-task {id, answer}`（目标会话 `dispatchedSessionId` → `askedBy` → `sessionId`
+    逐个尝试、跳过归档候选，复用 `agents.get` / `sessionController.resolveAgent`，followup +
+    `sessions.flush` 成功后才清标记，全部不可用 / 投递失败保留标记并把原因写进 `lastError`）；
+    `taskboard_update` 支持 `needsUser` / `question` / `questionOptions` 并补 `askedBy`；
+    `applyTaskUpdate` 先做完全部校验再写字段（失败不留部分修改），只传 `questionOptions` 不 flag →
+    `bad-request`；任务进入 archived / `archiveDoneTasks` / `requeueTasksOfLead` 都清问题四字段；
+    **归档优先**：`{status:'archived', needsUser:true}` 漏 `question` 也照样归档（跳过 needsUser /
+    question / options 校验，标记清空）；**重设 `question` 不带 `questionOptions` 清空旧选项**；
+    `askedBy` 只在同一次调用里同时设置 `question` / `needsUser:true` 时生效，单独传被忽略；
+    `answer-task` 对已归档任务直接 `conflict`「任务已归档，不能再回答」（不投递、不写 `lastAnswer`）；
+    `buildDispatchText` 带 `用户最近回答：…`；`taskboard_list` / `taskBrief` 暴露
+    `needsUser` / `question` / `questionOptions`（`taskBrief` 从 7 个键扩到 10 个已声明键，
+    `TASK_LIST_OUTPUT_SCHEMA` / `TASK_ONE_OUTPUT_SCHEMA` 同步）；`add-task` / `update-task`
+    接受同名可选字段（含 `askedBy`）。
+  - Client：`needsUserTasks()` 派生列表（排除 archived、`askedAt` 最旧优先）不再进普通列；
+    右栏顶部「待你处理 N」条、平台看板第五列「待你处理」（问题最多两行）、详情浮层「需要你处理」区
+    （选项按钮 + 自由输入 + 「回复并继续」+ 错误提示不丢输入；「最近回答」在 flagged 分支外，
+    `lastAnswer` 非空即显示）；header `.tb-headbtn` 与左侧栏图标增加独立 needsUser 红点角标
+    （与右栏看板同一 `tasksForWorkspace` 过滤）；i18n zh/en 新增 `column.needsUser`
+    与 `needsUser.*`（无 `needsUser.empty` 死键）；CSS 适配窄栏。
+  - 文档：§1.2 / §1.4 / 新增 §1.9 / §2 / §3.1 / §3.3 / §4.4 / §5.1 / §5.1.1 / §5.2 / §5.3 /
+    §6 / §7 第 12 项同步；`presets/taskboard.patch.yml` 组长 persona 增加第 7 条
+    「需要用户决策时用 needsUser + question/options，不要只写 lastError 或聊天」。
+    `package.json` 版本号不在本任务里 bump（发布流程统一处理）。
+- v0.2.2（发布汇总）：发布「待你处理（needsUser）」闭环——组长需要用户决策时不再只能写 `lastError`
+  或停在对话里，而是把问题挂到任务上、由看板收集回答、宿主 followup 回组长会话继续干活。
+  `node --test` **218 pass / 0 fail**（v0.2.1 基线 189，+29）；真机链路已验证（t-51：组长设置
+  needsUser → 看板「待你处理」→ 用户回答「发」→ 组长收到「【任务看板 · 用户回复】」继续）。
+  主要内容：
+  - 新增字段：`needsUser` / `question`（≤500）/ `questionOptions`（≤4 个、每个 ≤80）/ `askedAt` /
+    `askedBy` / `lastAnswer`（≤1000）/ `answeredAt`；**不新增 status**，flagged 任务仍是 `todo` /
+    `doing`，只是带标记（§2 / §1.9）。
+  - 提问与回答：`taskboard_update` 支持 `needsUser` / `question` / `questionOptions`（同时补
+    `askedBy`）；宿主新增 RPC `answer-task {id, answer}`，把回答 followup 给组长会话、投递成功后才清标记。
+  - 轮询跳过：`selectDispatchCandidates` / tick 过滤 flagged 任务，`dispatch-now` 返回 `conflict`，
+    用户没回答前不会把问题任务当普通 todo 重新派发（§3.1 / §3.3）。
+  - 看板：右栏顶部「待你处理 N」条 + 平台看板最左第五列「待你处理」+ 详情浮层回答区（选项 / 自由输入 /
+    「回复并继续」）+ header 与侧栏图标的红点角标；flagged 任务不进普通四列（§5.1 / §5.1.1 / §5.2 / §5.3）。
+  - 边界：写入端先校验后落字段——`needsUser:true` 缺 `question` → `bad-request` 且**零修改**、不留
+    部分字段；`answer-task` 目标会话按 `dispatchedSessionId` → `askedBy` → `sessionId` **回退**、
+    跳过归档候选；归档（`archiveDoneTasks`）与组长重排（`requeueTasksOfLead`）都清问题四字段，且
+    **归档优先**——`{status:'archived', needsUser:true}` 漏 `question` 也照样归档；**重设 `question` 不带
+    `questionOptions` 时清空旧选项**；`lastAnswer` **随派发文本**（`buildDispatchText` 带
+    「用户最近回答：…」）交给下一个执行者。
+  - 测试与文档：`node --test` 218/0（+29 条 host / client / render 回归）；§1.2 / §1.4 / §1.9 / §2 /
+    §3.1 / §3.3 / §4.4 / §5.1 / §5.1.1 / §5.2 / §5.3 / §6 / §7 与 `presets/taskboard.patch.yml`
+    组长 persona 同步。

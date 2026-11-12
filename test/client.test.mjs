@@ -463,3 +463,68 @@ test('工作区路径纯函数：归一化 / 同路径比较 / 展示名 / 过�
   assert.deepEqual(helpers.tasksForFilter(tasks, 'C:\\work\\b').map((task) => task.id), ['t-3'])
   assert.equal(helpers.tasksForFilter(tasks, '').length, 4)
 })
+
+test('v0.2.2 待你处理：needsUserTasks 排除归档、askedAt 最旧优先，withoutNeedsUser 去掉 flagged', () => {
+  const { exported } = loadClient()
+  const helpers = exported.__test
+  const tasks = [
+    { id: 't-1', status: 'todo', needsUser: true, askedAt: '2026-11-12T01:00:00.000Z' },
+    { id: 't-2', status: 'doing', needsUser: true, askedAt: '2026-11-12T00:00:00.000Z' },
+    { id: 't-3', status: 'archived', needsUser: true, askedAt: '2026-11-11T00:00:00.000Z' },
+    { id: 't-4', status: 'todo', needsUser: false },
+    { id: 't-5', status: 'done', needsUser: true },
+    { id: 't-6', status: 'todo' },
+  ]
+  // 归档的 flagged 任务不出现在「待你处理」；缺 askedAt 的排最后
+  assert.equal(helpers.needsUserTasks(tasks).map((task) => task.id).join(','), 't-2,t-1,t-5')
+  // 普通四列 / lane 用：未归档的 flagged 去掉；已归档的 flagged 不在「待你处理」里，留归档列
+  assert.equal(helpers.withoutNeedsUser(tasks).map((task) => task.id).join(','), 't-3,t-4,t-6')
+  assert.deepEqual(Array.from(helpers.needsUserTasks(null)), [])
+  assert.deepEqual(Array.from(helpers.needsUserTasks([])), [])
+  assert.deepEqual(Array.from(helpers.withoutNeedsUser(null)), [])
+})
+
+test('v0.2.2 待你处理：i18n 文案中英齐全', () => {
+  const { exported } = loadClient()
+  const zh = exported.__test.DICT_ZH
+  const en = exported.__test.DICT_EN
+
+  assert.equal(zh['column.needsUser'], '待你处理')
+  assert.equal(en['column.needsUser'], 'Needs you')
+  const keys = [
+    'column.needsUser',
+    'needsUser.title',
+    'needsUser.question',
+    'needsUser.answerPlaceholder',
+    'needsUser.submit',
+    'needsUser.badge',
+    'needsUser.open',
+    'needsUser.lastAnswer',
+    'needsUser.answerOk',
+    'needsUser.answerFailed',
+    'needsUser.answerEmpty',
+    'needsUser.answerTooLong',
+    'needsUser.pickOption',
+  ]
+  for (const key of keys) {
+    assert.equal(typeof zh[key], 'string', 'missing zh key: ' + key)
+    assert.equal(typeof en[key], 'string', 'missing en key: ' + key)
+    assert.notEqual(zh[key], '', 'empty zh value: ' + key)
+    assert.notEqual(en[key], '', 'empty en value: ' + key)
+  }
+})
+
+test('v0.2.2 待你处理：i18n 保持无 needsUser.empty 死键', () => {
+  const { exported } = loadClient()
+  for (const [lang, dict] of [
+    ['zh', exported.__test.DICT_ZH],
+    ['en', exported.__test.DICT_EN],
+  ]) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(dict, 'needsUser.empty'),
+      false,
+      lang + ' 不应再有 needsUser.empty 死键',
+    )
+  }
+  assert.equal(clientSource.includes('needsUser.empty'), false, '源码不得引用 needsUser.empty')
+})

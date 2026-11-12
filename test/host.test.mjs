@@ -13,14 +13,18 @@ import {
   DISPATCH_MODES,
   LEAD_AUTO_MARK,
   LEAD_IN_FLIGHT_TTL_MS,
+  MAX_ANSWER_CHARS,
   MAX_ATTACHMENT_BYTES,
   MAX_BODY_BYTES,
+  MAX_QUESTION_CHARS,
+  MAX_QUESTION_OPTIONS,
   MAX_TASK_ATTACHMENTS,
   MAX_UPLOAD_BODY_BYTES,
   STATUSES,
   TASK_LIST_OUTPUT_SCHEMA,
   TASK_ONE_OUTPUT_SCHEMA,
   addTask,
+  answerTask,
   applyTaskUpdate,
   archivedSessionIdSet,
   archiveDoneTasks,
@@ -30,6 +34,7 @@ import {
   bindMainSession,
   boardPath,
   bodyLimitFor,
+  buildAnswerText,
   buildDispatchText,
   buildMainSessionRef,
   buildReceiptText,
@@ -62,11 +67,13 @@ import {
   isLoopbackRequest,
   leadTaskTitle,
   loadAttachmentIndex,
+  loadBoardFromDisk,
   normalizeBoard,
   normalizeConfig,
   normalizeConfig as normalizeConfigAlias,
   normalizeLeadAuto,
   normalizePathForCompare,
+  normalizeQuestionOptions,
   normalizeWorkspaceLeads,
   notifyCooldownMs,
   listWorkspaces,
@@ -84,6 +91,7 @@ import {
   resolveWorkspaceTarget,
   saveAttachment,
   selectDispatchCandidate,
+  selectDispatchCandidates,
   selectReceiptTasks,
   selectWorkspaceLead,
   sniffImageMime,
@@ -976,18 +984,44 @@ test('taskBrief output stays inside the closed tool output schemas', () => {
     notificationCount: 2,
     reportedAt: new Date(NOW).toISOString(),
     lastError: 'keep me',
+    // v0.2.2：needsUser / question / questionOptions 进工具输出（组长要能看到自己在等什么），
+    // askedAt / askedBy / lastAnswer / answeredAt 只属于 board.json / snapshot。
+    needsUser: true,
+    question: '选哪个方案？',
+    questionOptions: ['方案 A', '方案 B'],
+    askedAt: new Date(NOW).toISOString(),
+    askedBy: 'session-lead',
+    lastAnswer: '方案 A',
+    answeredAt: new Date(NOW).toISOString(),
   }
 
   const brief = taskBrief(fullTask)
   const declared = TASK_ONE_OUTPUT_SCHEMA.properties.task.properties
 
   // 键集合 ⊆ schema 声明的 properties；旧代码会在这里挂（dispatchedSessionId 未声明）
-  assert.deepEqual(Object.keys(brief).sort(), ['assignee', 'id', 'note', 'result', 'status', 'title', 'updatedAt'])
+  assert.deepEqual(Object.keys(brief).sort(), [
+    'assignee',
+    'id',
+    'needsUser',
+    'note',
+    'question',
+    'questionOptions',
+    'result',
+    'status',
+    'title',
+    'updatedAt',
+  ])
   for (const key of Object.keys(brief)) {
     assert.ok(Object.prototype.hasOwnProperty.call(declared, key), 'taskBrief 返回了 schema 未声明的字段：' + key)
   }
   assert.equal('dispatchedSessionId' in brief, false, 'taskBrief 不得返回 UI 专用的 dispatchedSessionId')
   assert.equal('reportedAt' in brief, false, 'taskBrief 不得返回完成回执记账字段 reportedAt')
+  assert.equal('askedBy' in brief, false, 'taskBrief 不得返回提问会话 askedBy')
+  assert.equal('lastAnswer' in brief, false, 'taskBrief 不得返回回答留档 lastAnswer')
+  assert.equal('answeredAt' in brief, false, 'taskBrief 不得返回回答时间 answeredAt')
+  assert.equal(brief.needsUser, true)
+  assert.equal(brief.question, '选哪个方案？')
+  assert.deepEqual(brief.questionOptions, ['方案 A', '方案 B'])
 
   // 单任务输出（taskboard_add / taskboard_update）与列表输出（taskboard_list，含 items）
   assert.deepEqual(schemaProblems({ task: brief }, TASK_ONE_OUTPUT_SCHEMA), [])
@@ -3508,4 +3542,854 @@ test('handleHttp：512 KB 上限对普通端点生效，upload-attachment 允许
   assert.equal(uploadBody.result.ok, false)
   assert.equal(uploadBody.result.error.code, 'bad-request')
   assert.doesNotMatch(uploadBody.result.error.message, /请求体超过/)
+})
+/* ------------------------------------------------------------------ *
+ * v0.2.2：待你处理（needsUser）—— 字段 / 轮询跳过 / answer-task（§1.9）
+ * ------------------------------------------------------------------ */
+
+test('needsUser：addTask 校验问题与规范化选项', () => {
+  const state = createEmptyBoard()
+  const task = addTask(
+    state,
+    {
+      title: '需要选型',
+      needsUser: true,
+      question: '  用哪个方案？  ',
+      questionOptions: ['A', '', 42, 'B', 'A', 'C', 'D', 'E', 'F'.repeat(120)],
+      askedBy: 'session-lead',
+    },
+    NOW,
+  )
+  assert.equal(task.needsUser, true)
+  assert.equal(task.question, '用哪个方案？')
+  assert.equal(task.questionOptions.length, MAX_QUESTION_OPTIONS, '选项最多保留 4 个')
+  assert.deepEqual(task.questionOptions.slice(0, 2), ['A', 'B'], '空串 / 非字符串 / 重复项被过滤')
+  assert.equal(task.askedAt, new Date(NOW).toISOString())
+  assert.equal(task.askedBy, 'session-lead')
+  assert.equal(task.lastAnswer, '')
+  assert.equal(task.answeredAt, null)
+
+  // 选项逐个截 80 字符
+  assert.equal(normalizeQuestionOptions(['x'.repeat(200)])[0].length, 80)
+  assert.equal(normalizeQuestionOptions(['x'.repeat(200)])[0], 'x'.repeat(80))
+
+  // needsUser=true 但 question 为空 → bad-request（不建任务）
+  const before = state.tasks.length
+  assert.throws(
+    () => addTask(state, { title: '没写问题', needsUser: true, question: '   ' }, NOW),
+    (error) => error.code === 'bad-request',
+  )
+  assert.equal(state.tasks.length, before, '校验失败不得建任务')
+
+  // 未 flag 时不写入问题字段
+  const plain = addTask(state, { title: '普通任务', question: 'ignored' }, NOW)
+  assert.equal(plain.needsUser, false)
+  assert.equal(plain.question, '')
+  assert.deepEqual(plain.questionOptions, [])
+  assert.equal(plain.askedAt, null)
+})
+
+test('needsUser：applyTaskUpdate 提问 / 改问题保留 askedAt / 取消提问保留回答留档', () => {
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '要不要上线' }, NOW)
+  assert.equal(task.needsUser, false)
+
+  applyTaskUpdate(state, task.id, { needsUser: true, question: '确认上线时间？', questionOptions: ['今天', '明天'] }, NOW + 1000)
+  assert.equal(task.needsUser, true)
+  assert.equal(task.question, '确认上线时间？')
+  assert.deepEqual(task.questionOptions, ['今天', '明天'])
+  assert.equal(task.askedAt, new Date(NOW + 1000).toISOString())
+  assert.equal(task.askedBy, null)
+  assert.equal(task.status, 'todo', '提问不改变 status')
+
+  // 只改问题（不再传 needsUser）：仍在 flagged 状态，askedAt 保留最早时间
+  applyTaskUpdate(state, task.id, { question: '改成：上线时间？' }, NOW + 2000)
+  assert.equal(task.needsUser, true)
+  assert.equal(task.question, '改成：上线时间？')
+  assert.equal(task.askedAt, new Date(NOW + 1000).toISOString(), '重复更新保留最早提问时间（最旧优先排序）')
+  assert.deepEqual(task.questionOptions, [], '重设问题不带 options 时清空旧选项（旧按钮已与新闻题无关）')
+
+  // 宿主补的 askedBy（taskboard_update 工具用）
+  applyTaskUpdate(state, task.id, { question: '再问一次', askedBy: 'session-lead' }, NOW + 3000)
+  assert.equal(task.askedBy, 'session-lead')
+
+  // flagged 但问题为空 → bad-request，且不破坏已有问题
+  assert.throws(
+    () => applyTaskUpdate(state, task.id, { needsUser: true, question: '   ' }, NOW + 4000),
+    (error) => error.code === 'bad-request',
+  )
+  assert.equal(task.question, '再问一次')
+
+  // 回答留档先放进去，再取消提问：问题四字段清空，回答留档保留
+  task.lastAnswer = '明天'
+  task.answeredAt = new Date(NOW + 5000).toISOString()
+  applyTaskUpdate(state, task.id, { needsUser: false }, NOW + 6000)
+  assert.equal(task.needsUser, false)
+  assert.equal(task.question, '')
+  assert.deepEqual(task.questionOptions, [])
+  assert.equal(task.askedAt, null)
+  assert.equal(task.askedBy, null)
+  assert.equal(task.lastAnswer, '明天', '取消提问不清回答留档')
+  assert.equal(task.answeredAt, new Date(NOW + 5000).toISOString())
+})
+
+test('needsUser：normalizeBoard 坏数据降级为未 flag，字段按上限截断', () => {
+  const { state } = normalizeBoard({
+    tasks: [
+      {
+        id: 't-1',
+        title: 'flagged',
+        status: 'todo',
+        needsUser: true,
+        question: '  问  ',
+        questionOptions: [' 选A ', '选A', '', 'B'.repeat(200)],
+        askedAt: '2026-11-11T02:00:00.000Z',
+        askedBy: 'session-lead',
+      },
+      // flagged 但问题为空：保守降级为未 flag，任务本身保留
+      { id: 't-2', title: 'broken flag', status: 'doing', needsUser: true, question: '   ' },
+      {
+        id: 't-3',
+        title: 'answer archive',
+        status: 'todo',
+        needsUser: true,
+        question: 'q'.repeat(600),
+        lastAnswer: 'y'.repeat(MAX_ANSWER_CHARS + 100),
+        answeredAt: '2026-11-11T02:00:00.000Z',
+      },
+    ],
+  })
+  assert.equal(state.tasks.length, 3)
+  assert.equal(state.tasks[0].needsUser, true)
+  assert.equal(state.tasks[0].question, '问')
+  assert.deepEqual(state.tasks[0].questionOptions, ['选A', 'B'.repeat(80)])
+  assert.equal(state.tasks[0].askedBy, 'session-lead')
+  assert.equal(state.tasks[1].needsUser, false)
+  assert.equal(state.tasks[1].question, '')
+  assert.deepEqual(state.tasks[1].questionOptions, [])
+  assert.equal(state.tasks[2].question.length, MAX_QUESTION_CHARS)
+  assert.equal(state.tasks[2].lastAnswer.length, MAX_ANSWER_CHARS)
+  assert.equal(state.tasks[2].answeredAt, '2026-11-11T02:00:00.000Z')
+  // 工具输出能看到 flagged 状态（组长据此确认在等什么）
+  assert.equal(taskBrief(state.tasks[0]).needsUser, true)
+  assert.equal(taskBrief(state.tasks[0]).question, '问')
+  // Snapshot.tasks 带全部新字段（UI 的「待你处理」条 / 详情回答区读它）
+  const snapshot = buildSnapshot(fakeRuntime(state, { get: () => undefined }, join(tmpdir(), 'dsh-taskboard-snap.json')), NOW)
+  const snapTask = snapshot.tasks.find((task) => task.id === 't-1')
+  assert.equal(snapTask.needsUser, true)
+  assert.equal(snapTask.question, '问')
+  assert.equal(snapTask.askedAt, '2026-11-11T02:00:00.000Z')
+  assert.equal(snapTask.askedBy, 'session-lead')
+  assert.equal(snapTask.questionOptions.length, 2)
+})
+
+test('needsUser：selectDispatchCandidates / tick 跳过 flagged，清 flag 后回到候选', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-needs-'))
+  try {
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({ pollEnabled: true, dispatchMode: 'creator' })
+    const flagged = addTask(
+      state,
+      { title: 'needs answer', sessionId: 'creator-1', needsUser: true, question: '确认吗？' },
+      NOW,
+    )
+    assert.deepEqual(selectDispatchCandidates(state, NOW), [], 'flagged 不在派发候选里')
+
+    const delivered = []
+    const creator = {
+      id: 'creator-1',
+      status: 'idle',
+      session: { id: 'creator-1', header: { cwd: 'C:\\work' } },
+      followup: (message) => delivered.push(message),
+    }
+    const agents = { get: (id) => (id === 'creator-1' ? creator : undefined), roots: () => [creator] }
+    const rt = fakeRuntime(state, { get: (name) => (name === 'agents' ? agents : undefined) }, join(dir, 'board.json'))
+
+    const first = await tick(rt, {})
+    assert.equal(first.dispatched, false)
+    assert.equal(first.reason, 'no-candidate')
+    assert.equal(flagged.status, 'todo')
+    assert.equal(delivered.length, 0)
+
+    // 「立即派发」也不能越过 flagged（等用户回答后再派）
+    await assert.rejects(
+      () => tick(rt, { taskId: flagged.id, force: true }),
+      (error) => error.code === 'conflict',
+    )
+    assert.equal(delivered.length, 0)
+
+    // 清掉标记 → 下一轮正常派发
+    applyTaskUpdate(state, flagged.id, { needsUser: false }, NOW + 1000)
+    assert.equal(selectDispatchCandidates(state, NOW + 1000).length, 1)
+    const second = await tick(rt, {})
+    assert.equal(second.dispatched, true)
+    assert.equal(second.task.id, flagged.id)
+    assert.equal(delivered.length, 1)
+    assert.equal(flagged.status, 'doing')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('answer-task 成功：followup 组长会话 + flush 后清标记并写回答留档', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-answer-'))
+  try {
+    const state = createEmptyBoard()
+    const task = addTask(
+      state,
+      { title: '选型', sessionId: 'creator-1', needsUser: true, question: '选哪个？', questionOptions: ['A', 'B'] },
+      NOW,
+    )
+    applyTaskUpdate(state, task.id, { status: 'doing' }, NOW)
+    task.dispatchedSessionId = 'session-lead'
+    task.dispatchedSessionTitle = '组长'
+    applyTaskUpdate(state, task.id, { assignee: 'worker-1' }, NOW)
+    assert.equal(task.status, 'doing')
+
+    const delivered = []
+    const lead = {
+      id: 'session-lead',
+      status: 'running',
+      session: { id: 'session-lead', header: { title: '组长' } },
+      followup: (message) => delivered.push(message),
+    }
+    let flushes = 0
+    const sessions = {
+      flush: async () => {
+        flushes += 1
+      },
+    }
+    const filePath = join(dir, 'board.json')
+    commitBoard(state, filePath)
+    const rt = fakeRuntime(
+      state,
+      { get: (name) => (name === 'agents' ? { get: (id) => (id === 'session-lead' ? lead : undefined) } : name === 'sessions' ? sessions : undefined) },
+      filePath,
+    )
+
+    const result = await answerTask(rt, task.id, '  选 A  ', NOW + 1000)
+    assert.equal(result.sessionId, 'session-lead')
+    assert.equal(result.task.id, task.id)
+    assert.equal(flushes, 1, 'sessions.flush 成功后才清标记')
+    assert.equal(delivered.length, 1)
+    const text = delivered[0].content[0].text
+    assert.match(text, /^【任务看板 · 用户回复】t-1 选型/)
+    assert.match(text, /用户回答：选 A/)
+    assert.match(text, /请继续处理该任务（任务仍在原状态）。/)
+    assert.equal(text, buildAnswerText(task, '选 A'))
+
+    assert.equal(task.needsUser, false)
+    assert.equal(task.question, '')
+    assert.deepEqual(task.questionOptions, [])
+    assert.equal(task.askedAt, null)
+    assert.equal(task.askedBy, null)
+    assert.equal(task.lastAnswer, '选 A')
+    assert.equal(task.answeredAt, new Date(NOW + 1000).toISOString())
+    assert.equal(task.lastError, '')
+    assert.equal(task.status, 'doing', '回答不改变任务状态')
+
+    // 落盘：重新读回来仍是「已清标记 + 回答留档」
+    const reloaded = loadBoardFromDisk(filePath).state.tasks[0]
+    assert.equal(reloaded.needsUser, false)
+    assert.equal(reloaded.lastAnswer, '选 A')
+    assert.equal(reloaded.answeredAt, new Date(NOW + 1000).toISOString())
+
+    // 已不再 flagged：再回答一次 → conflict
+    await assert.rejects(
+      () => answerTask(rt, task.id, '再答一次', NOW + 2000),
+      (error) => error.code === 'conflict',
+    )
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('answer-task 失败：找不到会话 / 投递失败保留标记，空与超长回答拒绝', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-answer-fail-'))
+  try {
+    const state = createEmptyBoard()
+    const task = addTask(state, { title: '待回答', sessionId: 'creator-1', needsUser: true, question: '确认吗？' }, NOW)
+    const filePath = join(dir, 'board.json')
+    const offlineRt = fakeRuntime(state, { get: () => undefined }, filePath)
+
+    // 目标会话解析：dispatchedSessionId 为空 → 回退 sessionId（creator-1），离线 → conflict
+    await assert.rejects(
+      () => answerTask(offlineRt, task.id, '是', NOW),
+      (error) => error.code === 'conflict',
+    )
+    assert.equal(task.needsUser, true, '找不到会话必须保留标记')
+    assert.equal(task.question, '确认吗？')
+    assert.match(task.lastError, /creator-1 不在线/)
+
+    // 空回答 / 超长回答：bad-request，不动标记
+    await assert.rejects(() => answerTask(offlineRt, task.id, '   ', NOW), (error) => error.code === 'bad-request')
+    await assert.rejects(
+      () => answerTask(offlineRt, task.id, 'x'.repeat(MAX_ANSWER_CHARS + 1), NOW),
+      (error) => error.code === 'bad-request',
+    )
+    assert.equal(task.needsUser, true)
+
+    // followup 抛错 → internal，保留标记与问题，lastError 写原因
+    task.dispatchedSessionId = 'session-lead'
+    // 目标会话被归档 → conflict（归档门会拒绝模型步进），同样保留标记
+    const archivedRt = fakeRuntime(
+      state,
+      {
+        get: (name) =>
+          name === 'agents'
+            ? {
+                get: (id) =>
+                  id === 'session-lead'
+                    ? { id: 'session-lead', status: 'idle', session: { id: 'session-lead' }, followup: () => {} }
+                    : undefined,
+              }
+            : name === 'workspaceRegistry'
+              ? { archivedSessionIds: ['session-lead'] }
+              : undefined,
+      },
+      filePath,
+    )
+    await assert.rejects(
+      () => answerTask(archivedRt, task.id, '是', NOW + 1),
+      (error) => error.code === 'conflict',
+    )
+    assert.equal(task.needsUser, true)
+    assert.match(task.lastError, /已归档/)
+
+    const throwing = {
+      id: 'session-lead',
+      status: 'idle',
+      session: { id: 'session-lead', header: {} },
+      followup: () => {
+        throw new Error('boom')
+      },
+    }
+    const throwingRt = fakeRuntime(
+      state,
+      { get: (name) => (name === 'agents' ? { get: (id) => (id === 'session-lead' ? throwing : undefined) } : undefined) },
+      filePath,
+    )
+    await assert.rejects(
+      () => answerTask(throwingRt, task.id, '是', NOW + 1),
+      (error) => error.code === 'internal',
+    )
+    assert.equal(task.needsUser, true)
+    assert.equal(task.question, '确认吗？')
+    assert.match(task.lastError, /回复发送失败/)
+
+    // flush 抛错同样 internal（消息已入队但标记不清，用户可重试）
+    const flushing = {
+      id: 'session-lead',
+      status: 'idle',
+      session: { id: 'session-lead', header: {} },
+      followup: () => {},
+    }
+    const flushingRt = fakeRuntime(
+      state,
+      {
+        get: (name) =>
+          name === 'agents'
+            ? { get: (id) => (id === 'session-lead' ? flushing : undefined) }
+            : name === 'sessions'
+              ? { flush: async () => { throw new Error('flush-boom') } }
+              : undefined,
+      },
+      filePath,
+    )
+    await assert.rejects(
+      () => answerTask(flushingRt, task.id, '是', NOW + 2),
+      (error) => error.code === 'internal',
+    )
+    assert.equal(task.needsUser, true)
+
+    // 未 flag 的任务 → conflict；未知 id → not-found
+    const plain = addTask(state, { title: '普通任务' }, NOW)
+    await assert.rejects(() => answerTask(offlineRt, plain.id, '是', NOW), (error) => error.code === 'conflict')
+    await assert.rejects(() => answerTask(offlineRt, 't-999', '是', NOW), (error) => error.code === 'not-found')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('taskboard_update tool：needsUser + question 落盘并把 askedBy 记为调用会话', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-tool-needs-'))
+  try {
+    const state = createEmptyBoard()
+    const task = addTask(state, { title: '需要拍板' }, NOW)
+    const rt = fakeRuntime(state, { get: () => undefined }, join(dir, 'board.json'))
+    const registered = []
+    registerTools({ tools: { register: (definition) => registered.push(definition) } }, rt)
+    const updateTool = registered.find((tool) => tool.name === 'taskboard_update')
+    for (const key of ['needsUser', 'question', 'questionOptions']) {
+      assert.ok(updateTool.parameters.properties[key], 'taskboard_update.parameters 必须声明 ' + key)
+    }
+    assert.equal(updateTool.parameters.required.includes('needsUser'), false)
+
+    const exec = { agent: { session: { id: 'session-lead', header: {} } } }
+    const value = await updateTool.execute(
+      { id: task.id, needsUser: true, question: '发布前要不要跑全量回归？', questionOptions: ['要', '不要'] },
+      exec,
+    )
+    assert.deepEqual(schemaProblems(value, TASK_ONE_OUTPUT_SCHEMA), [])
+    assert.equal(task.needsUser, true)
+    assert.equal(task.question, '发布前要不要跑全量回归？')
+    assert.deepEqual(task.questionOptions, ['要', '不要'])
+    assert.equal(task.askedBy, 'session-lead', 'askedBy 取 exec.agent.session.id')
+    assert.ok(task.askedAt)
+    assert.equal(task.status, 'todo', '提问不是状态迁移')
+    // 工具输出（taskBrief）能看到 flagged 状态
+    assert.equal(value.task.needsUser, true)
+    assert.equal(value.task.question, '发布前要不要跑全量回归？')
+
+    // 新任务缺 question → 工具调用失败（bad-request），不写盘
+    const fresh = addTask(state, { title: '新任务' }, NOW)
+    await assert.rejects(
+      () => updateTool.execute({ id: fresh.id, needsUser: true }, exec),
+      (error) => error.code === 'bad-request',
+    )
+    assert.equal(fresh.needsUser, false)
+    assert.equal(fresh.question, '')
+
+    // 取消提问：问题四字段清空
+    const cleared = await updateTool.execute({ id: task.id, needsUser: false }, exec)
+    assert.equal(cleared.task.needsUser, false)
+    assert.equal(cleared.task.question, '')
+    assert.deepEqual(cleared.task.questionOptions, [])
+    assert.equal(task.askedBy, null)
+    assert.equal(task.askedAt, null)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('handleHttp：answer-task 端点走 RPC 信封，成功后清标记、再答返回 conflict', async () => {
+  // 独立临时目录：handleHttp 会先 reloadBoardIfStale()，固定路径会读到上一次运行留下的旧板。
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-http-answer-'))
+  try {
+    const state = createEmptyBoard()
+    const task = addTask(state, { title: 'RPC 提问', sessionId: 'creator-1', needsUser: true, question: '选哪个？' }, NOW)
+    task.dispatchedSessionId = 'session-lead'
+    const delivered = []
+    const lead = {
+      id: 'session-lead',
+      status: 'idle',
+      session: { id: 'session-lead', header: {} },
+      followup: (message) => delivered.push(message),
+    }
+    const rt = fakeRuntime(
+      state,
+      {
+        get: (name) =>
+          name === 'agents'
+            ? { get: (id) => (id === 'session-lead' ? lead : undefined) }
+            : name === 'sessions'
+              ? { flush: async () => {} }
+              : undefined,
+      },
+      join(dir, 'board.json'),
+    )
+    const envelope = (rpcId, payload) =>
+      JSON.stringify({ type: 'client-request', rpcId, method: 'answer-task', payload })
+
+    const req = fakeHttpRequestWithBody({ url: '/taskboard/answer-task' }, envelope('r1', { id: task.id, answer: '选 A' }))
+    const res = fakeHttpResponse()
+    const pending = handleHttp(rt, req, res)
+    req.send()
+    await pending
+    const body = JSON.parse(res.body)
+    assert.equal(body.result.ok, true, JSON.stringify(body))
+    assert.equal(body.result.value.sessionId, 'session-lead')
+    assert.equal(body.result.value.task.needsUser, false)
+    assert.equal(task.lastAnswer, '选 A')
+    assert.equal(delivered.length, 1)
+    assert.match(delivered[0].content[0].text, /^【任务看板 · 用户回复】/)
+
+    // 已不再 flagged：同一个端点返回 conflict 错误信封（HTTP 仍是 200）
+    const req2 = fakeHttpRequestWithBody({ url: '/taskboard/answer-task' }, envelope('r2', { id: task.id, answer: '再来' }))
+    const res2 = fakeHttpResponse()
+    const pending2 = handleHttp(rt, req2, res2)
+    req2.send()
+    await pending2
+    assert.equal(res2.statusCode, 200)
+    const body2 = JSON.parse(res2.body)
+    assert.equal(body2.result.ok, false)
+    assert.equal(body2.result.error.code, 'conflict')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * v0.2.2 复核修复：原子更新 / 回答目标会话回退 / 重排与归档清标记
+ * ------------------------------------------------------------------ */
+
+test('needsUser：applyTaskUpdate 先校验后写入，bad-request 不留部分修改', () => {
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '原任务', sessionId: 'creator-1' }, NOW)
+  const before = {
+    status: task.status,
+    title: task.title,
+    needsUser: task.needsUser,
+    question: task.question,
+    questionOptions: task.questionOptions.slice(),
+    askedAt: task.askedAt,
+    askedBy: task.askedBy,
+    startedAt: task.startedAt,
+    updatedAt: task.updatedAt,
+  }
+  const assertUnchanged = () => {
+    assert.equal(task.status, before.status, 'status 不得被部分修改')
+    assert.equal(task.title, before.title, 'title 不得被部分修改')
+    assert.equal(task.needsUser, before.needsUser)
+    assert.equal(task.question, before.question)
+    assert.deepEqual(task.questionOptions, before.questionOptions)
+    assert.equal(task.askedAt, before.askedAt)
+    assert.equal(task.askedBy, before.askedBy)
+    assert.equal(task.startedAt, before.startedAt)
+    assert.equal(task.updatedAt, before.updatedAt, '抛错不得刷新 updatedAt')
+  }
+
+  // status / title 本身合法，只有 needsUser 组合非法：不能留下 doing / changed 的部分修改
+  assert.throws(
+    () => applyTaskUpdate(state, task.id, { status: 'doing', title: 'changed', needsUser: true }, NOW + 1000),
+    (error) => error.code === 'bad-request',
+  )
+  assertUnchanged()
+
+  // question:'' 同样在写字段之前被拒
+  assert.throws(
+    () => applyTaskUpdate(state, task.id, { status: 'doing', title: 'changed', question: '   ' }, NOW + 2000),
+    (error) => error.code === 'bad-request',
+  )
+  assertUnchanged()
+
+  // 只传 questionOptions、不 flag 也不带 question → bad-request（不静默丢选项）
+  assert.throws(
+    () => applyTaskUpdate(state, task.id, { questionOptions: ['A'] }, NOW + 3000),
+    (error) => error.code === 'bad-request' && /questionOptions/.test(error.message),
+  )
+  assertUnchanged()
+  assert.deepEqual(task.questionOptions, [])
+
+  // flagged 任务只补选项（不重复传 question）是合法更新
+  applyTaskUpdate(state, task.id, { needsUser: true, question: '选哪个？' }, NOW + 4000)
+  applyTaskUpdate(state, task.id, { questionOptions: ['A', 'B'] }, NOW + 5000)
+  assert.equal(task.needsUser, true)
+  assert.equal(task.question, '选哪个？')
+  assert.deepEqual(task.questionOptions, ['A', 'B'])
+})
+
+test('needsUser：进入 archived（update-task / archiveDoneTasks）清标记，保留回答留档', () => {
+  const state = createEmptyBoard()
+  // update-task 直接 todo→archived
+  const flagged = addTask(
+    state,
+    { title: '归档提问', needsUser: true, question: '确认归档？', questionOptions: ['是', '否'], askedBy: 'lead-1' },
+    NOW,
+  )
+  flagged.lastAnswer = '是'
+  flagged.answeredAt = new Date(NOW + 500).toISOString()
+  applyTaskUpdate(state, flagged.id, { status: 'archived' }, NOW + 1000)
+  assert.equal(flagged.status, 'archived')
+  assert.equal(flagged.needsUser, false)
+  assert.equal(flagged.question, '')
+  assert.deepEqual(flagged.questionOptions, [])
+  assert.equal(flagged.askedAt, null)
+  assert.equal(flagged.askedBy, null)
+  assert.equal(flagged.lastAnswer, '是', '归档不丢回答留档')
+  assert.equal(flagged.answeredAt, new Date(NOW + 500).toISOString())
+
+  // archive-done 批量归档
+  const done = addTask(state, { title: '完成后提问' }, NOW)
+  applyTaskUpdate(state, done.id, { status: 'doing' }, NOW + 1)
+  applyTaskUpdate(state, done.id, { status: 'done' }, NOW + 2)
+  applyTaskUpdate(state, done.id, { needsUser: true, question: '还要补测吗？', questionOptions: ['要'] }, NOW + 3)
+  done.lastAnswer = '要'
+  done.answeredAt = new Date(NOW + 400).toISOString()
+  assert.equal(archiveDoneTasks(state, NOW + 4000), 1)
+  assert.equal(done.status, 'archived')
+  assert.equal(done.needsUser, false)
+  assert.equal(done.question, '')
+  assert.deepEqual(done.questionOptions, [])
+  assert.equal(done.askedAt, null)
+  assert.equal(done.askedBy, null)
+  assert.equal(done.lastAnswer, '要')
+  assert.equal(done.answeredAt, new Date(NOW + 400).toISOString())
+  // 归档后不再出现在「待你处理」派生列表里（Host 侧 selectDispatchCandidates 也跳过 archived）
+  assert.equal(selectDispatchCandidates(state, NOW + 5000).length, 0)
+
+  // 旧 board.json 里归档后仍带标记的：读盘时降级为未 flag，回答留档保留
+  const { state: reloaded } = normalizeBoard({
+    tasks: [{ id: 't-old-archived', title: '旧归档', status: 'archived', needsUser: true, question: '旧问题', lastAnswer: '旧回答' }],
+  })
+  assert.equal(reloaded.tasks[0].needsUser, false)
+  assert.equal(reloaded.tasks[0].question, '')
+  assert.equal(reloaded.tasks[0].lastAnswer, '旧回答')
+})
+
+test('needsUser：status=archived 优先于 needsUser 校验（漏 question 也能归档）', () => {
+  const state = createEmptyBoard()
+  const makeDone = (title) => {
+    const task = addTask(state, { title }, NOW)
+    applyTaskUpdate(state, task.id, { status: 'doing' }, NOW + 1)
+    applyTaskUpdate(state, task.id, { status: 'done' }, NOW + 2)
+    return task
+  }
+
+  // 模型漏传 question：旧实现先抛 bad-request，任务卡在 done 归档不了
+  const missing = makeDone('漏问题归档')
+  applyTaskUpdate(state, missing.id, { status: 'archived', needsUser: true }, NOW + 3)
+  assert.equal(missing.status, 'archived', '归档不能被 needsUser 校验拦住')
+  assert.equal(missing.needsUser, false)
+  assert.equal(missing.question, '')
+  assert.deepEqual(missing.questionOptions, [])
+  assert.equal(missing.askedAt, null)
+  assert.equal(missing.askedBy, null)
+
+  // 带 question 也一样：归档清标记，问题不落盘
+  const withQuestion = makeDone('带问题归档')
+  applyTaskUpdate(state, withQuestion.id, { status: 'archived', needsUser: true, question: 'Q' }, NOW + 3)
+  assert.equal(withQuestion.status, 'archived')
+  assert.equal(withQuestion.needsUser, false)
+  assert.equal(withQuestion.question, '')
+  assert.deepEqual(withQuestion.questionOptions, [])
+  assert.equal(withQuestion.askedAt, null)
+  assert.equal(withQuestion.askedBy, null)
+})
+
+test('needsUser：重设 question 不带 questionOptions 时清空旧选项', () => {
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '重设问题' }, NOW)
+  applyTaskUpdate(
+    state,
+    task.id,
+    { needsUser: true, question: 'Q1', questionOptions: ['A', 'B'], askedBy: 'lead-1' },
+    NOW + 1,
+  )
+  assert.deepEqual(task.questionOptions, ['A', 'B'])
+
+  // 只换问题：旧选项必须清空，否则用户会看到与 Q2 无关的按钮
+  applyTaskUpdate(state, task.id, { question: 'Q2' }, NOW + 2)
+  assert.equal(task.question, 'Q2')
+  assert.equal(task.needsUser, true)
+  assert.deepEqual(task.questionOptions, [], '重设问题不带 options → 旧选项不残留')
+  assert.equal(task.askedAt, new Date(NOW + 1).toISOString(), 'askedAt 仍保留最早时间')
+  assert.equal(task.askedBy, 'lead-1', 'askedBy 不因重设问题而丢')
+
+  // 显式传 options 才更新
+  applyTaskUpdate(state, task.id, { question: 'Q3', questionOptions: ['C'] }, NOW + 3)
+  assert.deepEqual(task.questionOptions, ['C'])
+
+  // 只补 options（不重设 question）仍合法，问题保留
+  applyTaskUpdate(state, task.id, { questionOptions: ['D', 'E'] }, NOW + 4)
+  assert.equal(task.question, 'Q3')
+  assert.deepEqual(task.questionOptions, ['D', 'E'])
+})
+
+test('requeueTasksOfLead：重排任务时清 flagged 标记，lastError 保留重排说明', () => {
+  const state = createEmptyBoard()
+  const task = addTask(
+    state,
+    { title: '组长提问中', needsUser: true, question: '怎么处理？', questionOptions: ['A'], askedBy: 'lead-1' },
+    NOW,
+  )
+  applyTaskUpdate(state, task.id, { status: 'doing' }, NOW + 1)
+  task.dispatchedSessionId = 'lead-1'
+  task.dispatchedSessionTitle = '组长'
+  task.lastAnswer = '上一次回答'
+  task.answeredAt = new Date(NOW).toISOString()
+
+  assert.equal(requeueTasksOfLead(state, 'lead-1', NOW + 2), 1)
+  assert.equal(task.status, 'todo')
+  assert.equal(task.dispatchedSessionId, null)
+  assert.equal(task.needsUser, false, '重排后不能继续 flagged（否则 tick 跳过、回答发错会话）')
+  assert.equal(task.question, '')
+  assert.deepEqual(task.questionOptions, [])
+  assert.equal(task.askedAt, null)
+  assert.equal(task.askedBy, null)
+  assert.match(task.lastError, /重新排队/)
+  assert.equal(task.lastAnswer, '上一次回答', '重排不丢回答留档')
+  assert.equal(task.answeredAt, new Date(NOW).toISOString())
+  // 清掉标记后回到派发候选（交给新组长）
+  assert.equal(selectDispatchCandidates(state, NOW + 3).length, 1)
+})
+
+test('answer-task：任务已归档时直接 conflict，不投递也不写回答', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-answer-archived-'))
+  try {
+    const state = createEmptyBoard()
+    const delivered = []
+    const agent = {
+      id: 'lead-live',
+      status: 'idle',
+      session: { id: 'lead-live', header: {} },
+      followup: (message) => delivered.push(message),
+    }
+    const rt = fakeRuntime(
+      state,
+      {
+        get: (name) =>
+          name === 'agents'
+            ? { get: (id) => (id === 'lead-live' ? agent : undefined) }
+            : name === 'sessions'
+              ? { flush: async () => {} }
+              : undefined,
+      },
+      join(dir, 'board.json'),
+    )
+    // 正常路径走不到（归档已清标记），这里手工构造 archived + flagged 验证纵深防御
+    const task = addTask(
+      state,
+      { title: '归档后残留标记', needsUser: true, question: '还答吗？', askedBy: 'lead-live' },
+      NOW,
+    )
+    task.status = 'archived'
+    task.archivedAt = new Date(NOW).toISOString()
+    const revisionBefore = state.revision
+    await assert.rejects(
+      () => answerTask(rt, task.id, '答', NOW + 1),
+      (error) => error.code === 'conflict' && /任务已归档/.test(error.message),
+    )
+    assert.equal(delivered.length, 0, '归档任务不得 followup')
+    assert.equal(task.lastAnswer, '', '归档任务不写回答')
+    assert.equal(task.answeredAt, null)
+    assert.equal(task.needsUser, true, '守卫不改任务字段（不伪造回答成功）')
+    assert.equal(state.revision, revisionBefore, '守卫不写盘')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('answer-task：按 dispatchedSessionId → askedBy → sessionId 回退，跳过已归档候选', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-answer-fallback-'))
+  try {
+    const state = createEmptyBoard()
+    const delivered = []
+    const makeAgent = (id) => ({
+      id,
+      status: 'idle',
+      session: { id, header: {} },
+      followup: (message) => delivered.push({ id, message }),
+    })
+    const askerLive = makeAgent('asker-live')
+    const creatorLive = makeAgent('creator-live')
+    const agents = {
+      get: (id) => (id === 'asker-live' ? askerLive : id === 'creator-live' ? creatorLive : undefined),
+      roots: () => [askerLive, creatorLive],
+    }
+    const rt = fakeRuntime(
+      state,
+      {
+        get: (name) =>
+          name === 'agents'
+            ? agents
+            : name === 'sessions'
+              ? { flush: async () => {} }
+              : name === 'workspaceRegistry'
+                ? { archivedSessionIds: ['lead-archived'] }
+                : undefined,
+      },
+      join(dir, 'board.json'),
+    )
+
+    // a) 没有 dispatched / sessionId，askedBy live → 发给提问会话
+    const askedOnly = addTask(
+      state,
+      { title: '只记录提问者', needsUser: true, question: '选哪个？', askedBy: 'asker-live' },
+      NOW,
+    )
+    const first = await answerTask(rt, askedOnly.id, '选 A', NOW + 1)
+    assert.equal(first.sessionId, 'asker-live')
+    assert.equal(askedOnly.needsUser, false)
+    assert.equal(delivered.length, 1)
+    assert.equal(delivered[0].id, 'asker-live')
+
+    // b) dispatched 指向已归档组长，sessionId live → 跳过归档候选，投给创建会话
+    const leadArchived = addTask(
+      state,
+      { title: '组长已归档', sessionId: 'creator-live', needsUser: true, question: '还要继续吗？' },
+      NOW,
+    )
+    leadArchived.dispatchedSessionId = 'lead-archived'
+    const second = await answerTask(rt, leadArchived.id, '继续', NOW + 2)
+    assert.equal(second.sessionId, 'creator-live')
+    assert.equal(leadArchived.needsUser, false)
+    assert.equal(delivered.length, 2)
+    assert.equal(delivered[1].id, 'creator-live')
+
+    // c) 三个候选都不可用 → conflict，标记保留，错误信息列出尝试过的会话
+    const deadAll = addTask(
+      state,
+      { title: '全不可用', sessionId: 'dead-session', needsUser: true, question: '在吗？', askedBy: 'dead-asker' },
+      NOW,
+    )
+    deadAll.dispatchedSessionId = 'lead-archived'
+    await assert.rejects(
+      () => answerTask(rt, deadAll.id, '试试', NOW + 3),
+      (error) =>
+        error.code === 'conflict' &&
+        /lead-archived 已归档/.test(error.message) &&
+        /dead-asker 不在线/.test(error.message) &&
+        /dead-session 不在线/.test(error.message),
+    )
+    assert.equal(deadAll.needsUser, true, '全部不可用必须保留标记')
+    assert.equal(deadAll.question, '在吗？')
+    assert.match(deadAll.lastError, /已尝试/)
+    assert.equal(delivered.length, 2, '失败时不得投递')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('needsUser：todo 任务回答后再派发，派发文本带「用户最近回答」', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-answer-redispatch-'))
+  try {
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({ pollEnabled: true, dispatchMode: 'creator' })
+    const task = addTask(
+      state,
+      { title: '要不要上线', sessionId: 'creator-1', needsUser: true, question: '明天能上线吗？', askedBy: 'lead-1' },
+      NOW,
+    )
+    const delivered = []
+    const lead = {
+      id: 'lead-1',
+      status: 'running',
+      session: { id: 'lead-1', header: {} },
+      followup: (message) => delivered.push(message),
+    }
+    const creator = {
+      id: 'creator-1',
+      status: 'idle',
+      session: { id: 'creator-1', header: { cwd: 'C:\\work' } },
+      followup: (message) => delivered.push(message),
+    }
+    const agents = {
+      get: (id) => (id === 'lead-1' ? lead : id === 'creator-1' ? creator : undefined),
+      roots: () => [creator],
+    }
+    const rt = fakeRuntime(
+      state,
+      { get: (name) => (name === 'agents' ? agents : name === 'sessions' ? { flush: async () => {} } : undefined) },
+      join(dir, 'board.json'),
+    )
+
+    const answered = await answerTask(rt, task.id, '明天下午可以', NOW + 1000)
+    assert.equal(answered.sessionId, 'lead-1', '回答优先发给提问会话（askedBy）')
+    assert.equal(task.needsUser, false, '回答后清标记')
+    assert.equal(task.status, 'todo', 'todo 任务回答后仍待派发')
+    assert.equal(delivered.length, 1)
+    // 直接构造派发文本也带答案（旧会话 / 新组长都能看到用户已拍板）
+    assert.match(buildDispatchText(task, NOW + 1500), /用户最近回答：明天下午可以/)
+
+    // 清标记后回到候选，tick 投给创建会话，派发消息带上最近回答
+    const dispatched = await tick(rt, {})
+    assert.equal(dispatched.dispatched, true)
+    assert.equal(dispatched.sessionId, 'creator-1')
+    assert.equal(delivered.length, 2)
+    assert.match(delivered[1].content[0].text, /用户最近回答：明天下午可以/)
+    assert.equal(task.status, 'doing')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
