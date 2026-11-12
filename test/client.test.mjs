@@ -464,6 +464,36 @@ test('工作区路径纯函数：归一化 / 同路径比较 / 展示名 / 过�
   assert.equal(helpers.tasksForFilter(tasks, '').length, 4)
 })
 
+test('v0.2.3：resolveWorkspaceSelection 恢复工作区过滤选择（有效 / 脏值 / 全部 / 未就绪）', () => {
+  const { exported } = loadClient()
+  const helpers = exported.__test
+  const workspaces = [
+    { id: 'w1', path: 'C:\\work\\a', title: '工作区 A' },
+    { id: 'w2', path: 'C:\\work\\b', title: '' },
+  ]
+
+  // 字段缺失 / 空串 / 全空白 = 「全部工作区」（默认选择）
+  assert.equal(helpers.resolveWorkspaceSelection(undefined, workspaces), '')
+  assert.equal(helpers.resolveWorkspaceSelection(null, workspaces), '')
+  assert.equal(helpers.resolveWorkspaceSelection('', workspaces), '')
+  assert.equal(helpers.resolveWorkspaceSelection('   ', workspaces), '')
+
+  // 有效值命中：斜杠 / 大小写归一化后返回注册表里的规范 path
+  assert.equal(helpers.resolveWorkspaceSelection('C:\\work\\b', workspaces), 'C:\\work\\b')
+  assert.equal(helpers.resolveWorkspaceSelection('c:/work/a/', workspaces), 'C:\\work\\a')
+
+  // 脏值回退：工作区被删 / 改名 / 非字符串 → 「全部工作区」，不把无效值当选中项
+  assert.equal(helpers.resolveWorkspaceSelection('C:\\work\\gone', workspaces), '')
+  assert.equal(helpers.resolveWorkspaceSelection(42, workspaces), '')
+  assert.equal(helpers.resolveWorkspaceSelection({ path: 'C:\\work\\a' }, workspaces), '')
+
+  // 工作区列表为空（注册表还没就绪）→ null：等下一条 snapshot，别误判成「工作区已删除」
+  assert.equal(helpers.resolveWorkspaceSelection('C:\\work\\b', []), null)
+  assert.equal(helpers.resolveWorkspaceSelection('C:\\work\\b', null), null)
+  // 「全部工作区」不依赖列表，立刻可判定
+  assert.equal(helpers.resolveWorkspaceSelection('', []), '')
+})
+
 test('v0.2.2 待你处理：needsUserTasks 排除归档、askedAt 最旧优先，withoutNeedsUser 去掉 flagged', () => {
   const { exported } = loadClient()
   const helpers = exported.__test

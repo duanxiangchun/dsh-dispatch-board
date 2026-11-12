@@ -219,6 +219,17 @@ class ComponentInstance {
     }
   }
 
+  /**
+   * 卸载：执行所有 effect 的 cleanup（相当于 React 卸载时框架做的事）。
+   * 驱动器平时只记录 cleanup 不执行；需要验证「卸载 → 重新挂载」的用例显式调用这里。
+   */
+  unmount() {
+    const cleanups = this.cleanups
+    this.cleanups = []
+    this.tree = null
+    for (const fn of cleanups) fn()
+  }
+
   async run(maxPasses = 8) {
     let tree = null
     for (let pass = 0; pass < maxPasses; pass += 1) {
@@ -1240,8 +1251,233 @@ test('PlatformBoard：默认显示全部工作区任务，可按工作区过滤�
   assert.ok(includesText(filteredA, '共 2 条'), 'toolbar count follows the filter')
   assert.ok(includesText(filteredA, '共 5 条'), 'header still shows the total')
 
-  // 过滤只影响显示，不触发额外 RPC
+  // 过滤只影响显示（不多拉 snapshot），但选择会立即持久化（v0.2.3）
   assert.equal(countCalls(harness, 'snapshot'), 1)
+  const filterCalls = harness.rpcCalls.filter((call) => call.endpoint === 'set-workspace-filter')
+  assert.equal(filterCalls.length, 1, '切换工作区过滤必须立即写盘')
+  assert.deepEqual(Object.assign({}, filterCalls[0].payload), { path: WS_A })
+})
+
+test('PlatformBoard：恢复持久化的「工作区」过滤选择，切换后立即写盘（含「全部」）', async () => {
+  const snapshot = makeSnapshot()
+  snapshot.config.workspaceFilter = WS_B // 上次选中工作区 B（模拟重启 / 刷新后的 snapshot）
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  // 打开看板即恢复：过滤器选中 B，只显示 B 的两条任务
+  const filterSelect = selectByAria(tree, '工作区')
+  assert.equal(filterSelect.props.value, WS_B, '上次选择的工作区必须被恢复')
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 2)
+  assert.ok(includesText(tree, '实现轮询自动派发'))
+  assert.ok(includesText(tree, '归档过期的旧任务'))
+  assert.ok(!includesText(tree, '梳理看板数据模型'))
+  assert.ok(includesText(tree, '共 2 条'), 'toolbar count follows the restored filter')
+
+  // 切回「全部工作区」→ 立即写盘（'' 表示全部）
+  filterSelect.props.onChange({ target: { value: '' } })
+  const cleared = await instance.run()
+  assert.equal(selectByAria(cleared, '工作区').props.value, '')
+  assert.equal(nodesWithClass(cleared, 'tb-card').length, 5)
+  let calls = harness.rpcCalls.filter((call) => call.endpoint === 'set-workspace-filter')
+  assert.equal(calls.length, 1)
+  assert.deepEqual(Object.assign({}, calls[0].payload), { path: '' }, '「全部工作区」也必须能被记住')
+
+  // 再切到工作区 A → 立即写盘 A 的路径
+  selectByAria(cleared, '工作区').props.onChange({ target: { value: WS_A } })
+  const picked = await instance.run()
+  assert.equal(selectByAria(picked, '工作区').props.value, WS_A)
+  assert.equal(nodesWithClass(picked, 'tb-card').length, 2)
+  calls = harness.rpcCalls.filter((call) => call.endpoint === 'set-workspace-filter')
+  assert.equal(calls.length, 2)
+  assert.deepEqual(Object.assign({}, calls[1].payload), { path: WS_A })
+})
+
+test('PlatformBoard：持久化的工作区已不存在（被删 / 改名）→ 回退全部工作区，不抛错', async () => {
+  const snapshot = makeSnapshot()
+  snapshot.config.workspaceFilter = 'C:\\work\\deleted-workspace'
+  const harness = createHarness({ snapshot })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+
+  assert.equal(selectByAria(tree, '工作区').props.value, '', '无效值不得被当成选中项')
+  assert.deepEqual(optionTexts(selectByAria(tree, '工作区')), ['全部工作区', '工作区 A', 'b'])
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 5, '回退「全部工作区」显示全部任务')
+  assert.deepEqual(harness.sandboxErrors, [], '脏值不能让看板抛错 / 白屏')
+})
+
+test('PlatformBoard：恢复持久化的「任务所属工作区」选择，切换后立即写盘（含回到占位）', async () => {
+  const snapshot = makeSnapshot()
+  snapshot.config.workspaceDraft = WS_B // 上次在新建行选中工作区 B（模拟去别的会话再点回来 / 刷新页面）
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  // 打开看板即恢复：新建行下拉选中 B（不是占位），标题为空时仍禁用
+  let submit = submitButton(tree)
+  assert.equal(selectByAria(tree, '任务所属工作区').props.value, WS_B, '上次选的工作区必须被恢复')
+  assert.equal(submit.props.disabled, true, '标题为空时仍然禁用')
+  assert.ok(!includesText(tree, '先选择任务所属的工作区'), '已恢复工作区时不该再提示先选工作区')
+  assert.equal(countCalls(harness, 'set-workspace-draft'), 0, '恢复不得写盘')
+  assert.equal(countCalls(harness, 'set-workspace-filter'), 0, '恢复不得串到过滤器')
+
+  // 写标题 → 可提交，payload cwd 用恢复出来的 B
+  composerInput(tree).props.onChange({ target: { value: '恢复后加的任务' } })
+  let next = await instance.run()
+  submit = submitButton(next)
+  assert.equal(submit.props.disabled, false, '恢复工作区后写标题即可提交')
+  submit.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  const addCall = harness.rpcCalls.find((call) => call.endpoint === 'add-task')
+  assert.ok(addCall, 'clicking 添加到待开始 must call add-task')
+  assert.deepEqual(Object.assign({}, addCall.payload), { title: '恢复后加的任务', cwd: WS_B })
+
+  // 切回「选择工作区」占位 → 立即写盘 ''（= 未选择），提交重新禁用
+  next = await instance.run()
+  selectByAria(next, '任务所属工作区').props.onChange({ target: { value: '' } })
+  const cleared = await instance.run()
+  assert.equal(selectByAria(cleared, '任务所属工作区').props.value, '')
+  assert.equal(submitButton(cleared).props.disabled, true, '回到占位后不能再提交')
+  assert.ok(includesText(cleared, '先选择任务所属的工作区'))
+  let calls = harness.rpcCalls.filter((call) => call.endpoint === 'set-workspace-draft')
+  assert.equal(calls.length, 1)
+  assert.deepEqual(Object.assign({}, calls[0].payload), { path: '' }, '「未选择」也必须能被记住')
+
+  // 再切到工作区 A → 立即写盘 A 的路径
+  selectByAria(cleared, '任务所属工作区').props.onChange({ target: { value: WS_A } })
+  const picked = await instance.run()
+  assert.equal(selectByAria(picked, '任务所属工作区').props.value, WS_A)
+  calls = harness.rpcCalls.filter((call) => call.endpoint === 'set-workspace-draft')
+  assert.equal(calls.length, 2)
+  assert.deepEqual(Object.assign({}, calls[1].payload), { path: WS_A })
+  assert.equal(countCalls(harness, 'set-workspace-filter'), 0, '新建行的选择不得写到过滤器字段')
+})
+
+test('PlatformBoard：持久化的「任务所属工作区」已不存在（被删 / 改名）→ 回退占位、提交禁用，不抛错', async () => {
+  const snapshot = makeSnapshot()
+  snapshot.config.workspaceDraft = 'C:\\work\\deleted-workspace'
+  const harness = createHarness({ snapshot })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+
+  assert.equal(selectByAria(tree, '任务所属工作区').props.value, '', '无效值不得被当成选中项')
+  assert.deepEqual(optionTexts(selectByAria(tree, '任务所属工作区')), ['选择工作区', '工作区 A', 'b'])
+  assert.equal(submitButton(tree).props.disabled, true, '没有有效工作区时不能提交')
+  assert.ok(includesText(tree, '先选择任务所属的工作区'))
+  assert.deepEqual(harness.sandboxErrors, [], '脏值不能让看板抛错 / 白屏')
+  assert.equal(countCalls(harness, 'set-workspace-draft'), 0, '回退默认不得写盘')
+})
+
+test('PlatformBoard：工作区过滤器与新建行工作区各自独立记忆，互不串值', async () => {
+  const snapshot = makeSnapshot()
+  snapshot.config.workspaceFilter = WS_A // 过滤器记住 A
+  snapshot.config.workspaceDraft = WS_B // 新建行记住 B
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  assert.equal(selectByAria(tree, '工作区').props.value, WS_A, '过滤器恢复自己的选择')
+  assert.equal(selectByAria(tree, '任务所属工作区').props.value, WS_B, '新建行恢复自己的选择')
+
+  // 改过滤器 → 只写 workspaceFilter，新建行选择不变
+  selectByAria(tree, '工作区').props.onChange({ target: { value: '' } })
+  let next = await instance.run()
+  assert.equal(selectByAria(next, '任务所属工作区').props.value, WS_B, '过滤器变化不得改动新建行选择')
+  assert.equal(countCalls(harness, 'set-workspace-filter'), 1)
+  assert.equal(countCalls(harness, 'set-workspace-draft'), 0)
+
+  // 改新建行工作区 → 只写 workspaceDraft，过滤器不变
+  selectByAria(next, '任务所属工作区').props.onChange({ target: { value: WS_A } })
+  next = await instance.run()
+  assert.equal(selectByAria(next, '工作区').props.value, '', '新建行变化不得改动过滤器')
+  assert.equal(countCalls(harness, 'set-workspace-draft'), 1)
+  assert.equal(countCalls(harness, 'set-workspace-filter'), 1)
+  assert.deepEqual(rpcPayload(harness, 'set-workspace-draft'), { path: WS_A })
+  assert.deepEqual(rpcPayload(harness, 'set-workspace-filter'), { path: '' })
+})
+
+test('PlatformBoard：卸载后重新挂载（去别的会话再点回看板）→ 新建行工作区仍是上次的选择', async () => {
+  const snapshot = makeSnapshot()
+  let persistedDraft = ''
+  // 假宿主：set-workspace-draft 真的记住值（等价 Host 合并写到 board.json），snapshot 每次都带最新值。
+  const rpc = (channel, endpoint, payload) => {
+    if (endpoint === 'set-workspace-draft') {
+      persistedDraft = payload && typeof payload.path === 'string' ? payload.path : ''
+      snapshot.config.workspaceDraft = persistedDraft
+      return Promise.resolve({ ok: true, value: { workspaceDraft: persistedDraft, changed: true, saved: true } })
+    }
+    return Promise.resolve({ ok: true, value: snapshot })
+  }
+  const harness = createHarness({ snapshot, rpc })
+
+  // 第一次打开看板：选工作区 B（此时 Host 落盘）
+  const first = await renderComponent(harness.componentOf('main'), {})
+  selectByAria(first.tree, '任务所属工作区').props.onChange({ target: { value: WS_B } })
+  await first.instance.run()
+  assert.equal(persistedDraft, WS_B, '切换后必须马上写到 Host')
+
+  // 卸载 = 左侧菜单切到别的会话（main 槽位换页）：执行第一个实例的 effect cleanup
+  //（aliveRef=false、停掉轮询），本地 state 随实例丢弃。
+  assert.equal(harness.intervals.length, 1, '卸载前应已注册轮询定时器（否则下面的 0 是空过）')
+  first.instance.unmount()
+  assert.equal(harness.intervals.length, 0, '卸载必须停掉实例注册的轮询定时器（effect cleanup 真的执行了）')
+
+  // 再点「任务看板」= 新组件实例重新挂载，只能从 snapshot 恢复。
+  const second = await renderComponent(harness.componentOf('main'), {})
+  assert.equal(
+    selectByAria(second.tree, '任务所属工作区').props.value,
+    WS_B,
+    '重新挂载后必须从 snapshot 恢复上次选择（不能被清理成占位）',
+  )
+  composerInput(second.tree).props.onChange({ target: { value: '重新挂载后加的任务' } })
+  const next = await second.instance.run()
+  const submit = submitButton(next)
+  assert.equal(submit.props.disabled, false)
+  submit.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const addCalls = harness.rpcCalls.filter((call) => call.endpoint === 'add-task')
+  assert.equal(addCalls.length, 1)
+  assert.deepEqual(Object.assign({}, addCalls[0].payload), { title: '重新挂载后加的任务', cwd: WS_B })
+})
+
+test('PlatformBoard：用户选 B 之后才返回的旧 snapshot（config.workspaceDraft = A）不得覆盖选择（恢复守卫）', async () => {
+  const staleSnapshot = makeSnapshot()
+  staleSnapshot.config.workspaceDraft = WS_A // 旧 snapshot：Host 看到的是用户改之前的偏好
+  let releaseSnapshot = null
+  const harness = createHarness({
+    rpc: (channel, endpoint, payload) => {
+      if (endpoint === 'session-info') {
+        return Promise.resolve({ ok: true, value: { sessionId: payload && payload.sessionId, cwd: null } })
+      }
+      if (endpoint === 'set-workspace-draft') {
+        return Promise.resolve({
+          ok: true,
+          value: { workspaceDraft: payload && payload.path, changed: true, saved: true },
+        })
+      }
+      // snapshot：延迟到用例显式释放，模拟「用户操作先到、旧 snapshot 后到」的返回顺序。
+      return new Promise((resolve) => {
+        releaseSnapshot = () => resolve({ ok: true, value: staleSnapshot })
+      })
+    },
+  })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  // 首条 snapshot 还没回来（工作区列表未就绪），用户已经在下拉里选了 B：
+  // draftTouchedRef / draftRestoredRef 都被置位，之后到达的 snapshot 只能刷新看板、不能改这个选择。
+  selectByAria(tree, '任务所属工作区').props.onChange({ target: { value: WS_B } })
+  await instance.run()
+  assert.deepEqual(rpcPayload(harness, 'set-workspace-draft'), { path: WS_B }, '用户切换要立即写 Host')
+
+  // 旧 snapshot 现在才回来：workspaces 就绪，但 config.workspaceDraft 仍是改之前的 A。
+  assert.equal(typeof releaseSnapshot, 'function', '首条 snapshot 必须由用例控制返回时机')
+  releaseSnapshot()
+  await settle()
+  const next = await instance.run()
+
+  // 旧 snapshot 确实被采用（工作区选项出现、任务渲染）……
+  assert.deepEqual(optionTexts(selectByAria(next, '任务所属工作区')), ['选择工作区', '工作区 A', 'b'])
+  assert.equal(nodesWithClass(next, 'tb-card').length, 5, '旧 snapshot 的看板数据要正常落地')
+  // ……但新建行「任务所属工作区」不能被它恢复成 A（否则用户刚选的 B 被旧值覆盖）。
+  assert.equal(selectByAria(next, '任务所属工作区').props.value, WS_B, '晚到的旧 snapshot 不得覆盖用户刚选的 B')
+  assert.equal(countCalls(harness, 'set-workspace-draft'), 1, '恢复被守卫拦下，不得把旧值 A 回写 Host')
+  assert.deepEqual(harness.sandboxErrors, [])
 })
 
 test('PlatformBoard：新增任务必须选工作区，提交 payload 带 cwd、不带 sessionId', async () => {

@@ -16,6 +16,23 @@ Host 半 `lib/index.js`（ESM，Cordis 插件），Client 半 `lib/client.js`（
    0.2.2 起不再有 `$DSH_HOME/.agent-presets` 目录机制——别写文件安装预设。
 5. 每个 RPC 端点必须在 `docs/architecture.md` 的表格里有行；错误码统一 `bad-request|not-found|conflict|internal`。
 
+## 看板工作流约定（组长 / worker 必读）
+
+与 `docs/architecture.md` §1.9 一致；改看板提问 / 归档行为前先读那一节。
+
+1. **归档是终态：`needsUser` 不能挂在归档任务上**。看板「待你处理」不显示 `archived` 任务；
+   `taskboard_update` / `update-task` 在归档任务上设置 `needsUser:true` 或 `question` 会被 Host 以
+   `conflict` 拒绝（先于任何字段写入）。任务已完成 / 已归档但还需要用户拍板 → 用 `taskboard_add`
+   新建一条 `todo` 任务（标题写清要确认什么），再在新任务上提问；同一次调用里带
+   `{status:'todo', needsUser:true, question}` 重开 + 提问也允许。`needsUser:false` 取消提问在归档
+   任务上仍幂等成功。
+2. **问题写进看板，聊天只留一句指路**：question / questionOptions / 背景全部写进 `taskboard_update`
+   的 `question` 与任务的 `note`；对用户的说明只写「已在看板提问 t-XX」，不要把问题正文只放在聊天或
+   `lastError` 里（`lastError` 只写故障）。
+3. **审核结论必须落看板**：直聊派活的任务由宿主自动置 `done`，组长审核后仍要用
+   `taskboard_update {id, result:"…"}` 把审核结论写回该任务；写不进去就 `taskboard_add` 新建一条
+   记录任务，不能只留在聊天里。
+
 ## 验证流程
 
 ```powershell

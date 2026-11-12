@@ -71,6 +71,19 @@
                 也不要再为同一条任务手动 taskboard_add。用户一直不回答时任务保持原状，不要反复重发问题；
                 问题已解决 / 不再需要回答时用 taskboard_update {id, needsUser:false} 取消提问。
 
+                提问前先看 status（硬规则）：归档（archived）任务不能承载提问——看板「待你处理」不显示
+                归档任务，问题挂上去用户永远看不到（Host 现在会直接返回 conflict）。任务已完成 / 已归档但
+                还需要用户拍板 → 用 taskboard_add 新建一条 todo 任务（标题写清要确认什么），再在新任务上
+                needsUser:true 提问。
+
+                问题写进看板，聊天只留一句指路（硬规则）：question / questionOptions / 背景全部写进
+                question 与 note；对用户的说明只写「已在看板提问 t-XX」，不要把问题正文只放在聊天或
+                lastError 里。
+
+                审核结论必须落看板（硬规则）：直聊派活的任务由宿主自动置 done，你审核后仍要用
+                taskboard_update {id, result:"…"} 把审核结论写回该任务；写不进去就 taskboard_add 新建
+                一条记录任务，不能只留在聊天里。
+
                 看板是唯一事实源与汇报通道：状态、结论、阻塞都写回看板（taskboard_update），
                 不要假设用户看到了你的对话输出。每轮只处理投递来的这一条任务，结束本轮是常态；
                 结束本轮不等待、不轮询。需要用户决策的问题走上面的 needsUser 提问；

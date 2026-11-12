@@ -20,6 +20,7 @@ import {
   MAX_QUESTION_OPTIONS,
   MAX_TASK_ATTACHMENTS,
   MAX_UPLOAD_BODY_BYTES,
+  MAX_WORKSPACE_FILTER_CHARS,
   STATUSES,
   TASK_LIST_OUTPUT_SCHEMA,
   TASK_ONE_OUTPUT_SCHEMA,
@@ -75,6 +76,7 @@ import {
   normalizePathForCompare,
   normalizeQuestionOptions,
   normalizeWorkspaceLeads,
+  normalizeWorkspaceSelection,
   notifyCooldownMs,
   listWorkspaces,
   readAttachment,
@@ -94,6 +96,8 @@ import {
   selectDispatchCandidates,
   selectReceiptTasks,
   selectWorkspaceLead,
+  setWorkspaceFilter,
+  setWorkspaceDraft,
   sniffImageMime,
   subagentPromptText,
   taskBrief,
@@ -4157,6 +4161,218 @@ test('needsUser：status=archived 优先于 needsUser 校验（漏 question 也�
   assert.equal(withQuestion.askedBy, null)
 })
 
+test('needsUser：归档任务上提问 → conflict，校验先于写入且 board.json 零改动', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-ask-archived-'))
+  try {
+    const state = createEmptyBoard()
+    const task = addTask(state, { title: '已归档任务' }, NOW)
+    applyTaskUpdate(state, task.id, { status: 'archived' }, NOW + 1)
+    const filePath = join(dir, 'board.json')
+    commitBoard(state, filePath)
+    const beforeFile = readFileSync(filePath, 'utf8')
+    const before = {
+      status: task.status,
+      title: task.title,
+      result: task.result,
+      assignee: task.assignee,
+      needsUser: task.needsUser,
+      question: task.question,
+      questionOptions: task.questionOptions.slice(),
+      askedAt: task.askedAt,
+      askedBy: task.askedBy,
+      updatedAt: task.updatedAt,
+    }
+
+    // 同一个 patch 里还带了 title / result / assignee：抛错必须发生在任何字段写入之前。
+    assert.throws(
+      () =>
+        applyTaskUpdate(
+          state,
+          task.id,
+          { title: '改了标题', result: '不会写进去', assignee: 'lead-1', needsUser: true, question: '确认吗？' },
+          NOW + 2,
+        ),
+      (error) => error.code === 'conflict' && /任务已归档，不能在归档任务上提问/.test(error.message),
+    )
+
+    assert.equal(task.status, before.status)
+    assert.equal(task.title, before.title, '校验失败不得留下 title 部分修改')
+    assert.equal(task.result, before.result, '校验失败不得留下 result 部分修改')
+    assert.equal(task.assignee, before.assignee, '校验失败不得留下 assignee 部分修改')
+    assert.equal(task.needsUser, false)
+    assert.equal(task.question, '')
+    assert.deepEqual(task.questionOptions, [])
+    assert.equal(task.askedAt, null)
+    assert.equal(task.askedBy, null)
+    assert.equal(task.updatedAt, before.updatedAt, '抛错不得刷新 updatedAt')
+    assert.equal(readFileSync(filePath, 'utf8'), beforeFile, '调用方没有 commit，board.json 字节不变')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('needsUser：归档任务上只给 question（或只 needsUser:true）也 → conflict', () => {
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '归档后只想补问题' }, NOW)
+  applyTaskUpdate(state, task.id, { status: 'archived' }, NOW + 1)
+  const updatedAt = task.updatedAt
+
+  // 只给 question / 只给 needsUser / needsUser + options：都是「试图设置提问」，一律 conflict，
+  // 且 conflict 先于「needsUser:true 缺 question」的 bad-request 校验。
+  for (const patch of [{ question: '只给问题' }, { needsUser: true }, { needsUser: true, questionOptions: ['A'] }]) {
+    assert.throws(
+      () => applyTaskUpdate(state, task.id, patch, NOW + 2),
+      (error) => error.code === 'conflict' && /不能在归档任务上提问/.test(error.message),
+      JSON.stringify(patch) + ' 必须 conflict',
+    )
+  }
+  assert.equal(task.needsUser, false)
+  assert.equal(task.question, '')
+  assert.deepEqual(task.questionOptions, [])
+  assert.equal(task.askedAt, null)
+  assert.equal(task.askedBy, null)
+  assert.equal(task.updatedAt, updatedAt)
+})
+
+test('needsUser：归档优先不回归——{status:archived, needsUser:true, question} 照常归档并清字段', () => {
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '带问题归档' }, NOW)
+  applyTaskUpdate(state, task.id, { status: 'doing' }, NOW + 1)
+  applyTaskUpdate(state, task.id, { status: 'done' }, NOW + 2)
+  task.lastAnswer = '旧回答'
+  task.answeredAt = new Date(NOW + 3).toISOString()
+
+  applyTaskUpdate(state, task.id, { status: 'archived', needsUser: true, question: 'x' }, NOW + 4)
+  assert.equal(task.status, 'archived')
+  assert.equal(task.needsUser, false)
+  assert.equal(task.question, '')
+  assert.deepEqual(task.questionOptions, [])
+  assert.equal(task.askedAt, null)
+  assert.equal(task.askedBy, null)
+  assert.equal(task.lastAnswer, '旧回答', '归档不丢回答留档')
+  assert.equal(task.answeredAt, new Date(NOW + 3).toISOString())
+
+  // 已归档任务再传 {status:'archived', …} 同样走归档优先分支：幂等成功、不抛 conflict、问题不落字段。
+  applyTaskUpdate(state, task.id, { status: 'archived', needsUser: true, question: 'y' }, NOW + 5)
+  assert.equal(task.status, 'archived')
+  assert.equal(task.needsUser, false)
+  assert.equal(task.question, '')
+  assert.deepEqual(task.questionOptions, [])
+  assert.equal(task.askedAt, null)
+  assert.equal(task.askedBy, null)
+})
+
+test('needsUser：归档任务上 needsUser:false 幂等成功且不改其它字段', () => {
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '归档任务', note: '备注' }, NOW)
+  applyTaskUpdate(state, task.id, { status: 'archived' }, NOW + 1)
+  // 非提问类字段更新在归档任务上照常可用（也是脏 flag 清理路径的一种）。
+  applyTaskUpdate(state, task.id, { result: '结论', assignee: 'lead-1' }, NOW + 1)
+  task.lastAnswer = '保留的回答'
+  task.answeredAt = new Date(NOW + 2).toISOString()
+
+  for (const now of [NOW + 3, NOW + 4]) {
+    const updated = applyTaskUpdate(state, task.id, { needsUser: false }, now)
+    assert.equal(updated, task)
+    assert.equal(task.status, 'archived')
+    assert.equal(task.needsUser, false)
+    assert.equal(task.question, '')
+    assert.deepEqual(task.questionOptions, [])
+    assert.equal(task.askedAt, null)
+    assert.equal(task.askedBy, null)
+    assert.equal(task.lastAnswer, '保留的回答', '取消提问不清回答留档')
+    assert.equal(task.answeredAt, new Date(NOW + 2).toISOString())
+  }
+  assert.equal(task.title, '归档任务', '取消提问不改 title')
+  assert.equal(task.note, '备注', '取消提问不改 note')
+  assert.equal(task.result, '结论', '取消提问不改 result')
+  assert.equal(task.assignee, 'lead-1', '取消提问不改 assignee')
+})
+
+test('needsUser：归档任务上的历史脏 flag 在任意更新后仍被清空', () => {
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '旧脏数据' }, NOW)
+  // normalizeTask 读盘时会清 archived 上的 flag；这里直接构造内存脏数据，
+  // 覆盖「历史 board.json / 其它路径」在归档任务上留下待回答标记的路径（§1.9）。
+  task.status = 'archived'
+  task.archivedAt = new Date(NOW + 1).toISOString()
+  task.needsUser = true
+  task.question = '旧问题'
+  task.questionOptions = ['A', 'B']
+  task.askedAt = new Date(NOW + 2).toISOString()
+  task.askedBy = 'session-old'
+  task.lastAnswer = '旧回答'
+  task.answeredAt = new Date(NOW + 3).toISOString()
+
+  applyTaskUpdate(state, task.id, { title: '新标题' }, NOW + 4)
+  assert.equal(task.title, '新标题')
+  assert.equal(task.status, 'archived')
+  assert.equal(task.needsUser, false, '归档任务落字段后必须清掉残留 flag')
+  assert.equal(task.question, '')
+  assert.deepEqual(task.questionOptions, [])
+  assert.equal(task.askedAt, null)
+  assert.equal(task.askedBy, null)
+  assert.equal(task.lastAnswer, '旧回答', '清理 flag 不清回答留档')
+  assert.equal(task.answeredAt, new Date(NOW + 3).toISOString())
+})
+
+test('needsUser：未归档任务（todo / doing）正常提问，不被归档约束误伤', () => {
+  const state = createEmptyBoard()
+  const todo = addTask(state, { title: 'todo 提问' }, NOW)
+  applyTaskUpdate(state, todo.id, { needsUser: true, question: 'todo 问？', questionOptions: ['是'] }, NOW + 1)
+  assert.equal(todo.needsUser, true)
+  assert.equal(todo.question, 'todo 问？')
+  assert.deepEqual(todo.questionOptions, ['是'])
+  assert.equal(todo.status, 'todo', '提问不改变 status')
+
+  const doing = addTask(state, { title: 'doing 提问' }, NOW)
+  applyTaskUpdate(state, doing.id, { status: 'doing' }, NOW + 1)
+  applyTaskUpdate(state, doing.id, { question: 'doing 问？' }, NOW + 2)
+  assert.equal(doing.needsUser, true)
+  assert.equal(doing.question, 'doing 问？')
+  assert.equal(doing.status, 'doing')
+})
+
+test('needsUser：归档任务同一次调用里重开 + 提问可以成功（豁免只针对不改 status 的 patch）', () => {
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '重开再问' }, NOW)
+  applyTaskUpdate(state, task.id, { status: 'archived' }, NOW + 1)
+
+  applyTaskUpdate(state, task.id, { status: 'todo', needsUser: true, question: '重开后问？' }, NOW + 2)
+  assert.equal(task.status, 'todo', '同一次调用先重开')
+  assert.equal(task.needsUser, true)
+  assert.equal(task.question, '重开后问？')
+  assert.equal(task.askedAt, new Date(NOW + 2).toISOString())
+})
+
+test('taskboard_update tool：归档任务上提问返回 conflict，工具不 commit、board.json 不变', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-tool-archived-ask-'))
+  try {
+    const state = createEmptyBoard()
+    const task = addTask(state, { title: '已归档' }, NOW)
+    applyTaskUpdate(state, task.id, { status: 'archived' }, NOW + 1)
+    const filePath = join(dir, 'board.json')
+    commitBoard(state, filePath)
+    const beforeFile = readFileSync(filePath, 'utf8')
+
+    const rt = fakeRuntime(state, { get: () => undefined }, filePath)
+    const registered = []
+    registerTools({ tools: { register: (definition) => registered.push(definition) } }, rt)
+    const updateTool = registered.find((tool) => tool.name === 'taskboard_update')
+    const exec = { agent: { session: { id: 'session-lead', header: {} } } }
+
+    await assert.rejects(
+      () => updateTool.execute({ id: task.id, needsUser: true, question: '确认吗？' }, exec),
+      (error) => error.code === 'conflict' && /任务已归档，不能在归档任务上提问/.test(error.message),
+    )
+    assert.equal(task.needsUser, false)
+    assert.equal(task.question, '')
+    assert.equal(readFileSync(filePath, 'utf8'), beforeFile, '工具抛错后不得写盘')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('needsUser：重设 question 不带 questionOptions 时清空旧选项', () => {
   const state = createEmptyBoard()
   const task = addTask(state, { title: '重设问题' }, NOW)
@@ -4389,6 +4605,387 @@ test('needsUser：todo 任务回答后再派发，派发文本带「用户最近
     assert.equal(delivered.length, 2)
     assert.match(delivered[1].content[0].text, /用户最近回答：明天下午可以/)
     assert.equal(task.status, 'doing')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * v0.2.3：平台看板「工作区」过滤选择持久化（config.workspaceFilter）
+ * ------------------------------------------------------------------ */
+
+test('normalizeWorkspaceSelection：只接受非空短字符串，其余回退「全部工作区」', () => {
+  assert.equal(normalizeWorkspaceSelection('C:\\work\\b'), 'C:\\work\\b')
+  assert.equal(normalizeWorkspaceSelection('  C:\\work\\b  '), 'C:\\work\\b')
+  assert.equal(normalizeWorkspaceSelection(''), '', '空串 = 全部工作区')
+  assert.equal(normalizeWorkspaceSelection('   '), '')
+  assert.equal(normalizeWorkspaceSelection(null), '')
+  assert.equal(normalizeWorkspaceSelection(undefined), '')
+  assert.equal(normalizeWorkspaceSelection(42), '')
+  assert.equal(normalizeWorkspaceSelection(['C:\\work']), '')
+  assert.equal(normalizeWorkspaceSelection({ path: 'C:\\work' }), '')
+  const max = 'a'.repeat(MAX_WORKSPACE_FILTER_CHARS)
+  assert.equal(normalizeWorkspaceSelection(max), max)
+  assert.equal(normalizeWorkspaceSelection(max + 'a'), '', '超长路径不可用 → 回退默认')
+})
+
+test('normalizeConfig：workspaceFilter 缺省 / 脏值回退空串，合法路径原样保留', () => {
+  assert.equal(createEmptyBoard().config.workspaceFilter, '', '空板默认全部工作区')
+  assert.equal(normalizeConfig({}).workspaceFilter, '')
+  assert.equal(normalizeConfig({ workspaceFilter: '  C:\\work\\b ' }).workspaceFilter, 'C:\\work\\b')
+  assert.equal(normalizeConfig({ workspaceFilter: 7 }).workspaceFilter, '')
+  assert.equal(normalizeConfig({ workspaceFilter: {} }).workspaceFilter, '')
+  // 其它字段互不影响
+  const config = normalizeConfig({ workspaceFilter: 'C:\\work\\b', mainSessionId: 'main-1', dispatchMode: 'creator' })
+  assert.equal(config.workspaceFilter, 'C:\\work\\b')
+  assert.equal(config.mainSessionId, 'main-1')
+  assert.equal(config.dispatchMode, 'creator')
+})
+
+test('setWorkspaceFilter：合并写保留其它字段，值未变不写盘，空串 = 全部工作区', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-ws-filter-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({ mainSessionId: 'main-1', mainSessionTitle: '主会话', dispatchMode: 'creator' })
+    state.config.workspaceLeads = {
+      'C:\\work\\a': { sessionId: 'lead-a', title: '组长 A', cwd: 'C:\\work\\a', createdAt: new Date(NOW).toISOString() },
+    }
+    addTask(state, { title: '本地任务', cwd: 'C:\\work\\a' }, NOW)
+    const rt = fakeRuntime(state, { get: () => undefined }, filePath)
+    commitBoard(state, filePath)
+    const revisionBefore = state.revision
+
+    const saved = setWorkspaceFilter(rt, 'C:\\work\\b')
+    assert.deepEqual(saved, { workspaceFilter: 'C:\\work\\b', changed: true, saved: true })
+    assert.equal(state.revision, revisionBefore + 1)
+
+    const disk = JSON.parse(readFileSync(filePath, 'utf8'))
+    assert.equal(disk.config.workspaceFilter, 'C:\\work\\b')
+    // 合并写：任务 / 主会话绑定 / 组长映射 / 派发模式都不能被这次写盘丢掉
+    assert.equal(disk.config.mainSessionId, 'main-1')
+    assert.equal(disk.config.mainSessionTitle, '主会话')
+    assert.equal(disk.config.dispatchMode, 'creator')
+    assert.equal(disk.config.workspaceLeads['C:\\work\\a'].sessionId, 'lead-a')
+    assert.equal(disk.tasks.length, 1)
+    assert.equal(disk.tasks[0].title, '本地任务')
+
+    // 幂等：同一个值（含空白差异）再设一次不写盘、不 bump revision
+    const again = setWorkspaceFilter(rt, '  C:\\work\\b  ')
+    assert.deepEqual(again, { workspaceFilter: 'C:\\work\\b', changed: false, saved: true })
+    assert.equal(state.revision, revisionBefore + 1)
+
+    // 「全部工作区」= 空串，同样会被记住
+    const cleared = setWorkspaceFilter(rt, '')
+    assert.equal(cleared.changed, true)
+    assert.equal(JSON.parse(readFileSync(filePath, 'utf8')).config.workspaceFilter, '')
+
+    // 脏值不报错：非字符串按「全部工作区」处理
+    const dirty = setWorkspaceFilter(rt, 42)
+    assert.deepEqual(dirty, { workspaceFilter: '', changed: false, saved: true })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('setWorkspaceFilter：另一个标签页先写了盘 → 先对齐盘上状态再合并写（不丢别人的修改）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-ws-filter-merge-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const state = createEmptyBoard()
+    addTask(state, { title: '本地任务' }, NOW)
+    commitBoard(state, filePath)
+    const rt = fakeRuntime(state, { get: () => undefined }, filePath)
+
+    // 模拟另一个标签页 / 进程：盘上 revision 更大，且改了主会话绑定、加了一条任务
+    const other = JSON.parse(readFileSync(filePath, 'utf8'))
+    other.revision += 5
+    other.config.mainSessionId = 'main-other'
+    other.tasks.push({ id: 't-99', title: '别的窗口加的任务', status: 'todo' })
+    writeFileSync(filePath, JSON.stringify(other, null, 2), 'utf8')
+
+    setWorkspaceFilter(rt, 'C:\\work\\b')
+    const disk = JSON.parse(readFileSync(filePath, 'utf8'))
+    assert.equal(disk.config.workspaceFilter, 'C:\\work\\b')
+    assert.equal(disk.config.mainSessionId, 'main-other', '必须保留盘上别人刚写的主会话绑定')
+    assert.ok(disk.tasks.some((task) => task.id === 't-99'), '必须保留盘上别人刚加的任务')
+    assert.ok(disk.tasks.some((task) => task.id === 't-1'), '本地任务也不能丢')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('setWorkspaceFilter：写盘失败只记日志（saved:false），不抛错、内存状态仍生效', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-ws-filter-fail-'))
+  try {
+    const blocker = join(dir, 'blocker')
+    writeFileSync(blocker, 'not a directory', 'utf8')
+    // board.json 的父目录其实是个文件 → mkdirSync 抛 ENOTDIR → commitBoard 返回 saved:false。
+    const rt = fakeRuntime(createEmptyBoard(), { get: () => undefined }, join(blocker, 'board.json'))
+    const result = setWorkspaceFilter(rt, 'C:\\work\\b')
+    assert.equal(result.workspaceFilter, 'C:\\work\\b')
+    assert.equal(result.changed, true)
+    assert.equal(result.saved, false, '写盘失败要如实告诉调用方，但 RPC 仍是成功响应')
+    assert.equal(rt.state.config.workspaceFilter, 'C:\\work\\b', '内存状态仍然生效（UI 不受影响）')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('loadBoardFromDisk：board.json 是脏 JSON → 从空板开始（workspaceFilter 回退「全部工作区」）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-ws-filter-corrupt-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    writeFileSync(filePath, '{ this is not json ', 'utf8')
+    const loaded = loadBoardFromDisk(filePath)
+    assert.equal(loaded.state.config.workspaceFilter, '', '脏 JSON 不得让偏好变成有效选中项')
+    assert.ok(loaded.warnings.length > 0, '坏文件要有告警')
+    assert.equal(existsSync(filePath), false, '坏文件被改名保留现场，从空板开始')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('handleHttp：set-workspace-filter 端点写盘，重启后读回 + snapshot 仍带这个选择', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-http-ws-filter-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const state = createEmptyBoard()
+    addTask(state, { title: '保留任务' }, NOW)
+    const rt = fakeRuntime(state, { get: () => undefined }, filePath)
+    const envelope = (payload) =>
+      JSON.stringify({ type: 'client-request', rpcId: 'x', method: 'set-workspace-filter', payload })
+
+    const req = fakeHttpRequestWithBody({ url: '/taskboard/set-workspace-filter' }, envelope({ path: 'C:\\work\\b' }))
+    const res = fakeHttpResponse()
+    const pending = handleHttp(rt, req, res)
+    req.send()
+    await pending
+    const body = JSON.parse(res.body)
+    assert.equal(body.result.ok, true, JSON.stringify(body))
+    assert.equal(body.result.value.workspaceFilter, 'C:\\work\\b')
+    assert.equal(body.result.value.changed, true)
+    assert.equal(body.result.value.saved, true)
+
+    const disk = JSON.parse(readFileSync(filePath, 'utf8'))
+    assert.equal(disk.config.workspaceFilter, 'C:\\work\\b')
+    assert.equal(disk.tasks.length, 1, '写入偏好不得丢任务')
+
+    // 重启 Host = 重新读盘：workspaceFilter 仍在，snapshot 带上它
+    const reloaded = loadBoardFromDisk(filePath).state
+    assert.equal(normalizeConfig(reloaded.config).workspaceFilter, 'C:\\work\\b')
+    const snapshot = buildSnapshot(fakeRuntime(reloaded, { get: () => undefined }, filePath))
+    assert.equal(snapshot.config.workspaceFilter, 'C:\\work\\b')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * v0.2.3（t-65）：平台看板新建行「任务所属工作区」选择持久化
+ * （config.workspaceDraft / RPC set-workspace-draft）
+ * ------------------------------------------------------------------ */
+
+test('normalizeConfig：workspaceDraft 缺省 / 脏值回退空串，合法路径原样保留，且与 workspaceFilter 互不影响', () => {
+  assert.equal(createEmptyBoard().config.workspaceDraft, '', '空板默认「未选择」')
+  assert.equal(normalizeConfig({}).workspaceDraft, '')
+  assert.equal(normalizeConfig({ workspaceDraft: '  C:\\work\\b ' }).workspaceDraft, 'C:\\work\\b')
+  assert.equal(normalizeConfig({ workspaceDraft: 7 }).workspaceDraft, '')
+  assert.equal(normalizeConfig({ workspaceDraft: {} }).workspaceDraft, '')
+  assert.equal(normalizeConfig({ workspaceDraft: null }).workspaceDraft, '')
+  assert.equal(normalizeConfig({ workspaceDraft: '   ' }).workspaceDraft, '')
+  const tooLong = 'a'.repeat(MAX_WORKSPACE_FILTER_CHARS + 1)
+  assert.equal(normalizeConfig({ workspaceDraft: tooLong }).workspaceDraft, '', '超长路径不可用 → 回退「未选择」')
+  // 两个 UI 偏好 + 其它 config 字段互不影响
+  const config = normalizeConfig({
+    workspaceDraft: 'C:\\work\\b',
+    workspaceFilter: 'C:\\work\\a',
+    mainSessionId: 'main-1',
+    dispatchMode: 'creator',
+  })
+  assert.equal(config.workspaceDraft, 'C:\\work\\b')
+  assert.equal(config.workspaceFilter, 'C:\\work\\a')
+  assert.equal(config.mainSessionId, 'main-1')
+  assert.equal(config.dispatchMode, 'creator')
+})
+
+test('setWorkspaceDraft：合并写保留其它字段（含 workspaceFilter），值未变不写盘，空串 = 未选择', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-ws-draft-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({ mainSessionId: 'main-1', mainSessionTitle: '主会话', dispatchMode: 'creator' })
+    state.config.workspaceFilter = 'C:\\work\\a'
+    state.config.workspaceLeads = {
+      'C:\\work\\a': { sessionId: 'lead-a', title: '组长 A', cwd: 'C:\\work\\a', createdAt: new Date(NOW).toISOString() },
+    }
+    addTask(state, { title: '本地任务', cwd: 'C:\\work\\a' }, NOW)
+    const rt = fakeRuntime(state, { get: () => undefined }, filePath)
+    commitBoard(state, filePath)
+    const revisionBefore = state.revision
+
+    const saved = setWorkspaceDraft(rt, 'C:\\work\\b')
+    assert.deepEqual(saved, { workspaceDraft: 'C:\\work\\b', changed: true, saved: true })
+    assert.equal(state.revision, revisionBefore + 1)
+
+    const disk = JSON.parse(readFileSync(filePath, 'utf8'))
+    assert.equal(disk.config.workspaceDraft, 'C:\\work\\b')
+    // 合并写：过滤器 / 任务 / 主会话绑定 / 组长映射 / 派发模式都不能被这次写盘丢掉
+    assert.equal(disk.config.workspaceFilter, 'C:\\work\\a', '写新建行选择不得改动过滤器选择')
+    assert.equal(disk.config.mainSessionId, 'main-1')
+    assert.equal(disk.config.mainSessionTitle, '主会话')
+    assert.equal(disk.config.dispatchMode, 'creator')
+    assert.equal(disk.config.workspaceLeads['C:\\work\\a'].sessionId, 'lead-a')
+    assert.equal(disk.tasks.length, 1)
+    assert.equal(disk.tasks[0].title, '本地任务')
+
+    // 幂等：同一个值（含空白差异）再设一次不写盘、不 bump revision
+    const again = setWorkspaceDraft(rt, '  C:\\work\\b  ')
+    assert.deepEqual(again, { workspaceDraft: 'C:\\work\\b', changed: false, saved: true })
+    assert.equal(state.revision, revisionBefore + 1)
+
+    // 回到「选择工作区」占位 = 空串，同样会被记住
+    const cleared = setWorkspaceDraft(rt, '')
+    assert.deepEqual(cleared, { workspaceDraft: '', changed: true, saved: true })
+    assert.equal(JSON.parse(readFileSync(filePath, 'utf8')).config.workspaceDraft, '')
+
+    // 脏值不报错：非字符串按「未选择」处理，且不清掉别的偏好
+    const dirty = setWorkspaceDraft(rt, 42)
+    assert.deepEqual(dirty, { workspaceDraft: '', changed: false, saved: true })
+    assert.equal(JSON.parse(readFileSync(filePath, 'utf8')).config.workspaceFilter, 'C:\\work\\a')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('setWorkspaceDraft / setWorkspaceFilter：两个下拉各自只改自己的字段（互不串值）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-ws-draft-independent-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const state = createEmptyBoard()
+    const rt = fakeRuntime(state, { get: () => undefined }, filePath)
+    commitBoard(state, filePath)
+
+    setWorkspaceDraft(rt, 'C:\\work\\b')
+    assert.equal(rt.state.config.workspaceDraft, 'C:\\work\\b')
+    assert.equal(rt.state.config.workspaceFilter, '', '写新建行选择不得顺手生成过滤器选择')
+
+    setWorkspaceFilter(rt, 'C:\\work\\a')
+    assert.equal(rt.state.config.workspaceFilter, 'C:\\work\\a')
+    assert.equal(rt.state.config.workspaceDraft, 'C:\\work\\b', '写过滤器不得清掉新建行选择')
+
+    const disk = JSON.parse(readFileSync(filePath, 'utf8'))
+    assert.equal(disk.config.workspaceDraft, 'C:\\work\\b')
+    assert.equal(disk.config.workspaceFilter, 'C:\\work\\a')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('setWorkspaceDraft：写盘失败只记日志（saved:false），不抛错、内存状态仍生效', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-ws-draft-fail-'))
+  // 写盘失败只 console.warn（commitBoard 的降级），这里把日志抓下来断言，顺便验证不抛错。
+  const originalWarn = console.warn
+  const warnings = []
+  try {
+    console.warn = (...args) => warnings.push(args.map((arg) => String(arg)).join(' '))
+    const blocker = join(dir, 'blocker')
+    writeFileSync(blocker, 'not a directory', 'utf8')
+    // board.json 的父目录其实是个文件 → mkdirSync 抛 ENOTDIR → commitBoard 返回 saved:false。
+    const rt = fakeRuntime(createEmptyBoard(), { get: () => undefined }, join(blocker, 'board.json'))
+    const result = setWorkspaceDraft(rt, 'C:\\work\\b')
+    assert.equal(result.workspaceDraft, 'C:\\work\\b')
+    assert.equal(result.changed, true)
+    assert.equal(result.saved, false, '写盘失败要如实告诉调用方，但 RPC 仍是成功响应')
+    assert.equal(rt.state.config.workspaceDraft, 'C:\\work\\b', '内存状态仍然生效（UI 不受影响）')
+    const writeWarnings = warnings.filter((line) => line.includes('看板写盘失败'))
+    assert.equal(writeWarnings.length, 1, '写盘失败必须记一条日志：' + JSON.stringify(warnings))
+    assert.ok(
+      writeWarnings[0].startsWith('[taskboard] 看板写盘失败：'),
+      '日志要能看出是看板写盘失败：' + writeWarnings[0],
+    )
+  } finally {
+    console.warn = originalWarn
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('setWorkspaceDraft：写盘失败后同值重试仍会重试写盘（saved 不撒谎），盘恢复可写后落盘', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-ws-draft-retry-'))
+  const originalWarn = console.warn
+  const warnings = []
+  const writeWarnings = () => warnings.filter((line) => line.includes('看板写盘失败'))
+  try {
+    console.warn = (...args) => warnings.push(args.map((arg) => String(arg)).join(' '))
+    const blocker = join(dir, 'blocker')
+    writeFileSync(blocker, 'not a directory', 'utf8')
+    const rt = fakeRuntime(createEmptyBoard(), { get: () => undefined }, join(blocker, 'board.json'))
+
+    // 第一次：内存生效，写盘失败
+    const first = setWorkspaceDraft(rt, 'C:\\work\\b')
+    assert.deepEqual(first, { workspaceDraft: 'C:\\work\\b', changed: true, saved: false })
+    assert.equal(writeWarnings().length, 1, '第一次写盘失败要告警')
+
+    // 同值再调：内存里已经是新值，但盘上还没有 → 必须再试一次写盘，不能谎报 saved:true
+    const retry = setWorkspaceDraft(rt, 'C:\\work\\b')
+    assert.deepEqual(
+      retry,
+      { workspaceDraft: 'C:\\work\\b', changed: false, saved: false },
+      '写盘失败后同值重试必须如实返回 saved:false（而不是「本次无需写盘」）',
+    )
+    assert.equal(writeWarnings().length, 2, '第二次调用必须真的重试写盘（commitBoard 又告警一次）')
+    assert.equal(existsSync(join(blocker, 'board.json')), false, '盘上确实还没有这个偏好')
+
+    // 盘恢复可写 → 同值再调会重试并真的落盘
+    rt.filePath = join(dir, 'board.json')
+    const recovered = setWorkspaceDraft(rt, 'C:\\work\\b')
+    assert.deepEqual(recovered, { workspaceDraft: 'C:\\work\\b', changed: false, saved: true })
+    const disk = JSON.parse(readFileSync(rt.filePath, 'utf8'))
+    assert.equal(disk.config.workspaceDraft, 'C:\\work\\b', '恢复可写后同值重试必须落盘')
+    assert.equal(writeWarnings().length, 2, '写盘成功不再告警')
+
+    // 落盘成功后回到幂等路径：同值再调不写盘、不 bump revision、不告警
+    const revisionBefore = rt.state.revision
+    const clean = setWorkspaceDraft(rt, 'C:\\work\\b')
+    assert.deepEqual(clean, { workspaceDraft: 'C:\\work\\b', changed: false, saved: true })
+    assert.equal(rt.state.revision, revisionBefore, '值未变（且已落盘）不 bump revision')
+    assert.equal(writeWarnings().length, 2, '无需写盘时不告警')
+  } finally {
+    console.warn = originalWarn
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('handleHttp：set-workspace-draft 端点写盘，重启后读回 + snapshot 仍带这个选择', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-http-ws-draft-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const state = createEmptyBoard()
+    addTask(state, { title: '保留任务' }, NOW)
+    const rt = fakeRuntime(state, { get: () => undefined }, filePath)
+    const envelope = (payload) =>
+      JSON.stringify({ type: 'client-request', rpcId: 'x', method: 'set-workspace-draft', payload })
+
+    const req = fakeHttpRequestWithBody({ url: '/taskboard/set-workspace-draft' }, envelope({ path: 'C:\\work\\b' }))
+    const res = fakeHttpResponse()
+    const pending = handleHttp(rt, req, res)
+    req.send()
+    await pending
+    const body = JSON.parse(res.body)
+    assert.equal(body.result.ok, true, JSON.stringify(body))
+    assert.equal(body.result.value.workspaceDraft, 'C:\\work\\b')
+    assert.equal(body.result.value.changed, true)
+    assert.equal(body.result.value.saved, true)
+
+    const disk = JSON.parse(readFileSync(filePath, 'utf8'))
+    assert.equal(disk.config.workspaceDraft, 'C:\\work\\b')
+    assert.equal(disk.tasks.length, 1, '写入偏好不得丢任务')
+
+    // 重启 Host = 重新读盘：workspaceDraft 仍在，snapshot 带上它
+    const reloaded = loadBoardFromDisk(filePath).state
+    assert.equal(normalizeConfig(reloaded.config).workspaceDraft, 'C:\\work\\b')
+    const snapshot = buildSnapshot(fakeRuntime(reloaded, { get: () => undefined }, filePath))
+    assert.equal(snapshot.config.workspaceDraft, 'C:\\work\\b')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

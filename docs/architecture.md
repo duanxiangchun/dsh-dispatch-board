@@ -370,7 +370,7 @@ worker 的 stopReason 不会覆盖它；成功回写也**不清空**它（真实
 无变化）；`tools/result` 里**不是派发结果**的事件（别的工具、失败的 `subagent` 调用）在监听器入口
 就 return，不计数——这类事件量太大，计数没有意义。
 
-### 1.9 待你处理（`needsUser`，v0.2.2 补充）
+### 1.9 待你处理（`needsUser`，v0.2.2）
 
 组长在派活 / 审核过程中遇到**必须由用户决策**的问题（选方案、确认范围、补凭据……）时，
 不应该把它塞进 `lastError`、也不应该只在聊天里问——聊天消息会被历史淹没，用户也看不到。
@@ -411,6 +411,13 @@ worker 的 stopReason 不会覆盖它；成功回写也**不清空**它（真实
 **不清空**（详情浮层能显示「最近回答」）；`needsUser:false` 只清问题相关的四个字段。
 任务进入 `archived`（`update-task {status:'archived'}` 或 `archive-done`）时**同样清问题四字段**、
 保留 `lastAnswer` / `answeredAt`——归档是终态，不该再留着「等待用户回答」的标记。
+**归档任务上不能提问（v0.2.3）**：`update-task` / `taskboard_update` 在不改 `status` 的
+patch 里设置提问（`needsUser:true`，或带 `question`）→ `conflict`「任务已归档，不能在归档任务上提问；
+请新建一条任务或先重开该任务」，校验先于任何字段写入（不写盘、不留部分修改）。原因：看板「待你处理」
+派生明确排除 `archived`（§5.1.1），问题挂上去用户永远看不到。`needsUser:false` 取消提问仍幂等成功；
+同一次调用里改 `status`（`{status:'todo', needsUser:true, question}` 重开，或 `{status:'archived', …}`
+归档优先分支）不受这条限制。归档任务落字段后宿主还会再兜底清一次问题四字段，防历史脏数据 / 其它路径
+留下会误导人的 flag。
 **归档优先**：`update-task {status:'archived', needsUser:true}` 即使漏了 `question` 也照样归档
 （跳过 needsUser / question / options 校验，标记直接清空），不返回 `bad-request`；模型漏参数不该
 让任务卡住无法归档。已归档任务再调 `answer-task` 直接 `conflict`（「任务已归档，不能再回答」），
@@ -435,7 +442,7 @@ worker 的 stopReason 不会覆盖它；成功回写也**不清空**它（真实
 {
   "version": 1,
   "nextId": 12,                 // 单调递增，任务 id = "t-<n>"
-  "revision": 37,               // 每次写盘 +1（client 可用它做增量判断）
+  "revision": 37,               // 每次 commitBoard +1（写盘失败那次也已 +1，只是没落盘；见下文「revision 口径」）
   "updatedAt": "2026-11-11T02:00:00.000Z",
   "config": {
     "pollEnabled": true,
@@ -447,7 +454,10 @@ worker 的 stopReason 不会覆盖它；成功回写也**不清空**它（真实
     "mainSessionTitle": "",       // 主会话展示标题（≤200 字符，可为空串）
     "workspaceLeads": {           // 工作区 key → 常驻组长映射；最多 32 条，非法条目丢弃
       "ws-1": { "sessionId": "…", "title": "…", "cwd": "C:\\work\\demo", "createdAt": "…ISO…" }
-    }
+    },
+    "workspaceFilter": "",        // v0.2.3：看板「工作区」过滤选择（工作区路径；"" = 全部工作区，默认）
+    "workspaceDraft": ""          // v0.2.3：平台看板「新建行 → 任务所属工作区」选择
+                                  // （工作区路径；"" = 未选择，提交保持禁用）
   },
   "tasks": [
     {
@@ -484,6 +494,13 @@ worker 的 stopReason 不会覆盖它；成功回写也**不清空**它（真实
 }
 ```
 
+**`revision` 口径**：`commitBoard()`（`lib/index.js` 导出）**先** `revision + 1`、刷新 `updatedAt`，**再**尝试写盘；
+写盘失败不抛错、也**不**回滚这次 `+1`（内存仍是真源，只是没落盘）。所以准确说法是「**每次 `commitBoard` +1**」，
+不是「每次成功写盘 +1」。`set-workspace-filter` / `set-workspace-draft` 写盘失败后同值重试仍会再调
+`commitBoard`、`revision` 再 +1（§3.3）；只有「值未变且已落盘」的幂等路径不调用 `commitBoard`，`revision` 才不变。
+Client 不拿它做增量渲染，只作快照字段透传；`reloadBoardIfStale` 用「盘上 revision > 内存 revision」判断是否
+采用盘上状态（§3.2 / §5）。
+
 **`config` 规范化（`normalizeConfig`，v0.2.0 新增字段）：**
 
 - `dispatchMode`：合法值 `'workspace-lead' | 'new' | 'creator' | 'auto'`；缺省或非法 → `'workspace-lead'`。
@@ -497,6 +514,15 @@ worker 的 stopReason 不会覆盖它；成功回写也**不清空**它（真实
     对象键顺序**末尾的旧条目**（新写入的映射必须保留）。不能反过来把新映射截掉，否则下一次
     `normalizeConfig` 会丢掉它、tick 每轮重复创建组长。
 - 旧字段（`pollEnabled` / `pollIntervalMs` / `maxNotifications`）行为不变。
+- `workspaceFilter`（v0.2.3）：平台看板「工作区」过滤选择的持久化值，`''` = 全部工作区（默认）。
+  只接受 trim 后非空、长度 ≤ **1024** 的字符串；非字符串 / 全空白 / 超长一律归一化为 `''`，**不抛错**
+  （UI 偏好坏值只回退默认，不该让看板白屏）。写入走 `set-workspace-filter`（§3.1）；是否仍指向现存
+  工作区由 Client 用 `snapshot.workspaces` 判定（§5.1.1 第 3 条，`resolveWorkspaceSelection`）。
+- `workspaceDraft`（**v0.2.3**）：平台看板**新建行**「任务所属工作区」下拉的持久化值，
+  `''` = 未选择（= 首次打开时的默认，提交按钮保持禁用）。归一化规则与 `workspaceFilter` 完全相同
+  （同一个 `normalizeWorkspaceSelection`：trim、≤ 1024、坏值 → `''`，**不抛错**），但**独立一个字段**——
+  两个下拉各自记忆、互不串值（改过滤器不会改新建行的选择，反之亦然）。写入走 `set-workspace-draft`
+  （§3.1）；是否仍指向现存工作区同样由 Client 用 `snapshot.workspaces` 判定（§5.1.1 第 2 条）。
 
 **任务字段 `reportedAt`**：完成回执记账（§1.6）。`null` = 未推送；离开 `done` 后再次 done 必为 `null`（§1.6）。
 它不是 `taskboard_update` / `update-task` 的可 patch 字段，只由宿主维护；出现在 `board.json`、
@@ -530,6 +556,8 @@ needsTouched 分支读它）；正常由 `taskboard_update` 工具自动填当�
 `questionOptions` 才更新/保留。任务进入 `archived` 时清问题四字段（保留 `lastAnswer` /
 `answeredAt`），且**归档优先**：`{status:'archived', needsUser:true}` 即使漏 `question` 也照样归档，
 跳过 needsUser / question / options 校验。
+**`status='archived'` 的任务上不能新设提问**（v0.2.3）：不改 `status` 却设置 `needsUser:true` /
+`question` → `conflict`，不写盘；`needsUser:false` 仍幂等清字段（§1.9）。
 `Snapshot.tasks` 与 `board.json` 都带这些字段；`taskBrief()` 只暴露 `needsUser` / `question` /
 `questionOptions`（§4.4），`askedBy` / `lastAnswer` / `answeredAt` 不进模型工具输出。
 
@@ -602,7 +630,7 @@ Content-Type: application/json
 | --- | --- | --- | --- |
 | `snapshot` | `{}` | `Snapshot` | 全量看板 + 运行时状态，client 每 2s 轮一次 |
 | `add-task` | `{title, note?, sessionId?, cwd?, needsUser?, question?, questionOptions?, askedBy?}` | `{task}` | 新建到 `todo`，`source='user'`；右栏传 `sessionId`（宿主解析 cwd），平台看板传 `cwd`（用户选的工作区）。v0.2.2 起也接受可选的 `needsUser` / `question` / `questionOptions`（宿主 / 测试建「待你处理」任务用；UI 新建行不传），`askedBy` 可显式指定提问会话（仅与 `needsUser:true` / `question` 同传时生效） |
-| `update-task` | `{id, status?, title?, note?, result?, assignee?, lastError?, needsUser?, question?, questionOptions?, askedBy?}` | `{task}` | 局部更新；非法状态迁移 → `conflict`；`needsUser:true` 缺 `question` → `bad-request`；只传 `questionOptions` 不带 `question` / `needsUser:true` → `bad-request`；重设 `question` 不带 `questionOptions` → 清空旧选项；`askedBy` 仅在同时设置 `question` / `needsUser:true` 时生效；校验全部在写字段之前完成（失败不留部分修改）；`status:'archived'` **优先**：跳过 needsUser / question / options 校验并清问题四字段（§1.9） |
+| `update-task` | `{id, status?, title?, note?, result?, assignee?, lastError?, needsUser?, question?, questionOptions?, askedBy?}` | `{task}` | 局部更新；非法状态迁移 → `conflict`；`needsUser:true` 缺 `question` → `bad-request`；只传 `questionOptions` 不带 `question` / `needsUser:true` → `bad-request`；重设 `question` 不带 `questionOptions` → 清空旧选项；`askedBy` 仅在同时设置 `question` / `needsUser:true` 时生效；校验全部在写字段之前完成（失败不留部分修改）；`status:'archived'` **优先**：跳过 needsUser / question / options 校验并清问题四字段（§1.9）；任务已归档且本次**没有**同时改 `status` 时设置提问（`needsUser:true` 或带 `question`）→ `conflict`（v0.2.3，§1.9） |
 | `answer-task` | `{id, answer}` | `{task, sessionId}` | **v0.2.2**：回答 `needsUser` 问题（§1.9）。`answer` 非空 ≤1000；任务已归档 → `conflict`（「任务已归档，不能再回答」，不投递、不写回答）；目标会话按 `dispatchedSessionId` → `askedBy` → `sessionId` 依次尝试（跳过已归档 / 不在线的候选）；followup + `sessions.flush` 成功后清标记并写 `lastAnswer` / `answeredAt`；全部候选不可用 → `conflict`（错误信息列出尝试过的会话），失败**保留**标记与问题，任务 `lastError` 写原因 |
 | `delete-task` | `{id}` | `{deleted:true,id}` | 物理删除（仅限 UI 手动） |
 | `dispatch-now` | `{id}` | `{dispatched, sessionId, task}` | 立即投递一次（不等轮询、无视冷却）；路由按当前 `dispatchMode` |
@@ -610,6 +638,8 @@ Content-Type: application/json
 | `archive-done` | `{}` | `{archived:n}` | 一键把全部 `done` 归档 |
 | `bind-main-session` | `{sessionId}` | `{main: MainSessionRef}` | **v0.2.0**：把会话绑定为主会话（完成回执收件人），持久化 `config.mainSessionId` / `mainSessionTitle` |
 | `clear-main-session` | `{}` | `{ok:true}` | **v0.2.0**：解除主会话绑定（幂等，未绑定也成功） |
+| `set-workspace-filter` | `{path}` | `{workspaceFilter, changed, saved}` | **v0.2.3**：记住平台看板「工作区」过滤选择（§5.1.1 第 3 条）。`path` = 工作区路径，`''` = 全部工作区；归一化见 §2（坏值 → `''`，不报错）。写前 `reloadBoardIfStale` 对齐盘上状态、只改 `config.workspaceFilter` 一个字段（**合并写**保留任务 / 组长映射 / 主会话绑定）；值未变且上次已落盘 → 不写盘（`changed:false, saved:true`）；写盘失败只 `console.warn`，仍返回成功（`saved:false`，UI 不受影响）；**写失败后同值重试仍会重试写盘**（`changed:false` + 真实 `saved`，见 §3.3） |
+| `set-workspace-draft` | `{path}` | `{workspaceDraft, changed, saved}` | **v0.2.3**：记住平台看板**新建行**「任务所属工作区」选择（§5.1.1 第 2 条）。`path` = 工作区路径，`''` = 未选择；归一化与写入语义与 `set-workspace-filter` 完全一致（坏值 → `''`、合并写到 `config.workspaceDraft`、值未变不写盘、写失败 `saved:false`、写失败后同值重试仍会重试写盘），但只动 `workspaceDraft` 一个字段——与 `workspaceFilter` **互不影响** |
 | `ensure-workspace-lead` | `{cwd}` | `{lead: LeadRef}` | **v0.2.0**：确保 `cwd` 所属工作区有可用常驻组长（复用 → 唤醒 → 必要时创建并修复映射） |
 | `session-info` | `{sessionId}` | `{sessionId, cwd}` | 给 client 兜底：冷会话（历史会话）不在 `agents[]` 里时也能拿到工作区，用于提示文案 |
 | `upload-attachment` | `{dataUrl, name?}` | `{id, ref, mime, size, name?}` | **v0.2.0**：粘贴图片上传。`dataUrl` = `data:image/<png\|jpeg\|webp\|gif>;base64,…`（解码后 ≤5 MB）；返回随机 id 与短引用 `attachment://<uuid>`（note 只存这个引用，§2.1） |
@@ -669,7 +699,9 @@ LeadRef        = { key: string, cwd: string, sessionId: string, title: string, l
     "mainSessionTitle": "",
     "workspaceLeads": {                     // 工作区 key → 常驻组长映射（≤32 条）
       "<key>": { "sessionId": "…", "title": "…", "cwd": "C:\\work\\demo", "createdAt": "…ISO…" }
-    }
+    },
+    "workspaceFilter": "",                  // v0.2.3：看板「工作区」过滤选择（"" = 全部工作区）
+    "workspaceDraft": ""                    // v0.2.3：新建行「任务所属工作区」选择（"" = 未选择）
   },
   "tasks": [ Task… ],                       // 全部状态，client 自己分组
   "poll": {
@@ -752,7 +784,7 @@ LeadRef        = { key: string, cwd: string, sessionId: string, title: string, l
 | --- | --- |
 | `bad-request` | 信封/端点/字段不合法（title 空、status 不在枚举、id 不存在时的格式错） |
 | `not-found` | `id` 不存在 |
-| `conflict` | 状态迁移非法 / 标题重复 / 并发 revision 冲突 |
+| `conflict` | 状态迁移非法 / 标题重复 / 并发 revision 冲突 / 在归档任务上提问（§1.9） |
 | `internal` | 读写盘、未知异常 |
 
 v0.2.0 新增端点的错误分支：
@@ -780,7 +812,37 @@ v0.2.0 新增端点的错误分支：
   （都已归档 / `agents.get` 与 `sessionController.resolveAgent` 都拿不到 live Agent / 三个字段都为空）
   → `conflict`，错误信息列出尝试过的会话；followup / `sessions.flush` 抛错 → `internal`。
   **候选不可用与投递失败这两种情况都保留标记**、把原因写进任务 `lastError`（用户可以重试）。
+- `update-task` / `taskboard_update`（v0.2.3，§1.9）：目标任务 `status='archived'` 且 patch
+  **没有**同时改 `status`，却试图设置提问（`needsUser:true` 或带 `question`）→ `conflict`（「任务已归档，
+  不能在归档任务上提问；请新建一条任务或先重开该任务」），校验先于任何字段写入、不写盘；
+  `needsUser:false`（取消提问）在归档任务上仍幂等成功；`{status:'archived', …}` 归档优先分支不受影响。
 - `dispatch-now` 指向 `needsUser === true` 的任务 → `conflict`（等用户回答；回答后自动恢复派发）。
+- `set-workspace-filter`（v0.2.3，§3.1）：**无错误分支**——`path` 非字符串 / 全空白 / 超长一律
+  归一化为 `''`（全部工作区）并返回成功；写盘失败也只 `console.warn`（`saved:false`），
+  RPC 仍是成功响应（UI 偏好是 best-effort，不该弹错误条）。
+- `set-workspace-draft`（**v0.2.3**，§3.1）：**无错误分支**——与 `set-workspace-filter` 同口径：
+  `path` 非字符串 / 全空白 / 超长一律归一化为 `''`（未选择）并返回成功；写盘失败只 `console.warn`
+  （`saved:false`），RPC 仍是成功响应。
+- **`set-workspace-filter` / `set-workspace-draft` 的 `{changed, saved}` 最终语义**（**v0.2.3**，
+  t-67 加固；两个端点完全一致）：
+  - `changed` = **本次调用是否改变了内存里的 `config[field]`**。值未变 → `false`（同值重试重写盘时也是
+    `false`，因为它描述的是值、不是这次有没有碰盘）。
+  - `saved` = **本次调用结束时该偏好是否已落盘**：本次写盘成功 → `true`；值未变且上次写盘成功
+    （本次无需写盘）→ `true`；写盘失败 → `false`。
+  - **`saved:false` 会被记住**（Host 进程内存级，`WeakMap<state, Set<field>>`，**不写进 `board.json`**）：
+    写盘失败后内存里已经是新值，同值再调**不会**因为「内存值没变」而谎报 `{changed:false, saved:true}`，
+    而是**再试一次写盘**并返回真实的 `saved`——仍失败 → 仍 `saved:false`；盘恢复可写 → 落盘并
+    `saved:true`（此时 `changed:false`）。写成功即清除标记，之后同值调用回到「无需写盘、不 bump
+    revision」的幂等路径（值未变且已落盘时**不**调用 `commitBoard`，`revision` 不变）。注意别把
+    「不 bump」推广到失败路径：`revision` 随**每次 `commitBoard`** +1，而 `commitBoard` 是**先** +1
+    **再**尝试写盘——写盘失败那次也已经 +1（只是没落盘，§2）。因此上面「同值重试 → 仍失败」的路径
+    每调一次 `revision` 就再 +1 一次，只有幂等路径才完全不 bump。
+  - 自愈路径：`reloadBoardIfStale` 若替换了 `rt.state`，旧 state 上的标记随 `WeakMap` 自然失效，
+    新 state 的 `config[field]` 回到盘上旧值，下一次调用走正常「值不同 → 写盘」分支；不需要人工清理。
+    其它路径成功整份写盘（如 `add-task`）后标记会保守保留：最多多一次冗余重写，不丢数据、不误报
+    `saved:true`。
+  - 缺省字段（`board.json` 里没有该键）经 `normalizeConfig` 归一化后等于请求值（`''`）时按「已落盘」
+    处理——盘上的**有效值**与请求值一致，不需要写。
 - 工具 `taskboard_add` 的 `workspace` 解析失败是**工具调用错误**（不是 RPC 错误码），错误文本 `未知工作区：<入参>`。
 
 ---
@@ -829,7 +891,7 @@ ctx.effect(() => ctx.webServer.register({
 | --- | --- | --- |
 | `taskboard_list` | `{status?}` | 返回文本清单（id / 状态 / 标题 / 备注 / assignee / result / 待回答的问题）+ 结构化 `tasks[]`；v0.2.2 起 `tasks[]` 额外带 `needsUser` / `question` / `questionOptions` |
 | `taskboard_add` | `{title, note?, workspace?}` | 新建任务（`source='agent'`，`sessionId=exec.agent.session.id`）；`workspace` v0.2.0 新增，见下 |
-| `taskboard_update` | `{id, status?, result?, assignee?, note?, needsUser?, question?, questionOptions?}` | 更新任务；`status` 非法迁移返回错误文本；v0.2.2 起 `needsUser:true` + `question` 用来「问用户」（§1.9），`needsUser:false` 取消提问，`askedBy` 取 `exec.agent.session.id`（工具不暴露该参数；RPC 层单独传 `askedBy` 也不生效，见 §2） |
+| `taskboard_update` | `{id, status?, result?, assignee?, note?, needsUser?, question?, questionOptions?}` | 更新任务；`status` 非法迁移返回错误文本；v0.2.2 起 `needsUser:true` + `question` 用来「问用户」（§1.9），`needsUser:false` 取消提问，`askedBy` 取 `exec.agent.session.id`（工具不暴露该参数；RPC 层单独传 `askedBy` 也不生效，见 §2）；任务已归档且未同时改 `status` 时设置 `needsUser:true` / `question` → 工具报 `conflict`（不写盘，§1.9） |
 
 **`taskboard_add.workspace`（v0.2.0，可选）**：工作区 id / 名称 / 绝对路径，用于主会话往任意工作区派任务。
 
@@ -967,15 +1029,29 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 2. **新建行**：标题输入（Enter 提交）+ 备注展开 + **工作区选择（必选）**：
    下拉 `placeholder = 选择工作区`，options 来自 `snapshot.workspaces`（title，空则路径尾段）；
    未选时「添加到待开始」禁用并提示「先选择任务所属的工作区」。提交 `add-task {title, note?, cwd: 工作区 path}`。
+   **选择会被记住（v0.2.3）**：切换后立即 `set-workspace-draft {path}` 持久化到
+   `board.json` 的 `config.workspaceDraft`（§3.1）。打开看板（刷新页面 / 去别的会话再点回来 / 重启 Host）
+   用 `snapshot.config.workspaceDraft` 恢复，判定与过滤器同一纯函数
+   `resolveWorkspaceSelection(stored, snapshot.workspaces)`：命中 → 选中注册表规范路径；
+   字段缺失 / 脏值 / 工作区被删或改名 → 回退 `选择工作区` 占位、提交保持禁用（不把无效值当选中项）；
+   `snapshot.workspaces` 还没就绪（返回 `null`）→ 等下一条 snapshot 再判定。
+   与第 3 条的过滤器**各自独立记忆、互不串值**（两个下拉分别写 `workspaceDraft` / `workspaceFilter`）。
    **粘贴图片（v0.2.0）**：与右栏看板同一套逻辑——备注 `textarea` 的 `paste` 事件识别 `image/*` →
    `upload-attachment` → note 追加短引用 `![image](attachment://<uuid>)` + 缩略图列表；普通文本粘贴不拦截。
    上传前先按 `file.size` 预检单图 ≤5 MB（超限直接提示、**不发请求**）；`uploading` 是**计数**，
    连续粘贴时计数 > 0，提交按钮与标题 Enter 都不提交；提交前统计 note 里不同引用数，> 8 时给具体提示
    （与服务端文案同源，§2.1）。提交时 note 只带短引用，`cwd` 仍必选。
-3. **工作区过滤**：`全部工作区`（默认）/ 单个工作区——只影响显示。
+3. **工作区过滤**：`全部工作区`（默认）/ 单个工作区——只影响显示；**选择会被记住**（v0.2.3）。
+   切换后立即 `set-workspace-filter {path}` 持久化到 `board.json` 的 `config.workspaceFilter`（§3.1）。
+   打开看板时用 `snapshot.config.workspaceFilter` 恢复，Client 纯函数
+   `resolveWorkspaceSelection(stored, snapshot.workspaces)`：命中当前工作区（`samePath` 归一化比较）→
+   选中注册表里的规范路径；字段缺失 / 脏值 → `全部工作区`；工作区列表为空（注册表还没就绪）→
+   `null`，等下一条 snapshot 再判定；持久化路径已不在列表里（工作区被删 / 改名）→ 回退 `全部工作区`，
+   **不把无效值当选中项**。写失败只 `console.warn`，不影响看板显示。
 4. **四列看板**：复用 `Col`（宽度足够时四列）；卡片只显示标题 + 操作按钮（t-33 起，
    工作区 / 备注 / 结论 / 时间 / 组长 / 执行者都在详情浮层）；`cwd=null` 的老任务也显示（详情里工作区为空）。
    **未归档的 `needsUser` 任务不在四列里重复显示**（见下一条）；已归档的 flagged 任务照常留在「已归档」列。
+   但**不要挂在归档任务上提问**：Host 会拒绝（`conflict`，§1.9），归档任务上的历史残留 flag 在更新 / 读盘时清除。
 5. **「待你处理」第五列（v0.2.2，§1.9）**：有 flagged 任务时在「待开始」**之前**插入第五列
    `待你处理 N`（`.tb-board[data-needs="true"]` 五列网格，`.tb-col[data-status="needsUser"]`）；
    没有 flagged 任务时**整列不渲染**（仍是四列）。列内卡片（`.tb-needs-card`）显示
@@ -1177,12 +1253,21 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
      **不要**为了记录再手动 `taskboard_add` 一条（会与自动任务重复）。只有真正需要另立任务（别的后续安排、
      跨工作区拆分记账）才用 `taskboard_add`。注意自动收尾**只对宿主自动建的任务生效**：轮询投递来的任务
      （`autoDispatch` 为 `null`）始终由组长 `taskboard_update` 写回 `done` / 打回 `doing`。
-  7. v0.2.2 补充（需要用户决策时）：**不要**把问题写进 `lastError`、也不要只在聊天里问。改用
+  7. v0.2.2（需要用户决策时）：**不要**把问题写进 `lastError`、也不要只在聊天里问。改用
      `taskboard_update {id, needsUser:true, question:"…", questionOptions?:["A","B"]}` 在任务上提一个
      具体问题（`question` ≤500 字、选项 ≤4 个 / 每个 ≤80 字），任务 `status` 保持原样；
      看板会把这条任务提到「待你处理」（§1.9），用户回答后宿主把回答 followup 给你，你继续原任务。
      任务已 `done` 又被用户打回、或发现验收标准需要用户确认时同样适用。`lastError` 只写故障原因
      （派发失败 / 组长不可用 / worker 异常），**不写提问**。
+  8. v0.2.3 补充（提问与审核的三条硬规则，`presets/taskboard.patch.yml` persona 同步）：
+     - **提问前先看 status**：归档（`archived`）是终态，看板「待你处理」不显示归档任务；Host 现在会
+       直接返回 `conflict`（§1.9）。任务已完成 / 已归档但还需要用户拍板 → 用 `taskboard_add` 新建一条
+       `todo` 任务（标题写清要确认什么），再在新任务上 `needsUser:true` 提问。
+     - **问题写进看板，聊天只留一句指路**：question / questionOptions / 背景全部写进 `question` 与 `note`；
+       对用户的说明只写「已在看板提问 t-XX」，不要把问题正文只放在聊天或 `lastError` 里。
+     - **审核结论必须落看板**：直聊派活的任务由宿主自动置 `done`，组长审核后仍要用
+       `taskboard_update {id, result:"…"}` 把审核结论写回该任务；写不进去就 `taskboard_add` 新建一条
+       记录任务，不能只留在聊天里。
 - 不在预设里写死 `agentOptions.provider/model`（可移植性）：子 Agent 继承主 Agent 路由。
 - 已知坑（都已在 patch 里修掉，改预设时别踩）：`dsh-plan-mode` 的 `section` 必填；
   `dsh-tool-todo` 的 `allowParallelInProgress` 必填；`tool-subagent` 的 `persona/toolFilter/backgroundMode`
@@ -1242,6 +1327,23 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
     重试可成功。Host 单测覆盖字段规范化 / 缺 question 拒绝 / tick 跳过 / 清 flag 后可派发 /
     answer-task 成功与两类失败 / answer 空与超长；Client 单测覆盖「待你处理」条与第五列的渲染、
     不在普通列、回答调用与成功清空、错误提示、两处角标。
+13. 工作区过滤持久化（v0.2.3，§5.1.1 第 3 条）：平台看板切到工作区 B → 刷新页面 → 过滤器仍是 B；
+    重启 Host 进程 → 仍是 B；切回「全部工作区」或工作区 A → 刷新 → 仍是它。
+    `board.json` 的 `config.workspaceFilter` 在每次切换后立即变化（B 的路径 / `""` / A 的路径），
+    且同一次写盘**不丢**任务、`workspaceLeads`、`mainSessionId` 等字段。手工把 `workspaceFilter`
+    改成不存在的路径（伪造工作区 id / 路径）→ 看板正常打开、过滤器回退「全部工作区」、控制台无报错。
+    `node --test` 覆盖 `normalizeWorkspaceSelection`（有效路径 / 空串 / 非字符串 / 超长）、
+    `setWorkspaceFilter`（合并写 / 幂等不 bump revision / 写盘失败只告警）、
+    `resolveWorkspaceSelection`（有效值命中 / 脏值回退 / 「全部」空串 / 字段缺失 / 列表未就绪）。
+14. 新建行「任务所属工作区」持久化（**v0.2.3**，§5.1.1 第 2 条）：平台看板在新建行选中
+    工作区 B → `board.json` 的 `config.workspaceDraft` 立即变成 B（同一次写盘不丢 `workspaceFilter` /
+    任务 / `workspaceLeads` / `mainSessionId`）→ 去别的会话再点回「任务看板」（组件重新挂载）→ 下拉仍是 B、
+    「添加到待开始」可用 → 刷新页面 / 重启 Host → 仍是 B。切回 `选择工作区` 占位 → `workspaceDraft`
+    变回 `""`、提交重新禁用；切到工作区 A → 过滤器**不受影响**（两个下拉互不串值，反之亦然）。
+    手工把 `workspaceDraft` 改成不存在的路径 → 看板正常打开、下拉回退占位、提交禁用、控制台无
+    `console.error`。`node --test` 覆盖 `normalizeConfig.workspaceDraft`、`setWorkspaceDraft`
+    （合并写 / 幂等 / 空串 / 写盘失败 / 与 `setWorkspaceFilter` 互不影响）、`set-workspace-draft` 端点
+    落盘 + 重启读回，以及 PlatformBoard 渲染层「恢复选中 / 切换写盘 / 失效回退占位 + 提交禁用」。
 
 ---
 
@@ -1509,3 +1611,87 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   - 测试与文档：`node --test` 218/0（+29 条 host / client / render 回归）；§1.2 / §1.4 / §1.9 / §2 /
     §3.1 / §3.3 / §4.4 / §5.1 / §5.1.1 / §5.2 / §5.3 / §6 / §7 与 `presets/taskboard.patch.yml`
     组长 persona 同步。
+- v0.2.3（工作区过滤选择持久化）：左侧栏「任务看板（全部工作区）」的工作区过滤器原先不持久化，
+  每次打开都回到「全部工作区」。现在切换后**立即**走新 RPC `set-workspace-filter {path}` 写入
+  `board.json` 的 `config.workspaceFilter`（工作区路径；`''` = 全部工作区；归一化见 §2），
+  下次打开（刷新页面 / 重开 Harness / 重启 Host）用 `snapshot.config.workspaceFilter` 恢复选择；
+  持久化路径已不在 `snapshot.workspaces` 里（工作区被删 / 改名）时回退「全部工作区」，
+  **不把无效值当选中项**；字段缺失 / 脏数据 / 工作区列表未就绪都不会抛错或白屏。
+  Host 写入是**合并写**（写前 `reloadBoardIfStale` 对齐盘上状态，只改这一个字段，任务 / 组长映射 /
+  主会话绑定都保留），值未变不写盘，写盘失败只 `console.warn`（响应 `saved:false`，UI 不受影响）。
+  Client 新增纯函数 `resolveWorkspaceSelection(stored, workspaces)`（返回 `null` = 工作区列表未就绪，
+  等下一条 snapshot 再判定），平台看板首次 snapshot 到达后恢复、用户手动切换后不再被覆盖。
+  `node --test` **228 pass / 0 fail**（v0.2.2 基线 218，+10：host 7 / client 1 / render 2）。
+  §2 / §3.1 / §3.3 / §3.2 / §5.1.1 / §7 同步；`package.json` 版本号不在本任务里 bump（发布流程统一处理）。
+- v0.2.3（归档任务禁止承载提问 + 组长口径固化）：修复真实事故——组长在一条**已归档**
+  任务上 `taskboard_update {id, needsUser:true, question}`，Host 静默成功，但看板「待你处理」派生明确
+  排除 `archived`，问题永远不会被用户看到；同时组长的「审核结论」在直聊派活（宿主自动置 done）场景
+  没有写回看板的固定动作。
+  - Host（`applyTaskUpdate`）：目标任务 `status='archived'` 且本次 patch **没有**同时改 `status`，却设置
+    提问（`needsUser:true` 或带 `question`）→ `conflict`「任务已归档，不能在归档任务上提问；请新建一条
+    任务或先重开该任务」，**校验先于任何字段写入**（不写盘、不留部分修改）。`needsUser:false`（取消提问）
+    在归档任务上仍幂等成功；`{status:'archived', …}` 归档优先分支不回归；同一次调用里重开 + 提问允许。
+    落字段后对 `archived` 任务再兜底清问题四字段，防历史脏数据 / 其它路径留下会误导人的 flag。
+  - 测试：`test/host.test.mjs` 新增 8 条——归档任务上提问 `conflict` 且 `board.json` 零改动、只给
+    `question` / 只给 `needsUser:true`、归档优先不回归、取消提问幂等且不动其它字段、归档任务历史脏 flag
+    被清理、`todo` / `doing` 正常提问不回归、归档任务同一次调用重开 + 提问、`taskboard_update` 工具路径
+    `conflict` 且不 commit；本次改动 **+8 host 用例全绿**（落地时全量 **236 pass / 0 fail**，基线 228）。
+  - 组长口径：`presets/taskboard.patch.yml` 组长 persona 增加三条硬规则（提问前先看 status；问题写进
+    看板、聊天只留一句指路；审核结论必须落看板）；`AGENTS.md` 新增「看板工作流约定（组长 / worker 必读）」
+    一节；§1.9 / §2 / §3.1 / §3.3 / §5.1.1 / §6 同步。`package.json` 版本号不在本任务里 bump
+    （发布流程统一处理）。
+- v0.2.3（新建行「任务所属工作区」选择持久化，t-65）：用户报告「左侧菜单去别的会话、再点
+  『任务看板』，之前选的工作区被清理掉」。根因是平台看板**新建行**的「任务所属工作区」下拉只存在
+  React 组件本地 state（`lib/client.js` 的 `const [workspaceCwd, setWorkspaceCwd] = useState('')`），
+  主视图切到会话时 `main` 槽位卸载、组件重新挂载后 state 回到 `''`（= `选择工作区` 占位），
+  提交按钮重新被禁用，也没有任何持久化介质。顶部「工作区」过滤器（t-60 / `config.workspaceFilter`）
+  已经持久化，所以本次只补新建行这一路，且**两个下拉各自独立记忆**。
+  - 协议（§2 / §3.1 / §3.2 / §3.3）：`config` 增加 `workspaceDraft`（工作区路径；`''` = 未选择），
+    归一化复用 `normalizeWorkspaceSelection`（trim / ≤1024 / 坏值 → `''`，不抛错）；新增 RPC
+    `set-workspace-draft {path}` → `{workspaceDraft, changed, saved}`，语义与 `set-workspace-filter` 一致
+    （`reloadBoardIfStale` 后**合并写**只改这一个字段、值未变不写盘、写盘失败只 `console.warn` 且
+    `saved:false`），**无错误分支**。
+  - Host（`lib/index.js`）：`createEmptyBoard().config.workspaceDraft=''`、`normalizeConfig` 归一化、
+    导出 `setWorkspaceDraft(rt, raw)`（与 `setWorkspaceFilter` 共用内部 `writeWorkspacePreference`
+    合并写助手），`dispatchRpc` 增加 `set-workspace-draft` 分支；`snapshot.config.workspaceDraft` 随
+    `normalizeConfig` 透出，无需改 `buildSnapshot`。
+  - Client（`lib/client.js`）：PlatformBoard 首次 snapshot 到达后用
+    `resolveWorkspaceSelection(snapshot.config.workspaceDraft, snapshot.workspaces)` 恢复新建行选择
+    （列表未就绪 `null` → 等下一轮；`''` / 脏值 / 工作区被删 → 占位），用户手动切换后不再被 snapshot
+    覆盖；切换即 `set-workspace-draft`；渲染与提交都用校验后的 `activeWorkspaceCwd`（被删的工作区
+    不会留在选中态，`add-task` 也不会带一个已不存在的 cwd）。
+  - 测试：`test/host.test.mjs` 覆盖 `normalizeConfig.workspaceDraft`（缺省 / 合法 / 脏值 / 与其它字段
+    互不影响）、`setWorkspaceDraft`（合并写保留任务 / 主会话 / 组长映射 / `workspaceFilter`、幂等不
+    bump revision、空串、写盘失败 `saved:false`、与 `setWorkspaceFilter` 互不串值）、
+    `set-workspace-draft` 端点落盘 + 重新读盘 + snapshot（+5 条）；
+    `test/client-render.test.mjs` 覆盖「恢复持久化选择并可直接提交」「切换即写盘（含回到占位）」
+    「失效工作区回退占位 + 提交禁用 + 不抛错」「两个下拉互不串值」「组件卸载后重新挂载（= 去别的会话
+    再点回看板）仍恢复上次选择并可提交」（+4 条）。
+    `node --test` **245 pass / 0 fail**（基线 236，+9：host 5 / render 4）。
+    `package.json` 版本号不在本任务里 bump。
+- v0.2.3（工作区偏好持久化的 `saved` 语义修正 + 测试加固，t-67）：`writeWorkspacePreference`
+  写盘失败后内存里已是新值，旧实现下一次**同值**调用命中「内存值没变」直接返回
+  `{changed:false, saved:true}`，而盘上并没有该字段——`saved:true` 在撒谎。
+  - Host（`lib/index.js`）：模块级 `WeakMap<state, Set<field>>`（`dirtyWorkspacePrefs`）记住
+    「该字段上次写盘失败 / 尚未落盘」，写成功清除、写失败登记；值没变但标记为脏时**仍重试写盘**，
+    返回 `changed:false` + 真实 `saved`（仍失败 → `saved:false`；盘恢复可写 → 落盘并 `saved:true`）。
+    标记只在进程内存、**不进 `board.json`**；`reloadBoardIfStale` 替换 `rt.state` 后旧标记自然失效
+    （新 state 的字段回到盘上旧值，下次调用走正常写盘分支）。值未变且已落盘时行为不变：不写盘、
+    不 bump `revision`；写失败仍只 `console.warn`、不抛错。
+  - 文档（§3.1 / §3.3）：两个端点的 `{changed, saved}` 最终语义写进 §3.3（含「`saved:false` 会记忆、
+    同值重试会重试写盘」与自愈路径）；并校准 §2 / §3.3 的 `revision` 口径——随**每次 `commitBoard`**
+    +1，写盘失败那次也已 +1（只是没落盘），只有「值未变且已落盘」的幂等路径不 bump。
+  - 测试：`test/host.test.mjs` 新增「写盘失败 → 同值再调 → 仍 `saved:false` 且确实重试写盘（`console.warn`
+    再次触发）→ 盘恢复可写后落盘 → 干净后同值调用不再 bump revision」1 条；既有 `setWorkspaceDraft`
+    写失败用例补 `console.warn` 断言（`[taskboard] 看板写盘失败：…`）。
+    `test/client-render.test.mjs` 新增「用户选 B 之后才返回的旧 snapshot（`config.workspaceDraft` = A）
+    不得覆盖选择」1 条（覆盖 `draftTouchedRef` / `draftRestoredRef` 恢复守卫——两者由用户切换同时置位，
+    用例断言旧 snapshot 确实落地（工作区选项 / 任务正常更新）但选择仍是 B）；原「去别的会话再点回
+    看板」用例改为**真正卸载**（执行组件 effect cleanup）后再挂载，名字与内容一致。
+    `node --test` **247 pass / 0 fail**（基线 245，+2：host 1 / render 1）。
+    `package.json` 版本号不在本任务里 bump。
+- v0.2.3（发布汇总）：发布工作区偏好持久化（`config.workspaceFilter` / `config.workspaceDraft` 两个字段 +
+  `set-workspace-filter` / `set-workspace-draft` 两个 RPC）、归档任务禁止承载提问（`conflict`）+ 组长口径
+  固化（`presets/taskboard.patch.yml` persona / `AGENTS.md` 看板工作流约定）、写盘 `saved` 语义修正与
+  恢复守卫 / 竞态测试加固。`node --test` **247 pass / 0 fail**（v0.2.2 基线 218，+29：host 21 /
+  client 1 / render 7）；§1.9 / §2 / §3.1 / §3.3 / §5.1.1 / §6 / §7 同步。
