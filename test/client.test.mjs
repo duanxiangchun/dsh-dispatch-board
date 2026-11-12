@@ -494,6 +494,32 @@ test('v0.2.3：resolveWorkspaceSelection 恢复工作区过滤选择（有效 / 
   assert.equal(helpers.resolveWorkspaceSelection('', []), '')
 })
 
+test('v0.2.4：taskWorkspaceLabel 优先工作区 title、回退目录名、空 cwd 用 — 占位', () => {
+  const { exported } = loadClient()
+  const helpers = exported.__test
+  const workspaces = [
+    { id: 'w1', path: 'C:\\work\\a', title: '工作区 A' },
+    { id: 'w2', path: 'C:\\work\\b', title: '' },
+  ]
+
+  // 命中 snapshot.workspaces → 用工作区 title（斜杠 / 尾斜杠 / 大小写按 samePath 归一化）
+  assert.equal(helpers.taskWorkspaceLabel(workspaces, { cwd: 'C:\\work\\a' }), '工作区 A')
+  assert.equal(helpers.taskWorkspaceLabel(workspaces, { cwd: 'c:/work/a/' }), '工作区 A')
+
+  // title 为空 / cwd 没注册到 snapshot.workspaces → 回退路径尾段（与下拉选项同一规则）
+  assert.equal(helpers.taskWorkspaceLabel(workspaces, { cwd: 'C:\\work\\b' }), 'b')
+  assert.equal(helpers.taskWorkspaceLabel(workspaces, { cwd: 'C:\\work\\ghost' }), 'ghost')
+  assert.equal(helpers.taskWorkspaceLabel(null, { cwd: 'C:\\work\\ghost' }), 'ghost')
+
+  // cwd 为空 / 非字符串 / 任务缺失 → 「—」占位：不抛错、不出现 undefined
+  for (const task of [{ cwd: '' }, { cwd: null }, { cwd: 42 }, {}, null, undefined]) {
+    const label = helpers.taskWorkspaceLabel(workspaces, task)
+    assert.equal(label, helpers.workspaceLabelNone)
+    assert.equal(label, '—', '空 cwd 用破折号占位')
+    assert.ok(!String(label).includes('undefined'))
+  }
+})
+
 test('v0.2.2 待你处理：needsUserTasks 排除归档、askedAt 最旧优先，withoutNeedsUser 去掉 flagged', () => {
   const { exported } = loadClient()
   const helpers = exported.__test

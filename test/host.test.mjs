@@ -12,6 +12,8 @@ import {
   DEFAULT_DISPATCH_MODE,
   DISPATCH_MODES,
   LEAD_AUTO_MARK,
+  LEAD_DISPATCH_DEDUPE_MS,
+  LEAD_DISPATCH_INTENT_MS,
   LEAD_IN_FLIGHT_TTL_MS,
   MAX_ANSWER_CHARS,
   MAX_ATTACHMENT_BYTES,
@@ -42,6 +44,7 @@ import {
   buildSnapshot,
   buildWorkspaceLeadRefs,
   canTransition,
+  canReuseMentionedTask,
   clearMainSession,
   commitBoard,
   countAttachmentRefs,
@@ -50,9 +53,13 @@ import {
   createLeadAutoState,
   decodeImageDataUrl,
   deleteTask,
+  dispatchAbortSummary,
+  dispatchReferencedTaskId,
+  dispatchTaskIdFromPrompt,
   endpointFromUrl,
   ensureWorkspaceLead,
   findLeadInFlightTask,
+  findPendingDispatchCard,
   findTask,
   findTaskByWorker,
   firstDispatchLine,
@@ -77,12 +84,16 @@ import {
   normalizeQuestionOptions,
   normalizeWorkspaceLeads,
   normalizeWorkspaceSelection,
+  noteLeadDispatchIntent,
   notifyCooldownMs,
   listWorkspaces,
   readAttachment,
   registerLeadAutoHooks,
+  registerLeadDispatchGate,
+  releasePreparedDispatch,
   requeueTasksOfLead,
   parseRpcEnvelope,
+  prepareLeadDispatch,
   pruneArchivedTasks,
   putWorkspaceLead,
   registerTools,
@@ -101,6 +112,7 @@ import {
   sniffImageMime,
   subagentPromptText,
   taskBrief,
+  taskById,
   tick,
   truncateNote,
   workspaceIdForCwd,
@@ -3115,6 +3127,7 @@ test('snapshot exposes the leadAuto runtime counters', () => {
     assert.equal(snapshot.leadAuto.lastError, 'boom')
     assert.equal(snapshot.leadAuto.lastTaskId, 't-9')
     assert.equal(snapshot.leadAuto.lastErrorAt, null)
+    assert.equal(snapshot.leadAuto.aborted, 0, '0.2.4：老 runtime 没有 aborted → 0')
 
     // 没有 leadAuto 的老 runtime 也要能出快照；normalizeLeadAuto 对缺字段给出默认值。
     const legacy = fakeRuntime(state, ctx, join(dir, 'board.json'))
@@ -3126,6 +3139,7 @@ test('snapshot exposes the leadAuto runtime counters', () => {
       deduped: 0,
       completed: 0,
       skipped: 0,
+      aborted: 0,
       lastError: '',
       lastErrorAt: null,
       lastTaskId: null,
@@ -3136,6 +3150,809 @@ test('snapshot exposes the leadAuto runtime counters', () => {
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+/* ══════════════════════════════════════════════════════════════
+ * v0.2.4§1.8：派发前强制建卡（无卡不得派发）
+ *
+ * 背景：t-69 直聊派活时看板没有出现卡片——旧的 tools/result 挂钩只看
+ * 「组长名下有没有未陈旧的轮询任务」，把第二次直聊派发误判成那条任务的 worker。
+ * 新实现把建卡提前到 tools/pre-execute（worker 启动之前），并按「显式任务 id /
+ * 组长置 doing 的意图 / 同参数预建卡片」认领，认领不到就建卡，建卡失败直接拒绝派发。
+ * ══════════════════════════════════════════════════════════════ */
+
+/** 模拟「轮询投递到组长」的进行中任务（deliverBoardTask 之后的状态）。 */
+function deliveredPolledTask(state, now = NOW, overrides = {}) {
+  const task = addTask(state, { title: overrides.title || '轮询投递的任务', cwd: overrides.cwd || 'C:\\work\\demo' }, now)
+  task.status = 'doing'
+  task.startedAt = new Date(now).toISOString()
+  task.updatedAt = new Date(now).toISOString()
+  task.dispatchedSessionId = overrides.dispatchedSessionId || 'lead-1'
+  task.dispatchedSessionTitle = 'demo 组长'
+  task.notifiedAt = new Date(now).toISOString()
+  task.notificationCount = 1
+  return task
+}
+
+test('taskboard_update from a lead records the dispatch intent used by the next gate call', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-tool-intent-'))
+  try {
+    const state = createEmptyBoard()
+    const polled = deliveredPolledTask(state, NOW, { title: '轮询任务' })
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const registered = []
+    registerTools({ tools: { register: (definition) => registered.push(definition) } }, rt)
+    const updateTool = registered.find((tool) => tool.name === 'taskboard_update')
+
+    // 组长收到投递后的固定动作：taskboard_update 置 doing（真实工具路径，exec.agent = 组长）。
+    await updateTool.execute({ id: polled.id, status: 'doing', assignee: 'taskboard-worker' }, { agent: lead })
+    assert.equal(rt.leadDispatchIntent instanceof Map, true)
+    const intent = rt.leadDispatchIntent.get('lead-1')
+    assert.equal(intent.taskId, 't-1')
+    assert.equal(Number.isFinite(intent.at), true)
+
+    // 随后的 subagent prompt 只提到标题（没有「任务 id：」行）→ 闸门靠意图认领，不重复建卡。
+    const outcome = prepareLeadDispatch(
+      rt,
+      { agent: lead, exec: { name: 'subagent', agent: lead }, args: { description: '轮询任务的 worker', prompt: '处理「轮询任务」这条看板任务' } },
+      NOW + 1000,
+    )
+    assert.equal(outcome.created, false)
+    assert.equal(outcome.reused, 'lead-intent')
+    assert.equal(outcome.taskId, 't-1')
+    assert.equal(state.tasks.length, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('dispatchTaskIdFromPrompt only accepts an explicit 任务 id line', () => {
+  assert.equal(dispatchTaskIdFromPrompt('## 任务\n- 任务 id：`t-68`\n- 标题：x'), 't-68')
+  assert.equal(dispatchTaskIdFromPrompt('任务 id: t-9'), 't-9')
+  assert.equal(dispatchTaskIdFromPrompt('  * 任务ID：`t-12`'), 't-12')
+  assert.equal(dispatchTaskIdFromPrompt('对看板任务 `t-65` 的实现做取证验收'), '', '正文顺带提到不算')
+  assert.equal(dispatchTaskIdFromPrompt('任务 id 是 t-3'), '', '不是行首「任务 id：」不算')
+  assert.equal(dispatchTaskIdFromPrompt(''), '')
+  assert.equal(dispatchTaskIdFromPrompt(null), '')
+
+  // 0.2.4：组长直聊/手动建卡后常用「看板任务：t-N」引用卡片（实测 t-70 prompt 就是这种写法）。
+  assert.equal(dispatchReferencedTaskId('看板任务：**t-70「派发任务强制创建看板卡片」**'), 't-70')
+  assert.equal(dispatchReferencedTaskId('对看板任务 `t-65` 的实现做取证验收'), 't-65')
+  assert.equal(dispatchReferencedTaskId('## 任务\n- 任务 id：`t-68`'), '', '严格「任务 id：」由 dispatchTaskIdFromPrompt 负责')
+  assert.equal(dispatchReferencedTaskId('全局看板看不出任务属于哪个工作区'), '')
+  assert.equal(dispatchReferencedTaskId(null), '')
+})
+
+test('dispatchTaskIdFromPrompt tolerates markdown emphasis / backticks / half-width colons (t-78 incident)', () => {
+  // t-78 事故：组长把 prompt 写成 `**任务 id：t-78**`，旧正则要求行首直接是「任务」或「- 任务」，
+  // `**` 不在「列表符号 + 空格」形态里 → 整行匹配失败 → 没复用 t-78，另建了重复卡 t-79。
+  const cases = [
+    ['**任务 id：t-78**', 't-78', '加粗'],
+    ['任务 id：t-78', 't-78', '全角冒号'],
+    ['`任务 id：t-78`', 't-78', '整行反引号'],
+    ['__任务 id：t-78__', 't-78', '下划线强调'],
+    ['任务 id: t-78', 't-78', '半角冒号'],
+    ['任务ID：t-78', 't-78', '没有空格'],
+    ['任务 ID : t-78', 't-78', '大写 ID + 冒号前空格'],
+    ['任务　id：t-78', 't-78', '全角空格'],
+    ['任务  id :  t-78', 't-78', '行内多余空格'],
+    ['  **任务 id：t-78**  ', 't-78', '两端缩进'],
+    ['- **任务 id：t-78**', 't-78', '行首列表符号 + 加粗'],
+    ['  * `任务 id：t-78`', 't-78', '缩进 + 星号列表 + 反引号'],
+    ['+ 任务 id：t-78', 't-78', '加号列表'],
+    ['1. 任务 id：t-78', 't-78', '有序列表'],
+    ['> __任务 ID：t-78__', 't-78', '引用块'],
+    ['## 任务\n- **任务 id：`t-68`**\n- 标题：x', 't-68', '混在文档结构里'],
+    ['- 任务 id：t-81「看板对话按钮修复（t-71）」', 't-81', '标题里提到别的 t-N 不算第二个 id'],
+  ]
+  for (const [prompt, expected, label] of cases) {
+    assert.equal(dispatchTaskIdFromPrompt(prompt), expected, label + '：' + JSON.stringify(prompt))
+  }
+})
+
+test('dispatchTaskIdFromPrompt stays strict: prose / multiple ids / empty ids are not dispatch targets', () => {
+  const rejects = [
+    '上次那个 t-3 任务要返工', // 正文顺带提到
+    '见 t-7',
+    '对看板任务 `t-65` 的实现做取证验收',
+    '任务 id 是 t-3', // 不是「任务 id：」标签行
+    '任务 id：',
+    '任务 id：t-',
+    '任务 id：t-3 或 t-4', // 同一行两个 id = 归属不明
+    '任务 id：t-3、t-4',
+    '- 任务 id：t-3 / t-4',
+    '**任务 id：t-3 与 t-4**',
+    '看板任务：t-3',
+    '',
+    null,
+  ]
+  for (const prompt of rejects) {
+    assert.equal(dispatchTaskIdFromPrompt(prompt), '', '不该解析出 id：' + JSON.stringify(prompt))
+  }
+})
+
+test('dispatchReferencedTaskId tolerates markdown variants incl. 看板任务：**任务 id：t-N** (t-78 incident)', () => {
+  const cases = [
+    ['看板任务：t-78', 't-78', '普通全角冒号'],
+    ['看板任务: t-78', 't-78', '半角冒号'],
+    ['**看板任务：t-78**', 't-78', '整行加粗'],
+    ['看板任务：`t-78`', 't-78', '反引号'],
+    ['__看板任务：t-78__', 't-78', '下划线强调'],
+    ['看板任务 : **t-1**', 't-1', '冒号前后空格'],
+    // t-78 事故原话：第一行是正文，`任务 id` 夹在「看板任务：**…**」里。
+    ['看板任务：**任务 id：t-78**「发版前文档收尾：README 卡片描述 / §9 计数」', 't-78', '事故行'],
+    [
+      '你是 dsh-taskboard 仓库的 worker 子 Agent。看板任务：**任务 id：t-78**「发版前文档收尾」。工作目录：`C:\\work\\demo`。',
+      't-78',
+      '事故 prompt 第一行',
+    ],
+    ['看板任务：任务 ID：t-78', 't-78', '大写 ID'],
+  ]
+  for (const [prompt, expected, label] of cases) {
+    assert.equal(dispatchReferencedTaskId(prompt), expected, label + '：' + JSON.stringify(prompt))
+  }
+  const rejects = ['看板任务：', '看板任务：标题里提到 t-3 但没写卡号', '看板任务：见 t-7']
+  for (const prompt of rejects) {
+    assert.equal(dispatchReferencedTaskId(prompt), '', '不该解析出 id：' + JSON.stringify(prompt))
+  }
+})
+
+test('a dispatch whose prompt bolds the 任务 id reuses the polled card instead of duplicating it (t-78 → t-79)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-bold-'))
+  try {
+    const state = createEmptyBoard()
+    const polled = deliveredPolledTask(state)
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    // 事故现场原话（t-78 的 worker prompt 第一行）：「看板任务：**任务 id：t-78**「标题」」。
+    const args = {
+      description: '发版前文档收尾',
+      prompt:
+        '你是 dsh-taskboard 仓库的 worker 子 Agent。看板任务：**任务 id：t-1**「发版前文档收尾：README 卡片描述 / §9 计数」。工作目录：`C:\\work\\demo`。',
+    }
+    const exec = { callId: 'call-bold-mention', name: 'subagent', agent: lead, arguments: args }
+
+    const outcome = prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW + 20_000)
+
+    assert.equal(outcome.ok, true)
+    assert.equal(outcome.created, false, '已存在的 t-1 必须被复用（否则就是 t-79 那样的重复卡）')
+    assert.equal(outcome.reused, 'task-id-mention')
+    assert.equal(outcome.taskId, 't-1')
+    assert.equal(state.tasks.length, 1, '任务数不增')
+    assert.equal(polled.assignee, '', '闸门阶段不改轮询任务的字段')
+    assert.equal(rt.leadAuto.created, 0)
+    assert.equal(rt.leadAuto.deduped, 1)
+
+    // tools/result：worker 会话 id 挂到原卡上，依旧只有一张卡。
+    const attached = handleSubagentDispatch(rt, { agent: lead, childId: 'worker-bold', args, exec }, NOW + 20_001)
+    assert.equal(attached.reason, 'prepared')
+    assert.equal(attached.taskId, 't-1')
+    assert.equal(state.tasks.length, 1)
+    assert.equal(polled.assignee, 'worker-bold')
+    assert.equal(polled.autoDispatch, null, '轮询任务保持 null：subagent/end 绝不自动置 done')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a dispatch with a bolded 任务 id line reuses the polled card (explicit task-id path)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-bold-explicit-'))
+  try {
+    const state = createEmptyBoard()
+    const polled = deliveredPolledTask(state)
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = { description: '轮询任务的 worker', prompt: '## 任务\n- **任务 id：`t-1`**\n- 标题：轮询投递的任务' }
+    const exec = { callId: 'call-bold-explicit', name: 'subagent', agent: lead, arguments: args }
+
+    const outcome = prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW + 30_000)
+
+    assert.equal(outcome.ok, true)
+    assert.equal(outcome.created, false, '加粗的任务 id 行也要认领原卡')
+    assert.equal(outcome.reused, 'task-id')
+    assert.equal(outcome.taskId, 't-1')
+    assert.equal(state.tasks.length, 1, '任务数不增')
+    assert.equal(polled.status, 'doing')
+    assert.equal(rt.leadAuto.created, 0)
+
+    // 反例对照：正文顺带提到 t-1 的派发不认领原卡（严格性没被这次宽容化破坏）。
+    const otherRt = fakeRuntime(state, ctx, join(dir, 'other.json'))
+    otherRt.leadAuto = createLeadAutoState()
+    const prose = { description: '验证 t-1', prompt: '对 t-1 的实现做取证验收，顺便看看 t-2' }
+    const proseOutcome = prepareLeadDispatch(
+      otherRt,
+      { agent: lead, exec: { callId: 'call-prose', name: 'subagent', agent: lead }, args: prose },
+      NOW + 30_001,
+    )
+    assert.equal(proseOutcome.created, true, '正文提到 id 的验证派发有自己的卡片，不抢 t-1')
+    assert.equal(state.tasks.length, 2)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a dispatch that names a pending card (看板任务：t-N) reuses it instead of duplicating', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-mention-'))
+  try {
+    const state = createEmptyBoard()
+    // 组长直聊时先手动建了一条 todo 卡片（t-70 场景），随后 subagent 的 prompt 写成「看板任务：t-1」。
+    addTask(state, { title: '手动建的直聊卡', cwd: 'C:\\work\\demo' }, NOW)
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = { description: '直聊派活', prompt: '你是 worker。\n\n看板任务：**t-1「手动建的直聊卡」**' }
+
+    const outcome = prepareLeadDispatch(rt, { agent: lead, exec: { name: 'subagent', agent: lead }, args }, NOW + 1)
+    assert.equal(outcome.ok, true)
+    assert.equal(outcome.created, false)
+    assert.equal(outcome.reused, 'task-id-mention')
+    assert.equal(outcome.taskId, 't-1')
+    assert.equal(state.tasks.length, 1, '已有卡片不重复建（t-70 手动卡场景）')
+
+    // 已经挂了真实 worker 会话 id 的卡不被「看板任务」引用认领：验证子 Agent / 第二个 worker 有自己的卡。
+    const busyState = createEmptyBoard()
+    const busy = deliveredPolledTask(busyState)
+    busy.assignee = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
+    const busyRt = fakeRuntime(busyState, ctx, join(dir, 'busy.json'))
+    busyRt.leadAuto = createLeadAutoState()
+    const verifierArgs = { description: '验证 t-1', prompt: '对看板任务 `t-1` 的实现做取证验收' }
+    assert.equal(canReuseMentionedTask(busy), false)
+    const verifier = prepareLeadDispatch(
+      busyRt,
+      { agent: lead, exec: { name: 'subagent', agent: lead }, args: verifierArgs },
+      NOW + 2,
+    )
+    assert.equal(verifier.created, true)
+    assert.equal(busyState.tasks.length, 2)
+    assert.equal(busy.assignee, 'e2e5e228-10bc-4685-91a6-082f1ef29c8b', '原 worker 不被验证子 Agent 覆盖')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a dispatch without a card gets one before the worker starts (gate auto-create + attach)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-create-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = { description: '直聊派活', prompt: '把 X 改成 Y' }
+    const exec = { callId: 'call-1', name: 'subagent', agent: lead, arguments: args }
+
+    const outcome = prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW)
+
+    assert.equal(outcome.ok, true)
+    assert.equal(outcome.created, true, '没有卡片 → 闸门先建卡')
+    assert.equal(outcome.taskId, 't-1')
+    assert.equal(state.tasks.length, 1)
+    const task = state.tasks[0]
+    assert.equal(task.status, 'doing')
+    assert.equal(task.autoDispatch, LEAD_AUTO_MARK, '带 autoDispatch 标记：worker 结束才能自动收尾')
+    assert.equal(task.assignee, '', 'worker 还没启动：worker 会话 id 由 tools/result 阶段补')
+    assert.equal(task.title, '直聊派活')
+    assert.equal(task.note, '把 X 改成 Y')
+    assert.equal(task.cwd, 'C:\\work\\demo')
+    assert.equal(task.sessionId, 'lead-1')
+    assert.equal(task.dispatchedSessionId, 'lead-1')
+    assert.equal(task.notifiedAt, null, '自动卡片不参与轮询')
+    assert.equal(rt.leadAuto.created, 1)
+    assert.equal(rt.leadAuto.aborted, 0)
+
+    // 关键：worker 启动之前卡片已经落盘（重启 / 崩溃也不会出现「跑了但没记录」）。
+    const saved = JSON.parse(readFileSync(join(dir, 'board.json'), 'utf8'))
+    assert.equal(saved.tasks.length, 1)
+    assert.equal(saved.tasks[0].autoDispatch, LEAD_AUTO_MARK)
+    assert.equal(saved.tasks[0].status, 'doing')
+
+    // 同一次调用重复进闸门（PTC / 重试）→ 同一张卡，不重复建。
+    const again = prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW + 1)
+    assert.equal(again.taskId, 't-1')
+    assert.equal(again.reused, 'same-exec')
+    assert.equal(state.tasks.length, 1)
+    assert.equal(rt.leadAuto.created, 1)
+
+    // tools/result 阶段：只把 worker 会话 id 挂到预建卡上。
+    const attached = handleSubagentDispatch(rt, { agent: lead, childId: 'worker-1', args, exec }, NOW + 2)
+    assert.equal(attached.reason, 'prepared')
+    assert.equal(state.tasks.length, 1, '不再重复建卡')
+    assert.equal(state.tasks[0].assignee, 'worker-1')
+    assert.equal(state.tasks[0].autoDispatch, LEAD_AUTO_MARK)
+    assert.equal(rt.leadAuto.created, 1, '闸门建卡后 handleSubagentDispatch 不再计数')
+    assert.equal(rt.leadAuto.lastWorkerSessionId, 'worker-1')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a gate-created card is auto-closed when its worker completes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-done-'))
+  try {
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({ mainSessionId: null })
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = { description: '直聊派活', prompt: '把 X 改成 Y' }
+    const exec = { name: 'subagent', callId: 'call-done', agent: lead, arguments: args }
+
+    prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW)
+    handleSubagentDispatch(rt, { agent: lead, childId: 'worker-done', args, exec }, NOW + 1)
+    const outcome = await handleSubagentEnd(
+      rt,
+      {
+        runId: 'run-done',
+        provider: 'spawn',
+        id: 'worker-done',
+        local: true,
+        stopReason: 'completed',
+        lastAssistantMessage: [{ type: 'text', text: '## 结论\n\n- 已完成' }],
+      },
+      NOW + 2,
+    )
+
+    assert.equal(outcome.updated, true)
+    assert.equal(state.tasks.length, 1)
+    assert.equal(state.tasks[0].status, 'done')
+    assert.match(state.tasks[0].result, /## 结论/)
+    assert.equal(rt.leadAuto.completed, 1)
+    assert.equal(rt.leadAuto.aborted, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a dispatch with an explicit 任务 id reuses the polled card instead of duplicating it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-polled-'))
+  try {
+    const state = createEmptyBoard()
+    const polled = deliveredPolledTask(state)
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = { description: '轮询任务的 worker', prompt: '## 任务\n- 任务 id：`t-1`\n- 标题：轮询投递的任务' }
+    const exec = { callId: 'call-poll', name: 'subagent', agent: lead, arguments: args }
+
+    const outcome = prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW + 10_000)
+
+    assert.equal(outcome.ok, true)
+    assert.equal(outcome.created, false)
+    assert.equal(outcome.reused, 'task-id')
+    assert.equal(outcome.taskId, 't-1')
+    assert.equal(state.tasks.length, 1, '正常「轮询 → 组长 → worker」链路不新增卡片')
+    assert.equal(polled.assignee, '', '闸门阶段不改轮询任务的字段')
+    assert.equal(rt.leadAuto.created, 0)
+    assert.equal(rt.leadAuto.deduped, 1)
+
+    const attached = handleSubagentDispatch(rt, { agent: lead, childId: 'worker-poll', args, exec }, NOW + 10_001)
+    assert.equal(attached.reason, 'prepared')
+    assert.equal(state.tasks.length, 1)
+    assert.equal(polled.assignee, 'worker-poll', 'worker 会话 id 挂到原任务上（组长审核用）')
+    assert.equal(polled.autoDispatch, null, '轮询任务保持 null：subagent/end 绝不自动置 done')
+    assert.equal(polled.status, 'doing')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('t-69 regression: a direct-chat dispatch while another polled task is in flight still gets its own card', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-t69-'))
+  try {
+    const state = createEmptyBoard()
+    // 事故现场：t-68 已由轮询投递、正在 doing（updatedAt 刚刚），随后用户在直聊里要求派一个**新**活。
+    const polled = deliveredPolledTask(state, NOW, { title: '提交github发版吧' })
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = {
+      description: '全局看板卡片显示任务工作区',
+      prompt: '# 需求（用户原话）\n「全局的看板，看不出来这个任务是那个工作区的了」',
+    }
+    const exec = { callId: 'call-t69', name: 'subagent', agent: lead, arguments: args }
+
+    // 旧路径（只靠 tools/result、没有闸门句柄）会返回 lead-task-in-flight 并吞掉这次派发——
+    // 先断言这一点，证明下面的回归断言不是空跑（这正是 t-69 事故的机制）。
+    const legacy = handleSubagentDispatch(rt, { agent: lead, childId: 'worker-legacy', args }, NOW + 74_000)
+    assert.equal(legacy.reason, 'lead-task-in-flight')
+    assert.equal(state.tasks.length, 1, '旧路径：worker 会跑起来但看板没有新卡片')
+
+    const outcome = prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW + 75_000)
+
+    assert.equal(outcome.ok, true)
+    assert.equal(outcome.created, true, '直聊派活必须有自己的卡片，不能被 in-flight 轮询任务吞掉')
+    assert.equal(outcome.taskId, 't-2')
+    assert.equal(state.tasks.length, 2)
+    assert.equal(polled.assignee, '', '旧轮询任务不被这次派发占用 / 改写')
+    assert.equal(polled.status, 'doing')
+    const created = state.tasks[1]
+    assert.equal(created.autoDispatch, LEAD_AUTO_MARK)
+    assert.equal(created.status, 'doing')
+    assert.equal(created.title, '全局看板卡片显示任务工作区')
+
+    // 旧兜底路径（无 prepared 句柄）仍会返回 lead-task-in-flight；新链路在 tools/pre-execute
+    // 已经建好卡，tools/result 消费 prepared 句柄，绝不会走到那条判断。
+    const attached = handleSubagentDispatch(rt, { agent: lead, childId: 'worker-t69', args, exec }, NOW + 75_001)
+    assert.equal(attached.reason, 'prepared')
+    assert.equal(attached.taskId, 't-2')
+    assert.equal(polled.assignee, '')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('the lead marking a polled task doing lets exactly one following dispatch claim it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-intent-'))
+  try {
+    const state = createEmptyBoard()
+    const polled = deliveredPolledTask(state, NOW, { title: '轮询任务（prompt 没写任务 id）' })
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+
+    // 组长收到投递后的固定动作：taskboard_update 置 doing（工具执行时会记意图）。
+    assert.equal(noteLeadDispatchIntent(rt, lead, 't-1', NOW + 1), true)
+    const first = prepareLeadDispatch(
+      rt,
+      {
+        agent: lead,
+        exec: { name: 'subagent', agent: lead },
+        // prompt 指向这条任务（提到标题）但**没有**「任务 id：」行：只能靠组长置 doing 的意图认领。
+        args: { description: '轮询任务的 worker', prompt: '处理「轮询任务（prompt 没写任务 id）」这条看板任务' },
+      },
+      NOW + 2,
+    )
+    assert.equal(first.created, false)
+    assert.equal(first.reused, 'lead-intent')
+    assert.equal(first.taskId, 't-1')
+    assert.equal(state.tasks.length, 1)
+
+    // 意图是一次性的：下一次直聊派活必须新建卡片。
+    const second = prepareLeadDispatch(
+      rt,
+      { agent: lead, exec: { name: 'subagent', agent: lead }, args: { description: '直聊新活', prompt: '另一件事' } },
+      NOW + 3,
+    )
+    assert.equal(second.created, true)
+    assert.equal(second.taskId, 't-2')
+    assert.equal(state.tasks.length, 2)
+
+    // 已经挂了 worker 的任务再置 doing 不算新意图（避免把后续直聊派活并进旧任务）。
+    polled.assignee = 'worker-poll'
+    assert.equal(noteLeadDispatchIntent(rt, lead, 't-1', NOW + 4), false)
+    assert.equal(findPendingDispatchCard(state, 'lead-1', '不存在的标题', '', NOW + 5), null)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('an explicit task-id dispatch consumes the lead intent so the next direct dispatch still gets a card', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-intent-consume-'))
+  try {
+    const state = createEmptyBoard()
+    deliveredPolledTask(state, NOW, { title: '提交github发版吧' })
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+
+    // 组长置 doing（记意图）→ 立刻派 t-1 的 worker（prompt 带显式任务 id）。
+    assert.equal(noteLeadDispatchIntent(rt, lead, 't-1', NOW + 1), true)
+    const workerArgs = { description: '轮询任务的 worker', prompt: '## 任务\n- 任务 id：`t-1`\n- 标题：提交github发版吧' }
+    const worker = prepareLeadDispatch(
+      rt,
+      { agent: lead, exec: { name: 'subagent', agent: lead }, args: workerArgs },
+      NOW + 2,
+    )
+    assert.equal(worker.created, false)
+    assert.equal(worker.reused, 'task-id')
+    assert.equal(worker.taskId, 't-1')
+
+    // 随后用户在直聊里要求派新活：t-1 的意图已被消费，不能再被认领（t-69 事故的变体）。
+    const direct = prepareLeadDispatch(
+      rt,
+      { agent: lead, exec: { name: 'subagent', agent: lead }, args: { description: '全局看板工作区标签', prompt: '全局看板看不出任务属于哪个工作区' } },
+      NOW + 3,
+    )
+    assert.equal(direct.created, true)
+    assert.equal(direct.taskId, 't-2')
+    assert.equal(state.tasks.length, 2)
+    assert.equal(state.tasks[0].assignee, '', '旧轮询任务不被直聊派活占用')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('duplicate dispatch calls reuse the pending card inside the dedupe window only', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-idem-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = { description: '同一件事', prompt: '把 X 改成 Y' }
+
+    const first = prepareLeadDispatch(rt, { agent: lead, exec: { name: 'subagent', agent: lead }, args }, NOW)
+    assert.equal(first.created, true)
+    const duplicate = prepareLeadDispatch(
+      rt,
+      { agent: lead, exec: { name: 'subagent', agent: lead }, args },
+      NOW + LEAD_DISPATCH_DEDUPE_MS - 1,
+    )
+    assert.equal(duplicate.created, false)
+    assert.equal(duplicate.reused, 'pending-duplicate')
+    assert.equal(duplicate.taskId, first.taskId)
+    assert.equal(state.tasks.length, 1, '同一次派发的重复调用不重复建卡')
+
+    // 窗口外 = 真的又一次派发：允许新卡片。
+    const later = prepareLeadDispatch(
+      rt,
+      { agent: lead, exec: { name: 'subagent', agent: lead }, args },
+      NOW + LEAD_DISPATCH_DEDUPE_MS + 1,
+    )
+    assert.equal(later.created, true)
+    assert.equal(state.tasks.length, 2)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a board write failure aborts the dispatch and leaves no half-created card', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-writefail-'))
+  try {
+    const blocker = join(dir, 'blocker')
+    writeFileSync(blocker, 'not a directory', 'utf8')
+    const state = createEmptyBoard()
+    const { lead, ctx } = leadFixture()
+    // board.json 的父目录其实是个文件 → mkdirSync 抛 ENOTDIR → commitBoard 返回 saved:false。
+    const rt = fakeRuntime(state, ctx, join(blocker, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+
+    const outcome = prepareLeadDispatch(
+      rt,
+      { agent: lead, exec: { name: 'subagent', agent: lead }, args: { description: '写不进去', prompt: '干活' } },
+      NOW,
+    )
+
+    assert.equal(outcome.ok, false)
+    assert.equal(outcome.reason, 'write-failed')
+    assert.match(outcome.message, /派发已中止/)
+    assert.match(outcome.message, /看板卡片写入失败/)
+    assert.match(outcome.message, /写权限/, '错误可操作：告诉调用方怎么修')
+    assert.equal(state.tasks.length, 0, '回滚内存里的半成品卡片，不留下「有卡没落盘」')
+    assert.equal(rt.leadAuto.created, 0)
+    assert.equal(rt.leadAuto.aborted, 1)
+    assert.match(rt.leadAuto.lastError, /建卡写盘失败/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('the pre-execute gate allows normal dispatch but denies when the card cannot be persisted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-hook-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx } = leadFixture()
+    const listeners = {}
+    const onCalls = []
+    const presetOf = (session) => (session && session.header && session.header.agentPreset) || 'taskboard-dispatch'
+    const gateCtx = {
+      on: (name, listener, options) => {
+        onCalls.push({ name, options })
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'agentPresets' ? { presetForSession: presetOf } : undefined),
+    }
+    const rt = fakeRuntime(state, gateCtx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+
+    assert.equal(registerLeadDispatchGate(gateCtx, rt), true)
+    // §3.2：`leadAuto.enabled` 只反映 registerLeadAutoHooks（tools/result + subagent/end）是否注册；
+    // 闸门是独立注册，不能让它把 enabled 提前置 true（文档按此实际语义写明）。
+    assert.equal(rt.leadAuto.enabled, false)
+    assert.equal(typeof listeners['tools/pre-execute'], 'function')
+    assert.deepEqual(onCalls.map((call) => call.name), ['tools/pre-execute'])
+    assert.deepEqual(onCalls[0].options, { global: true }, '第三参必须 {global:true}，否则真机收不到事件')
+
+    // 非 subagent 工具 / 非组长预设：直接放行，不碰看板。
+    let nextCalls = 0
+    const next = async () => {
+      nextCalls += 1
+      return { kind: 'allow' }
+    }
+    assert.deepEqual(await listeners['tools/pre-execute']({ name: 'read', agent: lead, arguments: {} }, next), { kind: 'allow' })
+    assert.deepEqual(await listeners['tools/pre-execute']({ name: 'subagent', agent: { ...lead, id: 'worker-1', session: { ...lead.session, header: { ...lead.session.header, agentPreset: 'taskboard-worker' } } } }, next), { kind: 'allow' })
+    assert.equal(nextCalls, 2)
+    assert.equal(state.tasks.length, 0)
+
+    // 组长派发：闸门先建卡，再放行。
+    const args = { description: '闸门放行', prompt: '干活' }
+    assert.deepEqual(
+      await listeners['tools/pre-execute']({ name: 'subagent', callId: 'call-gate', agent: lead, arguments: args }, next),
+      { kind: 'allow' },
+    )
+    assert.equal(nextCalls, 3)
+    assert.equal(state.tasks.length, 1)
+
+    // 写盘失败：deny，next 不再被调用（worker 不会启动）。
+    const writeFailCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'agentPresets' ? { presetForSession: () => 'taskboard-dispatch' } : undefined),
+    }
+    const blocker = join(dir, 'blocker')
+    writeFileSync(blocker, 'not a directory', 'utf8')
+    const failState = createEmptyBoard()
+    const failRt = fakeRuntime(failState, writeFailCtx, join(blocker, 'board.json'))
+    failRt.leadAuto = createLeadAutoState()
+    assert.equal(registerLeadDispatchGate(writeFailCtx, failRt), true)
+    let failNext = 0
+    const decision = await listeners['tools/pre-execute'](
+      { name: 'subagent', callId: 'call-deny', agent: lead, arguments: { description: '写不进去', prompt: '干活' } },
+      async () => {
+        failNext += 1
+        return { kind: 'allow' }
+      },
+    )
+    assert.equal(decision.kind, 'deny')
+    assert.match(decision.reason, /派发已中止/)
+    assert.equal(decision.info.code, 'internal')
+    assert.equal(failNext, 0, 'deny 后工具体不执行：worker 不会启动')
+    assert.equal(failState.tasks.length, 0)
+    assert.equal(failRt.leadAuto.aborted, 1)
+
+    // 被其它策略拒绝（例如 plan mode）：闸门先建卡，tools/result 收到错误 → **不删卡**，
+    // 降级为待开始 + lastError（无法 100% 证明 worker 没启动，保守保留可见记录）。
+    assert.equal(registerLeadDispatchGate(gateCtx, rt), true)
+    registerLeadAutoHooks(gateCtx, rt)
+    assert.equal(rt.leadAuto.enabled, true, '两条观察挂钩注册成功才置 enabled')
+    const planExec = { name: 'subagent', callId: 'call-plan', agent: lead, arguments: { description: '计划模式派发', prompt: '干活' } }
+    const before = state.tasks.length
+    const planDecision = await listeners['tools/pre-execute'](planExec, async () => ({ kind: 'deny', reason: 'plan mode 禁止执行' }))
+    assert.equal(planDecision.kind, 'deny')
+    assert.equal(state.tasks.length, before + 1, '闸门先建卡（随后由 tools/result 降级）')
+    const planTaskId = state.tasks[state.tasks.length - 1].id
+    listeners['tools/result'](planExec, { isError: true, error: { message: 'plan mode 禁止执行' }, content: [] })
+    assert.equal(state.tasks.length, before + 1, '非 activation 不删卡：无法证明 worker 没启动')
+    const planTask = taskById(state, planTaskId)
+    assert.ok(planTask, '预建卡片仍在 state.tasks 里')
+    assert.equal(planTask.status, 'todo', '降级回待开始（可见记录）')
+    assert.equal(planTask.assignee, '')
+    assert.equal(planTask.autoDispatch, null, '回到 todo 后不再是宿主自动任务')
+    assert.equal(planTask.dispatchedSessionId, null, '清掉这次派发的会话字段')
+    assert.equal(planTask.dispatchedSessionTitle, '')
+    assert.match(planTask.lastError, /^派发未启动：/)
+    assert.match(planTask.lastError, /plan mode 禁止执行/)
+    assert.equal(planTask.title, '计划模式派发', '标题 / 备注保留')
+    const planSaved = JSON.parse(readFileSync(join(dir, 'board.json'), 'utf8'))
+    assert.equal(planSaved.tasks.length, before + 1, '盘上也没被删')
+    assert.equal(planSaved.tasks[planSaved.tasks.length - 1].status, 'todo')
+    assert.match(planSaved.tasks[planSaved.tasks.length - 1].lastError, /plan mode 禁止执行/)
+
+    // 非 activation（worker 未启动 / 无法确认启动）：降级预建卡片，绝不删除；复用来的轮询卡片完全不动。
+    const createState = createEmptyBoard()
+    const createRt = fakeRuntime(createState, gateCtx, join(dir, 'release.json'))
+    createRt.leadAuto = createLeadAutoState()
+    const createdExec = { name: 'subagent', callId: 'call-release', agent: lead, arguments: { description: '会被降级', prompt: '干活' } }
+    prepareLeadDispatch(createRt, { agent: lead, exec: createdExec, args: createdExec.arguments }, NOW)
+    assert.equal(createState.tasks.length, 1)
+    const released = releasePreparedDispatch(createRt, createdExec, 'post-execute block：策略拒绝', NOW + 1)
+    assert.equal(released.released, true)
+    assert.equal(released.taskId, 't-1')
+    assert.equal(createState.tasks.length, 1, '非 activation 不删卡（t-70 加固）')
+    const downgraded = createState.tasks[0]
+    assert.equal(downgraded.status, 'todo')
+    assert.equal(downgraded.assignee, '')
+    assert.equal(downgraded.autoDispatch, null)
+    assert.equal(downgraded.dispatchedSessionId, null)
+    assert.equal(downgraded.dispatchedSessionTitle, '')
+    assert.match(downgraded.lastError, /^派发未启动：post-execute block：策略拒绝/)
+    assert.equal(downgraded.title, '会被降级', '标题保留')
+    assert.equal(downgraded.note, '干活', '备注保留')
+    assert.equal(downgraded.cwd, 'C:\\work\\demo', 'cwd 保留')
+    assert.equal(createRt.leadAuto.aborted, 1)
+    const savedRelease = JSON.parse(readFileSync(join(dir, 'release.json'), 'utf8'))
+    assert.equal(savedRelease.tasks.length, 1, '卡仍在盘上')
+    assert.equal(savedRelease.tasks[0].status, 'todo')
+    assert.match(savedRelease.tasks[0].lastError, /派发未启动/)
+    // 幂等：同一 exec 重复消费 / 重复降级 → 不动任务、不重复计数。
+    const again = releasePreparedDispatch(createRt, createdExec, '再来一次', NOW + 2)
+    assert.equal(again.released, false)
+    assert.equal(again.reason, 'no-prepared')
+    assert.equal(createState.tasks.length, 1)
+    assert.equal(createRt.leadAuto.aborted, 1, '降级只做一次')
+
+    const reuseState = createEmptyBoard()
+    const polled = deliveredPolledTask(reuseState)
+    const reuseRt = fakeRuntime(reuseState, gateCtx, join(dir, 'reuse.json'))
+    reuseRt.leadAuto = createLeadAutoState()
+    const reuseArgs = { description: '轮询任务的 worker', prompt: '## 任务\n- 任务 id：`t-1`' }
+    const reuseExec = { name: 'subagent', callId: 'call-reuse', agent: lead, arguments: reuseArgs }
+    prepareLeadDispatch(reuseRt, { agent: lead, exec: reuseExec, args: reuseArgs }, NOW)
+    const keep = releasePreparedDispatch(reuseRt, reuseExec, '取消', NOW + 1)
+    assert.equal(keep.released, false)
+    assert.equal(keep.reason, 'reused')
+    assert.equal(reuseState.tasks.length, 1)
+    assert.equal(reuseState.tasks[0].id, polled.id, '复用来的轮询卡片不属于这次派发，不能降级')
+    assert.equal(reuseState.tasks[0].status, 'doing', '轮询卡片状态完全不动')
+    assert.equal(reuseState.tasks[0].lastError, '')
+    assert.equal(reuseRt.leadAuto.aborted, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a non-activation tools/result keeps the gate card as a visible todo record (block / unknown shape)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-release-'))
+  try {
+    // 原因摘要：post-execute block 只有 content；未知 / 缺 subagentId 的 activation 形状。
+    assert.equal(
+      dispatchAbortSummary({ isError: true, content: [{ type: 'text', text: 'blocked by post-execute policy' }] }),
+      '工具调用失败：blocked by post-execute policy',
+    )
+    assert.equal(dispatchAbortSummary({ isError: false, value: { kind: 'result' } }), '工具返回不是 activation（kind=result）')
+    assert.equal(dispatchAbortSummary({ isError: false, value: { kind: 'activation', subagentId: '  ' } }), 'activation 结果缺少 subagentId')
+
+    const state = createEmptyBoard()
+    const { lead } = leadFixture()
+    const listeners = {}
+    const hookCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'agentPresets' ? { presetForSession: () => 'taskboard-dispatch' } : undefined),
+    }
+    const rt = fakeRuntime(state, hookCtx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    assert.equal(registerLeadDispatchGate(hookCtx, rt), true)
+    assert.equal(registerLeadAutoHooks(hookCtx, rt), true)
+
+    // 1) tools/post-execute 返回 block：工具体可能已执行、结果被改写成 isError，无法证明 worker 没启动。
+    const blockExec = { name: 'subagent', callId: 'call-block', agent: lead, arguments: { description: '被 post-execute 拦下', prompt: '干活' } }
+    assert.deepEqual(await listeners['tools/pre-execute'](blockExec, async () => ({ kind: 'allow' })), { kind: 'allow' })
+    assert.equal(state.tasks.length, 1)
+    listeners['tools/result'](blockExec, { isError: true, content: [{ type: 'text', text: 'blocked by post-execute policy: 需要审批' }] })
+    const blocked = state.tasks[0]
+    assert.equal(state.tasks.length, 1, 'block 也不删卡')
+    assert.equal(blocked.status, 'todo', '降级为可见的待开始记录')
+    assert.match(blocked.lastError, /^派发未启动：工具调用失败：blocked by post-execute policy/)
+    assert.equal(blocked.assignee, '')
+    assert.equal(blocked.autoDispatch, null)
+    assert.equal(rt.leadAuto.aborted, 1)
+
+    // 2) provider 返回形状变了（kind 不是 activation）→ 同样保留卡片。
+    const shapeExec = { name: 'subagent', callId: 'call-shape', agent: lead, arguments: { description: '形状未知', prompt: '干活' } }
+    assert.deepEqual(await listeners['tools/pre-execute'](shapeExec, async () => ({ kind: 'allow' })), { kind: 'allow' })
+    assert.equal(state.tasks.length, 2)
+    listeners['tools/result'](shapeExec, { isError: false, value: { kind: 'result', subagentId: 'worker-future' } })
+    const shaped = state.tasks[1]
+    assert.equal(state.tasks.length, 2, '未知形状也不删卡')
+    assert.equal(shaped.status, 'todo')
+    assert.match(shaped.lastError, /^派发未启动：工具返回不是 activation（kind=result）/)
+    assert.equal(shaped.assignee, '')
+    assert.equal(rt.leadAuto.aborted, 2)
+
+    // 3) 同一个 exec 再收到一次结果：prepared 句柄已消费 → 不重复降级 / 计数。
+    listeners['tools/result'](blockExec, { isError: true, error: { message: 'again' } })
+    assert.equal(state.tasks.length, 2)
+    assert.equal(rt.leadAuto.aborted, 2, '降级只做一次')
+
+    // 4) 落盘：两张卡都还在，且都是 todo（不是被删 / 不是 doing 悬空）。
+    const saved = JSON.parse(readFileSync(join(dir, 'board.json'), 'utf8'))
+    assert.equal(saved.tasks.length, 2)
+    assert.deepEqual(
+      saved.tasks.map((task) => task.status),
+      ['todo', 'todo'],
+    )
+    assert.match(saved.tasks[0].lastError, /blocked by post-execute policy/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
 
 /* ══════════════════════════════════════════════════════════════
  * v0.2.0 粘贴图片附件（§2.1：上传成功 / 非法 MIME / 超限 /

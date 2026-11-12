@@ -148,6 +148,14 @@ function includesText(tree, needle) {
   return textOf(tree).includes(needle)
 }
 
+/**
+ * 看板顶部的「操作反馈」横幅（notice）：Banner 渲染时带 × 关闭按钮（onClose）。
+ * fixture 默认的 preset 缺失横幅没有关闭按钮，用它区分「本次点击的提示」和常驻横幅。
+ */
+function noticeBanners(tree) {
+  return nodesWithClass(tree, 'tb-banner').filter((node) => collect(node).some((child) => hasClass(child, 'tb-banner-close')))
+}
+
 /* ══════════════════════════════════════════════════════════════
  * 组件驱动器（支持 setState 重渲染；effect 只执行一次/按 deps）
  * ══════════════════════════════════════════════════════════════ */
@@ -468,6 +476,8 @@ function createHarness(options = {}) {
   const uiWorkspaceService = options.uiWorkspace === false ? undefined : {
     openSession(sessionId) {
       openSessionCalls.push(sessionId)
+      // 让用例模拟「宿主 openSession 同步抛错」（典型：sessions.retain: unknown session <id>）。
+      if (typeof options.openSessionImpl === 'function') options.openSessionImpl(sessionId)
     },
   }
   const scopeServices = {
@@ -1208,7 +1218,7 @@ test('PlatformPanelIcon：RPC 失败时不崩、不显示角标', async () => {
  * 用例：PlatformBoard —— 全部工作区看板（左侧栏 main 页面）
  * ══════════════════════════════════════════════════════════════ */
 
-test('PlatformBoard：默认显示全部工作区任务，可按工作区过滤（卡片不再带工作区 tag）', async () => {
+test('PlatformBoard：默认显示全部工作区任务，可按工作区过滤（t-33 旧 tag 类不再复用）', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
   const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
 
@@ -1256,6 +1266,97 @@ test('PlatformBoard：默认显示全部工作区任务，可按工作区过滤�
   const filterCalls = harness.rpcCalls.filter((call) => call.endpoint === 'set-workspace-filter')
   assert.equal(filterCalls.length, 1, '切换工作区过滤必须立即写盘')
   assert.deepEqual(Object.assign({}, filterCalls[0].payload), { path: WS_A })
+})
+
+test('PlatformBoard：卡片显示一行工作区标签（title 优先 / 目录名回退 / 无 cwd 占位），右栏看板不重复显示', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+
+  // 5 条任务（2 条 A、2 条 B、1 条无 cwd）：每张卡片都有一行 .tb-card-workspace
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 5, 'all tasks render by default')
+  assert.equal(nodesWithClass(tree, 'tb-card-workspace').length, 5, '每张平台看板卡片都带工作区标签')
+
+  // cwd 命中 snapshot.workspaces → 用工作区 title（不是路径尾段）
+  const cardA = cardByTitle(tree, '梳理看板数据模型')
+  assert.ok(cardA, 'task card must render')
+  const tagA = nodesWithClass(cardA, 'tb-card-workspace')[0]
+  assert.equal(textOf(tagA), '工作区 A', '工作区 title 优先于目录名')
+  assert.equal(tagA.props.title, WS_A, '标签 title 属性兜完整工作区路径')
+  assert.equal(tagA.props['data-empty'], 'false')
+
+  // 工作区 title 为空 → 回退路径尾段 baseName(cwd)
+  const tagB = nodesWithClass(cardByTitle(tree, '实现轮询自动派发'), 'tb-card-workspace')[0]
+  assert.equal(textOf(tagB), 'b', 'title 为空时回退目录名')
+
+  // cwd 为空 → 「—」占位，不抛错、不渲染 undefined
+  const tagNone = nodesWithClass(cardByTitle(tree, '写客户端渲染冒烟测试'), 'tb-card-workspace')[0]
+  assert.equal(textOf(tagNone), '—', '无 cwd 的任务显示占位')
+  assert.equal(tagNone.props['data-empty'], 'true')
+  assert.equal(tagNone.props.title, undefined, '空 cwd 不塞空 title 属性')
+  assert.ok(!textOf(tree).includes('undefined'), '空 cwd 不得渲染 undefined')
+
+  // 位置：标题之后、操作行之前（副标题位，不挤压标题的 2 行高度）
+  assert.deepEqual(
+    cardA.children.slice(0, 3).map((node) => classOf(node)),
+    ['tb-card-title tb-card-titlebtn', 'tb-card-workspace', 'tb-card-actions'],
+    '工作区标签夹在标题与操作行之间',
+  )
+
+  // 全局看板的「待你处理」第五列同样是全局视角：它的卡片也带工作区标签
+  const needsHarness = createHarness({ snapshot: makeSnapshot({ tasks: [needsTask()] }) })
+  const needsTree = (await renderComponent(needsHarness.componentOf('main'), {})).tree
+  const needsTag = nodesWithClass(needsTree, 'tb-card-workspace')[0]
+  assert.ok(needsTag, '待你处理卡片也带工作区标签')
+  assert.equal(textOf(needsTag), '工作区 A')
+
+  // 右栏看板绑定单个工作区 → 不重复显示：卡片结构仍是「标题 + 操作按钮」
+  const rightHarness = createHarness({ snapshot: makeSnapshot() })
+  const right = await renderNarrow(rightHarness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  assert.equal(nodesWithClass(right.tree, 'tb-card-workspace').length, 0, '右栏看板不显示工作区标签')
+  for (const card of nodesWithClass(right.tree, 'tb-card')) {
+    assert.equal(card.children.length, 2, '右栏卡片仍是标题 + 操作行')
+  }
+
+  // CSS：单行不换行 + 超长省略（窄屏 / 长工作区名不撑宽卡片），基础样式与主题皮肤都有规则
+  const tagCss = clientSource.match(/\.tb-card-workspace\{[^}]*\}/)
+  assert.ok(tagCss, '.tb-card-workspace 基础规则必须存在')
+  assert.match(tagCss[0], /white-space:nowrap/, '标签单行不换行')
+  assert.match(tagCss[0], /text-overflow:ellipsis/, '超长工作区名省略，不撑破卡片')
+  assert.ok(
+    (clientSource.match(/\.tb-card-workspace\{/g) || []).length >= 2,
+    '基础样式 + Apple 皮肤都给了 .tb-card-workspace 规则',
+  )
+})
+
+test('PlatformBoard：cwd 未注册到 snapshot.workspaces 时回退目录名，空 cwd 不抛错、不出现 undefined', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      { id: 't-ghost', title: '工作区已删除的任务', status: 'todo', cwd: 'C:\\work\\ghost', updatedAt: minutesAgo(3) },
+      { id: 't-empty', title: '没有工作区的老任务', status: 'doing', cwd: '', updatedAt: minutesAgo(4) },
+      { id: 't-null', title: 'cwd 缺失的任务', status: 'done', cwd: null, updatedAt: minutesAgo(5) },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+
+  const labels = nodesWithClass(tree, 'tb-card-workspace').map((node) => textOf(node).trim())
+  assert.deepEqual(labels, ['ghost', '—', '—'], '未注册 cwd 回退目录名；空 cwd 用占位')
+
+  const ghostTag = nodesWithClass(cardByTitle(tree, '工作区已删除的任务'), 'tb-card-workspace')[0]
+  assert.equal(textOf(ghostTag), 'ghost', '未注册到 snapshot.workspaces 的 cwd 用路径尾段')
+  assert.equal(ghostTag.props.title, 'C:\\work\\ghost', '未注册工作区也能悬停看到完整路径')
+  assert.equal(ghostTag.props['data-empty'], 'false')
+
+  for (const title of ['没有工作区的老任务', 'cwd 缺失的任务']) {
+    const tag = nodesWithClass(cardByTitle(tree, title), 'tb-card-workspace')[0]
+    assert.equal(textOf(tag), '—', title + ' 用占位')
+    assert.equal(tag.props['data-empty'], 'true')
+  }
+
+  const pageText = textOf(tree)
+  assert.ok(!pageText.includes('undefined'), '空 / 未注册 cwd 都不得渲染 undefined')
+  assert.ok(!pageText.includes('null'), 'cwd 为 null 不得把 null 渲染出来')
+  assert.deepEqual(harness.sandboxErrors, [], '空 / 未注册 cwd 不能让看板抛错')
 })
 
 test('PlatformBoard：恢复持久化的「工作区」过滤选择，切换后立即写盘（含「全部」）', async () => {
@@ -2190,7 +2291,7 @@ test('详情「关联对话」：装饰过的 assignee 仍给出「执行对话�
   )
 })
 
-test('uiWorkspace 缺失：卡片「对话」/详情会话按钮点击只 warn，不抛异常', async () => {
+test('uiWorkspace 缺失：卡片「对话」/详情会话按钮点击给出明确提示（不再静默）', async () => {
   const snapshot = makeSnapshot({
     tasks: [
       { id: 'w-1', title: '有关联会话', status: 'todo', cwd: WS_A, sessionId: 'session-eeee5555', updatedAt: minutesAgo(2) },
@@ -2211,14 +2312,265 @@ test('uiWorkspace 缺失：卡片「对话」/详情会话按钮点击只 warn�
     harness.warnings.some((line) => line.includes('uiWorkspace 不可用')),
     'missing uiWorkspace must warn, got: ' + JSON.stringify(harness.warnings),
   )
+  // v0.2.4：服务缺失不再只是 console.warn —— 看板顶部必须出现用户可见的提示。
+  const afterChat = await instance.run()
+  const chatBanners = noticeBanners(afterChat)
+  assert.equal(chatBanners.length, 1, 'missing uiWorkspace must show a banner')
+  assert.ok(textOf(chatBanners[0]).includes('无法打开对话'), 'banner must say the conversation cannot open')
+  assert.ok(textOf(chatBanners[0]).includes('会话导航服务未就绪'), 'banner must name the missing navigation service')
+  assert.ok(hasClass(chatBanners[0], 'tb-banner') && chatBanners[0].props['data-tone'] === 'warn', 'banner is a warn tone')
+  assert.deepEqual(harness.sandboxErrors, [], 'missing uiWorkspace must not throw inside the board')
 
-  const opened = await openDetailByTitle(instance, tree, '有关联会话')
+  const opened = await openDetailByTitle(instance, afterChat, '有关联会话')
   const creator = detailSessionButtons(opened).find((node) => textOf(node).startsWith('发起对话'))
   assert.ok(creator)
   const warningsBefore = harness.warnings.length
   assert.doesNotThrow(() => creator.props.onClick())
   assert.ok(harness.warnings.length > warningsBefore, 'detail session button must also warn')
   assert.deepEqual(harness.openSessionCalls, [])
+  const afterDetailClick = await instance.run()
+  assert.equal(noticeBanners(afterDetailClick).length, 1, 'detail session button failure also surfaces a banner')
+  // t-71 P1：横幅必须在 .tb-detail 内部；只断言「DOM 里有个 banner」不够——顶层的会被遮罩盖住。
+  const detailPanel = detailBox(afterDetailClick)
+  assert.ok(detailPanel, 'detail overlay stays open after a failed session button')
+  const surface = nodesWithClass(detailPanel, 'tb-banner')
+  assert.equal(surface.length, 1, 'the failure banner must live inside the detail overlay')
+  assert.equal(surface[0].props['data-tone'], 'warn')
+  assert.ok(textOf(surface[0]).includes('无法打开对话'))
+})
+
+test('平台看板（main 槽位）卡片「对话」：目标可打开时调用 openSession 且用 worker 会话 id', async () => {
+  const WORKER = 'aaaaaaaa-bbbb-4ccc-8ddd-1234567890ab'
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 'm-open',
+        title: '可打开的任务',
+        status: 'done',
+        cwd: WS_A,
+        dispatchedSessionId: 'session-lead1111',
+        assignee: WORKER,
+        updatedAt: minutesAgo(2),
+      },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  const card = cardByTitle(tree, '可打开的任务')
+  assert.ok(card)
+  const chat = buttons(card).find((node) => textOf(node).trim() === '对话')
+  assert.ok(chat, 'main slot card must expose the 对话 action')
+  assert.equal(chat.props.title, WORKER, 'title carries the actual first target (worker session)')
+  chat.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, [WORKER], 'openable worker session is opened directly')
+  const next = await instance.run()
+  assert.equal(noticeBanners(next).length, 0, 'a successful jump shows no notice')
+  assert.deepEqual(harness.warnings, [])
+  assert.deepEqual(harness.sandboxErrors, [])
+})
+
+test('平台看板（main 槽位）卡片「对话」：worker 会话打不开时回退组长会话（不再是点了没反应）', async () => {
+  const WORKER = 'b60e5afa-b565-4b99-98d1-079ed5f29a5f'
+  const LEAD = 'session-lead2222'
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 'm-fallback',
+        title: 'worker 已关闭',
+        status: 'done',
+        cwd: WS_A,
+        dispatchedSessionId: LEAD,
+        assignee: WORKER,
+        updatedAt: minutesAgo(2),
+      },
+    ],
+  })
+  // 真机根因：worker 子会话在客户端解析不到 → uiWorkspace.openSession 同步抛
+  // `sessions.retain: unknown session <id>`；此刻必须回退到同任务的组长会话。
+  const harness = createHarness({
+    snapshot,
+    openSessionImpl: (sessionId) => {
+      if (sessionId === WORKER) throw new Error('sessions.retain: unknown session ' + sessionId)
+    },
+  })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  const card = cardByTitle(tree, 'worker 已关闭')
+  assert.ok(card)
+  const chat = buttons(card).find((node) => textOf(node).trim() === '对话')
+  assert.ok(chat)
+  assert.equal(chat.props.title, WORKER)
+  chat.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, [WORKER, LEAD], 'unopenable worker falls back to the lead session')
+  const next = await instance.run()
+  assert.equal(noticeBanners(next).length, 0, 'a successful fallback needs no warning banner')
+  assert.ok(
+    harness.warnings.some((line) => line.includes('跳转会话失败')),
+    'the failed worker attempt is still logged, got: ' + JSON.stringify(harness.warnings),
+  )
+  assert.deepEqual(harness.sandboxErrors, [])
+})
+
+test('平台看板（main 槽位）卡片「对话」：全部会话都打不开时出「无法打开对话」提示、不白屏', async () => {
+  const WORKER = 'deadbeef-1111-4000-8000-000000000000'
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 'm-dead',
+        title: '会话已不存在',
+        status: 'done',
+        cwd: WS_A,
+        assignee: WORKER,
+        updatedAt: minutesAgo(2),
+      },
+    ],
+  })
+  const harness = createHarness({
+    snapshot,
+    openSessionImpl: (sessionId) => {
+      throw new Error('sessions.retain: unknown session ' + sessionId)
+    },
+  })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  const card = cardByTitle(tree, '会话已不存在')
+  assert.ok(card)
+  const chat = buttons(card).find((node) => textOf(node).trim() === '对话')
+  assert.ok(chat)
+  assert.doesNotThrow(() => chat.props.onClick())
+  assert.deepEqual(harness.openSessionCalls, [WORKER])
+
+  const next = await instance.run()
+  const banners = noticeBanners(next)
+  assert.equal(banners.length, 1, 'a fully failed jump must show exactly one banner')
+  assert.equal(banners[0].props['data-tone'], 'warn')
+  assert.ok(textOf(banners[0]).includes('无法打开对话'), 'banner text must say the conversation cannot open')
+  assert.ok(textOf(banners[0]).includes('00000000'), 'banner names the target session tail, got: ' + textOf(banners[0]))
+  // 不白屏：卡片 / 看板仍在，sandbox 没有 error，控制台有诊断 warn。
+  assert.equal(nodesWithClass(next, 'tb-card').length, 1, 'board keeps rendering after a failed jump')
+  assert.deepEqual(harness.sandboxErrors, [])
+  assert.ok(harness.warnings.some((line) => line.includes('跳转会话失败')))
+})
+
+test('详情浮层会话按钮失败：提示渲染在浮层内部（不被 .tb-detail-mask 遮住），成功跳转后清掉', async () => {
+  const CREATOR = 'session-cccc3333'
+  const WORKER = 'session-worker1111'
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 'dlg-1',
+        title: '浮层会话',
+        status: 'todo',
+        cwd: WS_A,
+        sessionId: CREATOR,
+        assignee: WORKER,
+        updatedAt: minutesAgo(2),
+      },
+    ],
+  })
+  const harness = createHarness({
+    snapshot,
+    openSessionImpl: (sessionId) => {
+      if (sessionId === CREATOR) throw new Error('sessions.retain: unknown session ' + sessionId)
+    },
+  })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  const opened = await openDetailByTitle(instance, tree, '浮层会话')
+  assert.ok(detailMask(opened))
+
+  const creator = detailSessionButtons(opened).find((node) => textOf(node).startsWith('发起对话'))
+  assert.ok(creator)
+  assert.doesNotThrow(() => creator.props.onClick())
+  const afterFail = await instance.run()
+
+  // 关键（t-71 P1）：提示必须渲染在 .tb-detail 内部（与遮罩同一子树、在遮罩背景之上），
+  // 而不是只存在于看板顶层——顶层横幅会被 position:fixed;z-index:9000 的 .tb-detail-mask 盖住。
+  const box = detailBox(afterFail)
+  assert.ok(box, 'detail must stay open after a failed session jump')
+  const inDetail = nodesWithClass(box, 'tb-banner')
+  assert.equal(inDetail.length, 1, 'failure hint must render inside the detail overlay (above the mask)')
+  assert.equal(inDetail[0].props['data-tone'], 'warn')
+  assert.ok(textOf(inDetail[0]).includes('无法打开对话'), 'in-detail hint must say the conversation cannot open')
+  const notices = noticeBanners(afterFail)
+  assert.equal(notices.length, 1, 'exactly one notice banner (the in-detail one) is rendered')
+  assert.ok(
+    collect(box).includes(notices[0]),
+    'the notice banner must live inside the detail overlay (a top-level banner would be hidden behind the mask)',
+  )
+  assert.deepEqual(harness.sandboxErrors, [])
+
+  // 再点能打开的「执行对话」：成功后浮层内的旧 warn 也要消失（t-71 P2）。
+  const runner = detailSessionButtons(afterFail).find((node) => textOf(node).startsWith('执行对话'))
+  assert.ok(runner)
+  runner.props.onClick()
+  const afterOk = await instance.run()
+  const stillOpen = detailBox(afterOk)
+  assert.ok(stillOpen, 'a successful navigation still leaves the overlay mounted')
+  assert.equal(nodesWithClass(stillOpen, 'tb-banner').length, 0, 'successful jump clears the in-detail warn')
+  assert.equal(noticeBanners(afterOk).length, 0, 'successful jump leaves no session warning banner')
+  assert.deepEqual(harness.openSessionCalls, [CREATOR, WORKER])
+})
+
+test('会话跳转成功清掉旧 warn 横幅，但不误清「已归档」等其它通知', async () => {
+  const DEAD = 'deadbeef-2222-4000-8000-000000000000'
+  const ALIVE = 'session-alive999'
+  const snapshot = makeSnapshot({
+    tasks: [
+      { id: 'ok-1', title: '会话已失效', status: 'done', cwd: WS_A, assignee: DEAD, updatedAt: minutesAgo(2) },
+      { id: 'ok-2', title: '会话可打开', status: 'done', cwd: WS_A, sessionId: ALIVE, updatedAt: minutesAgo(3) },
+    ],
+  })
+  const harness = createHarness({
+    snapshot,
+    rpc: (channel, endpoint) => {
+      if (endpoint === 'archive-done') return Promise.resolve({ ok: true, value: { archived: 2 } })
+      return Promise.resolve({ ok: true, value: snapshot })
+    },
+    openSessionImpl: (sessionId) => {
+      if (sessionId === DEAD) throw new Error('sessions.retain: unknown session ' + sessionId)
+    },
+  })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  const clickChat = (title) => {
+    const card = cardByTitle(tree, title)
+    assert.ok(card, 'card must render: ' + title)
+    const chat = buttons(card).find((node) => textOf(node).trim() === '对话')
+    assert.ok(chat, 'missing 对话 button on ' + title)
+    chat.props.onClick()
+  }
+
+  // 1) 失效会话 → 顶层 warn 横幅
+  clickChat('会话已失效')
+  const afterFail = await instance.run()
+  assert.equal(noticeBanners(afterFail).length, 1, 'failed jump shows one warn banner')
+  assert.ok(textOf(noticeBanners(afterFail)[0]).includes('无法打开对话'))
+
+  // 2) 下一个会话能打开 → 旧的 session warn 必须被清掉（t-71 P2）
+  clickChat('会话可打开')
+  const afterOk = await instance.run()
+  assert.equal(noticeBanners(afterOk).length, 0, 'a successful jump clears the stale session warning')
+  assert.deepEqual(harness.openSessionCalls, [DEAD, ALIVE])
+
+  // 3) 「一键归档已完成」的 ok 通知不能被后续成功跳转误清
+  const archive = buttons(afterOk).find((node) => textOf(node).trim() === '一键归档已完成')
+  assert.ok(archive, 'platform board exposes the archive-done action')
+  archive.props.onClick()
+  await settle()
+  const afterArchive = await instance.run()
+  const okBanners = noticeBanners(afterArchive)
+  assert.equal(okBanners.length, 1, 'archive-done shows one ok banner')
+  assert.equal(okBanners[0].props['data-tone'], 'ok')
+  assert.ok(textOf(okBanners[0]).includes('已归档 2 个任务'))
+
+  clickChat('会话可打开')
+  const afterSecondOk = await instance.run()
+  const kept = noticeBanners(afterSecondOk)
+  assert.equal(kept.length, 1, 'a successful jump must not clear unrelated ok notices')
+  assert.equal(kept[0].props['data-tone'], 'ok')
+  assert.ok(textOf(kept[0]).includes('已归档 2 个任务'))
+  assert.deepEqual(harness.sandboxErrors, [])
 })
 
 /* ══════════════════════════════════════════════════════════════
