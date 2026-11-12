@@ -1,6 +1,6 @@
 {
   "name": "dsh-dispatch-board",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "DeepSeek Harness 插件：派单看板 + 派单模式。主 Agent 只拆解/派发/审核/汇报，子 Agent 干活；看板四列（待开始/进行中/已完成/已归档）由轮询自动派发，结论按 Markdown 展示。Dispatcher mode plus a dispatch board for DeepSeek Harness.",
   "type": "module",
   "main": "lib/index.js",

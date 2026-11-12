@@ -371,6 +371,59 @@ test('formatting helpers behave', () => {
   assert.equal(helpers.fmtAgo(t0, new Date(Date.now() - 3 * 3600000).toISOString(), Date.now()), '3 小时前')
 })
 
+test('v0.2.0 i18n：派发模式 / 组长条 / workspace-lead 三个 skip reason 中英齐全', () => {
+  const { exported } = loadClient()
+  const zh = exported.__test.DICT_ZH
+  const en = exported.__test.DICT_EN
+
+  // 模式选择器：值 'workspace-lead' 的文案必须是「工作区组长（推荐）」，旧三模式保留
+  assert.equal(zh['dispatch.mode.workspace-lead'], '工作区组长（推荐）')
+  assert.equal(en['dispatch.mode.workspace-lead'], 'Workspace lead (recommended)')
+  for (const mode of ['workspace-lead', 'new', 'creator', 'auto']) {
+    assert.equal(typeof zh['dispatch.mode.' + mode], 'string', 'missing zh dispatch mode: ' + mode)
+    assert.equal(typeof en['dispatch.mode.' + mode], 'string', 'missing en dispatch mode: ' + mode)
+  }
+
+  // 组长条 / 主会话绑定 / 卡片详情的组长文案
+  const keys = [
+    'lead.barLabel',
+    'lead.mainLabel',
+    'lead.mainFallback',
+    'lead.unbound',
+    'lead.bind',
+    'lead.rebind',
+    'lead.clear',
+    'lead.open',
+    'lead.wsLabel',
+    'lead.wsFallback',
+    'lead.create',
+    'lead.status.online',
+    'lead.status.busy',
+    'lead.status.offline',
+    'lead.status.missing',
+    'lead.noCurrentSession',
+    'lead.bindOk',
+    'lead.clearOk',
+    'lead.ensureOk',
+    'detail.lead',
+    'detail.noLead',
+    'poll.skip.lead-busy',
+    'poll.skip.lead-unavailable',
+    'poll.skip.lead-no-workspace',
+  ]
+  for (const key of keys) {
+    assert.equal(typeof zh[key], 'string', 'missing zh key: ' + key)
+    assert.equal(typeof en[key], 'string', 'missing en key: ' + key)
+    assert.notEqual(zh[key], '', 'empty zh value: ' + key)
+    assert.notEqual(en[key], '', 'empty en value: ' + key)
+  }
+
+  // skip reason 文案与契约 §1.5 的表一致（宿主 lastError 文案同源）
+  assert.equal(zh['poll.skip.lead-busy'], '工作区组长正在运行，等它空下来再派')
+  assert.equal(zh['poll.skip.lead-unavailable'], '工作区组长不可用：稍后重试，或在看板点「创建组长」')
+  assert.equal(zh['poll.skip.lead-no-workspace'], '无法解析任务的工作区：请从目标工作区的会话里重新加这条任务')
+})
+
 test('工作区路径纯函数：归一化 / 同路径比较 / 展示名 / 过滤', () => {
   const { exported } = loadClient()
   const helpers = exported.__test

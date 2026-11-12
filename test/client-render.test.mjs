@@ -329,6 +329,19 @@ function createHarness(options = {}) {
   }
 
   // 注意：故意不提供 AbortSignal 和 ResizeObserver（覆盖降级分支，并让 BoardTab 走窄栏）。
+  // FileReader 桩：粘贴图片用 file.dataUrl 直接返回；真实浏览器里由 FileReader 读 Blob。
+  class FileReaderStub {
+    readAsDataURL(file) {
+      const result =
+        file && typeof file.dataUrl === 'string'
+          ? file.dataUrl
+          : 'data:' + (file && file.type ? file.type : 'image/png') + ';base64,' + (file && file.base64 ? file.base64 : '')
+      Promise.resolve().then(() => {
+        this.result = result
+        if (typeof this.onload === 'function') this.onload()
+      })
+    }
+  }
   const sandbox = {
     window: fakeWindow,
     document: documentStub,
@@ -346,6 +359,7 @@ function createHarness(options = {}) {
     clearTimeout,
     setInterval,
     clearInterval,
+    FileReader: FileReaderStub,
   }
   vm.createContext(sandbox)
   vm.runInContext(clientSource, sandbox, { filename: 'lib/client.js' })
@@ -526,7 +540,16 @@ function makeSnapshot(overrides = {}) {
       revision: 1,
       boardPath: 'C:\\Users\\duan\\.dsh\\storages\\taskboard\\board.json',
       pluginVersion: '0.1.0',
-      config: { pollEnabled: true, pollIntervalMs: 15000 },
+      config: {
+        pollEnabled: true,
+        pollIntervalMs: 15000,
+        dispatchMode: 'workspace-lead', // v0.2.0 新默认
+        mainSessionId: null,
+        mainSessionTitle: '',
+        workspaceLeads: {},
+      },
+      // v0.2.0：组长 / 主会话运行时视图（revision 不变也会变）
+      leads: { main: null, workspaces: [] },
       poll: {
         lastRunAt: minutesAgo(1),
         lastDispatchAt: minutesAgo(3),
@@ -793,13 +816,24 @@ test('BoardTab（窄栏）：只显示本工作区任务，.tb-lanes + 副标题
     assert.ok(!pageText.includes(title), 'task from another workspace / no cwd must not render: ' + title)
   }
 
-  // 工作区 A 的任务字段
-  assert.ok(includesText(tree, '先定 board.json 的字段'), 'task note should render')
-  assert.ok(includesText(tree, '结论: snapshot / add-task 已通'), 'task result should render')
-  assert.ok(includesText(tree, '执行者: main'), 'task assignee should render')
-  assert.ok(includesText(tree, '已通知 3 次'), 'notificationCount should render')
-  assert.ok(includesText(tree, '5 分钟前'), 'relative time should render')
-  assert.ok(!includesText(tree, '上一次投递超时'), 'lastError belongs to a task outside this workspace')
+  // t-33：卡片正文只剩标题 + 操作按钮，note / result / 执行者 / 通知次数 / 相对时间都不再上卡片
+  assert.ok(!includesText(tree, '先定 board.json 的字段'), 'task note must not render on the card')
+  assert.ok(!includesText(tree, '结论: snapshot / add-task 已通'), 'task result must not render on the card')
+  assert.ok(!includesText(tree, '执行者: main'), 'assignee must not render on the card')
+  assert.ok(!includesText(tree, '已通知 3 次'), 'notificationCount must not render on the card')
+  assert.ok(!includesText(tree, '5 分钟前'), 'relative time must not render on the card')
+  assert.ok(!includesText(tree, '上一次投递超时'), 'lastError must not render on the card either')
+  for (const cls of ['tb-card-note', 'tb-card-result', 'tb-card-error', 'tb-card-meta', 'tb-card-tag', 'tb-card-lead']) {
+    assert.equal(nodesWithClass(tree, cls).length, 0, 'card must not render .' + cls)
+  }
+  // 每张卡片 = 标题 + 操作行，并且带等高样式类（真实高度靠 CSS，见下面的 CSS 断言）
+  for (const card of cards) {
+    assert.ok(hasClass(card, 'tb-card-fixed'), 'card must carry the equal-height class .tb-card-fixed')
+    assert.equal(card.children.length, 2, 'card body must be title + action row only')
+    assert.ok(hasClass(card.children[0], 'tb-card-titlebtn'))
+    assert.ok(hasClass(card.children[1], 'tb-card-actions'))
+    assert.equal(card.children[0].props.title, textOf(card.children[0]), 'title attribute keeps the full title')
+  }
 
   const labels = buttonTexts(tree)
   for (const label of ['开始', '立即派发', '编辑', '删除', '归档', '打回', '全部派发', '全部归档', '刷新', '暂停轮询', '添加到待开始']) {
@@ -817,14 +851,15 @@ test('BoardTab（窄栏）：只显示本工作区任务，.tb-lanes + 副标题
   const banners = nodesWithClass(tree, 'tb-banner')
   assert.equal(banners.length, 1)
   assert.equal(banners[0].props['data-tone'], 'warn')
-  assert.ok(includesText(banners[0], '没有找到「派单看板模式」'))
+  assert.ok(includesText(banners[0], '没有找到「任务看板 · 工作区组长（自动）」'))
 
   // 一次 snapshot + 一次 session-info（挂载时问工作区）；轮询走 ctx.interval
+  // （t-34：卡片不再用相对时间，30s 的 setNow 定时器已删除，只剩轮询一个 interval）
   assert.equal(countCalls(harness, 'snapshot'), 1)
   assert.equal(countCalls(harness, 'session-info'), 1)
-  assert.equal(harness.intervals.length, 2)
+  assert.equal(harness.intervals.length, 1)
   assert.equal(harness.windowCounters.setInterval, 0)
-  assert.equal(instance.cleanups.length, 3)
+  assert.equal(instance.cleanups.length, 2)
 })
 
 test('BoardTab（窄栏）：轮询状态与派发 skip 原因照常渲染', async () => {
@@ -836,6 +871,67 @@ test('BoardTab（窄栏）：轮询状态与派发 skip 原因照常渲染', asy
   assert.ok(includesText(tree, '上次派发'))
   assert.ok(includesText(tree, '主会话'), 'last dispatch prefers the session title')
   assert.ok(includesText(tree, '工作区 A'))
+})
+
+test('卡片精简（t-33）：只渲染标题 + 操作按钮，等高样式类/CSS 齐备，行内编辑不改高度', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const cards = nodesWithClass(tree, 'tb-card')
+  assert.equal(cards.length, 2)
+  for (const card of cards) {
+    // 卡片正文 = 标题 + 操作行（没有 note / result / lastError / meta）
+    assert.equal(card.children.length, 2, 'card body must be exactly title + action row')
+    const [titleNode, actionRow] = card.children
+    assert.ok(hasClass(titleNode, 'tb-card-title'), 'first child is the title')
+    assert.ok(hasClass(titleNode, 'tb-card-titlebtn'), 'title keeps the detail click handler')
+    assert.equal(titleNode.props.role, 'button', 'title stays keyboard accessible')
+    assert.equal(titleNode.props.tabIndex, 0)
+    assert.equal(titleNode.props.title, textOf(titleNode), 'title attribute keeps the full title text')
+    assert.ok(hasClass(actionRow, 'tb-card-actions'), 'second child is the action row')
+    assert.ok(buttons(actionRow).length >= 3, 'action buttons survive the trim')
+    // 等高样式类：真实高度靠 CSS（浏览器验证），这里断言类名存在
+    assert.ok(hasClass(card, 'tb-card-fixed'), 'card must carry the equal-height class')
+  }
+  for (const cls of ['tb-card-note', 'tb-card-result', 'tb-card-error', 'tb-card-meta']) {
+    assert.equal(nodesWithClass(tree, cls).length, 0, 'card must not render .' + cls)
+  }
+
+  // 等高规则：min-height + border-box + 操作行 margin-top:auto + 标题 2 行截断
+  assert.ok(clientSource.includes('.tb-card-fixed{min-height:var(--tb-card-h,108px)'), 'equal-height min-height rule')
+  assert.ok(clientSource.includes('border-radius:var(--dsw-radius-sm);min-width:0;box-sizing:border-box}'), 'card uses border-box')
+  assert.ok(clientSource.includes('.tb-card-fixed .tb-card-actions{margin-top:auto;'), 'action row pinned to the card bottom')
+  assert.ok(clientSource.includes('-webkit-line-clamp:2'), 'title clamps to two lines')
+
+  // 行内编辑态保持现状：编辑卡片没有 .tb-card-fixed，高度自适应、不受精简影响
+  const editButton = buttons(cards[0]).find((node) => textOf(node).trim() === '编辑')
+  assert.ok(editButton, 'todo card still exposes 编辑')
+  editButton.props.onClick()
+  const editingTree = await instance.run()
+  const editingCard = collect(editingTree).find(
+    (node) => hasClass(node, 'tb-card') && collect(node).some((child) => hasClass(child, 'tb-edit')),
+  )
+  assert.ok(editingCard, 'editing card must render the inline editor')
+  assert.ok(!hasClass(editingCard, 'tb-card-fixed'), 'inline editor keeps auto height')
+  assert.ok(collect(editingCard).some((node) => node.type === 'textarea'), 'note textarea still renders while editing')
+
+  // 编辑态能真的保存：改标题 → 保存 = 一次 update-task（顺带守住「保存」按钮曾引用未定义 saveEdit 的崩点）
+  const titleInput = collect(editingCard).find((node) => node.type === 'input')
+  assert.ok(titleInput, 'editing card exposes the title input')
+  titleInput.props.onChange({ target: { value: '改过的标题' } })
+  const editedTree = await instance.run()
+  const saveButton = buttons(editedTree).find((node) => textOf(node).trim() === '保存')
+  assert.ok(saveButton, 'editing card exposes 保存')
+  saveButton.props.onClick()
+  await settle()
+  const updates = harness.rpcCalls.filter((call) => call.endpoint === 'update-task')
+  assert.equal(updates.length, 1, '保存 issues exactly one update-task')
+  assert.deepEqual(Object.assign({}, updates[0].payload), {
+    id: 't-1',
+    title: '改过的标题',
+    note: '先定 board.json 的字段',
+  })
+  assert.equal(collect(await instance.run()).filter((node) => hasClass(node, 'tb-edit')).length, 0, '保存 closes the inline editor')
 })
 
 test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boardPath，且没有「派发给」选择器', async () => {
@@ -874,7 +970,10 @@ test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boar
   const modeValues = collect(dispatchSelect)
     .filter((node) => node.type === 'option')
     .map((node) => node.props.value)
-  assert.deepEqual(modeValues, ['new', 'creator', 'auto'])
+  // v0.2.0：默认 workspace-lead（工作区组长），旧三模式保留兼容
+  assert.deepEqual(modeValues, ['workspace-lead', 'new', 'creator', 'auto'])
+  assert.equal(dispatchSelect.props.value, 'workspace-lead', 'default dispatch mode is workspace-lead')
+  assert.ok(includesText(dispatchSelect, '工作区组长（推荐）'))
   assert.ok(!includesText(tree, '派发给'), 'the old per-session dispatch-target selector must be gone')
   assert.ok(includesText(tree, '加进「待开始」后由主 Agent 自动接手'), 'composer shows the auto hint')
 })
@@ -998,7 +1097,7 @@ test('PlatformPanelIcon：RPC 失败时不崩、不显示角标', async () => {
  * 用例：PlatformBoard —— 全部工作区看板（左侧栏 main 页面）
  * ══════════════════════════════════════════════════════════════ */
 
-test('PlatformBoard：默认显示全部工作区任务，卡片带工作区 tag，可按工作区过滤', async () => {
+test('PlatformBoard：默认显示全部工作区任务，可按工作区过滤（卡片不再带工作区 tag）', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
   const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
 
@@ -1015,15 +1114,14 @@ test('PlatformBoard：默认显示全部工作区任务，卡片带工作区 tag
     assert.ok(pageText.includes(title), 'missing task: ' + title)
   }
 
-  // 工作区 tag：4 条有 cwd 的任务各一个（cwd=null 的老任务不显示）
-  const workspaceTags = nodesWithClass(tree, 'tb-card-tag').filter((node) => textOf(node).includes('工作区'))
-  assert.equal(workspaceTags.length, 4)
-  assert.equal(
-    workspaceTags.map((node) => textOf(node)).sort().join('|'),
-    '工作区 a|工作区 a|工作区 b|工作区 b',
-  )
-  for (const tag of workspaceTags) {
-    assert.ok(String(tag.props.title).startsWith('C:\\work\\'), 'workspace tag title carries the full path')
+  // t-33：卡片 meta（含工作区 tag / note / result）整体移除，工作区只靠工具栏筛选和详情浮层表达
+  assert.equal(nodesWithClass(tree, 'tb-card-tag').length, 0, 'workspace tags are gone with the card meta')
+  assert.equal(nodesWithClass(tree, 'tb-card-meta').length, 0, 'card meta is gone')
+  assert.equal(nodesWithClass(tree, 'tb-card-note').length, 0, 'card note preview is gone')
+  assert.equal(nodesWithClass(tree, 'tb-card-result').length, 0, 'card result preview is gone')
+  assert.ok(!includesText(tree, '先定 board.json 的字段'), 'note must not leak into the platform board either')
+  for (const card of nodesWithClass(tree, 'tb-card')) {
+    assert.ok(hasClass(card, 'tb-card-fixed'), 'platform cards are equal height as well')
   }
 
   // 工作区过滤下拉：全部 + 两个工作区（title 为空用路径尾段）
@@ -1104,7 +1202,7 @@ test('PlatformBoard：页面结构、按钮与页脚/预设 banner', async () =>
   const banners = nodesWithClass(tree, 'tb-banner')
   assert.equal(banners.length, 1)
   assert.equal(banners[0].props['data-tone'], 'warn')
-  assert.ok(includesText(banners[0], '没有找到「派单看板模式」'))
+  assert.ok(includesText(banners[0], '没有找到「任务看板 · 工作区组长（自动）」'))
 
   // 同一工作区路径（斜杠/大小写不同）在下拉里只出现一次
   const dupHarness = createHarness({
@@ -1308,9 +1406,11 @@ test('Detail：点卡片标题打开浮层，完整展示结论/备注/执行者
 
   // 字段网格：状态在徽标里，其余分「基本信息」「时间线」两组
   const { dts, dds } = detailLabels(opened)
-  for (const label of ['工作区', '执行者', '创建来源', '派发提醒次数', '任务 id']) {
+  for (const label of ['工作区', '执行者', '创建来源', '任务 id']) {
     assert.ok(dts.includes(label), 'missing detail field label: ' + label)
   }
+  assert.ok(!dts.includes('派发提醒次数'), 'dispatch reminder count must not render as a detail field')
+  assert.ok(!detailTextAll.includes('派发提醒次数'), 'dispatch reminder count must not render anywhere in the detail overlay')
   const timelineLabels = nodesWithClass(box, 'tb-timeline-label').map((node) => textOf(node))
   assert.deepEqual(timelineLabels, ['创建时间', '最后更新', '开始时间', '完成时间', '归档时间'])
   for (const sectionLabel of ['基本信息', '时间线']) {
@@ -1319,7 +1419,6 @@ test('Detail：点卡片标题打开浮层，完整展示结论/备注/执行者
   assert.ok(!dts.includes('状态'), 'status lives in the badge, not a duplicate row')
   assert.ok(dds.includes(WS_A), 'workspace path must render')
   assert.ok(dds.includes('main-agent-1'), 'assignee must render')
-  assert.ok(dds.includes('5'), 'notification count must render')
   assert.ok(dds.includes('t-detail-1'), 'task id must render')
   // 时间线现在是紧凑条：5 项、值形如 MM-DD HH:mm，完整时间在 title 里
   const timelineValues = nodesWithClass(box, 'tb-timeline-value')
@@ -1732,6 +1831,419 @@ test('doing 兜底 C：lastDispatchTaskId 精确命中哪条，只有那条显�
   assert.equal(detailSessionButtons(otherTree).length, 0)
 })
 
+/* ══════════════════════════════════════════════════════════════
+ * 用例：v0.2.0 组长条（主会话绑定 / 工作区组长）与派发模式
+ * ══════════════════════════════════════════════════════════════ */
+
+const MAIN_SESSION = 'session-main-1111'
+const MAIN_SESSION_TITLE = '修复登录重试问题的对话'
+const LEAD_A = 'session-lead-a'
+const LEAD_B = 'session-lead-b'
+const LEAD_C = 'session-lead-c'
+
+function leadsFixture(overrides = {}) {
+  return Object.assign(
+    {
+      main: { sessionId: MAIN_SESSION, title: MAIN_SESSION_TITLE, live: true, busy: false },
+      workspaces: [
+        { key: 'w1', label: '工作区 A', cwd: WS_A, sessionId: LEAD_A, title: 'A 组长会话', live: true, busy: false },
+        { key: 'w2', label: '工作区 B', cwd: WS_B, sessionId: LEAD_B, title: 'B 组长会话', live: true, busy: true },
+        { key: 'w3', label: '工作区 C', cwd: 'C:\\work\\c', sessionId: LEAD_C, title: 'C 组长会话', live: false, busy: false },
+      ],
+    },
+    overrides,
+  )
+}
+
+/** 等异步 RPC / setState 链落稳（驱动器不 await onClick，只能靠 setImmediate 排空）。 */
+async function settle(times = 4) {
+  for (let i = 0; i < times; i += 1) await new Promise((resolve) => setImmediate(resolve))
+}
+
+function leadBar(tree) {
+  return collect(tree).find((node) => hasClass(node, 'tb-leads')) || null
+}
+
+function leadBarText(tree) {
+  const bar = leadBar(tree)
+  return bar ? textOf(bar) : ''
+}
+
+function leadCell(tree, kind, needle) {
+  const bar = leadBar(tree)
+  if (!bar) return null
+  return (
+    collect(bar).find((node) => hasClass(node, 'tb-lead-' + kind) && textOf(node).includes(needle)) || null
+  )
+}
+
+function buttonByText(container, label) {
+  return buttons(container).find((node) => textOf(node).trim() === label) || null
+}
+
+async function clickAndRun(instance, container, label) {
+  const button = buttonByText(container, label)
+  assert.ok(button, 'button must render: ' + label)
+  button.props.onClick()
+  await settle()
+  return instance.run()
+}
+
+function rpcPayload(harness, endpoint) {
+  const call = harness.rpcCalls.find((item) => item.endpoint === endpoint)
+  return call ? Object.assign({}, call.payload) : null
+}
+
+test('组长条纯函数：状态点 / 标题尾 8 / 主会话行 / 工作区行 / 任务组长文案 / 派发模式', () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const helpers = harness.exported.__test
+
+  // 派发模式：v0.2.0 缺省 / 未知值回退 workspace-lead（不回退 new）
+  assert.deepEqual(Array.from(helpers.dispatchModes), ['workspace-lead', 'new', 'creator', 'auto'])
+  assert.equal(helpers.dispatchModeOf({ dispatchMode: 'workspace-lead' }), 'workspace-lead')
+  assert.equal(helpers.dispatchModeOf({ dispatchMode: 'creator' }), 'creator')
+  assert.equal(helpers.dispatchModeOf({}), 'workspace-lead')
+  assert.equal(helpers.dispatchModeOf({ dispatchMode: 'nonsense' }), 'workspace-lead')
+  assert.equal(helpers.dispatchModeOf(null), 'workspace-lead')
+
+  // 状态点：missing / offline / busy / online
+  assert.equal(helpers.leadStatusKey(null), 'missing')
+  assert.equal(helpers.leadStatusKey({ sessionId: '' }), 'missing')
+  assert.equal(helpers.leadStatusKey({ sessionId: 's1', live: false }), 'offline')
+  assert.equal(helpers.leadStatusKey({ sessionId: 's1' }), 'offline') // 缺 live 字段按离线，不误报在线
+  assert.equal(helpers.leadStatusKey({ sessionId: 's1', live: true, busy: true }), 'busy')
+  assert.equal(helpers.leadStatusKey({ sessionId: 's1', live: true, busy: false }), 'online')
+  assert.equal(helpers.leadStatusKey({ sessionId: 's1', archived: true, live: true, busy: false }), 'archived')
+
+  // 标题尾 8：长标题取后 8 字，空串用 fallback
+  assert.equal(helpers.leadTitleTail(MAIN_SESSION_TITLE, '主会话'), MAIN_SESSION_TITLE.slice(-8))
+  assert.equal(helpers.leadTitleTail('短标题', '主会话'), '短标题')
+  assert.equal(helpers.leadTitleTail('', '主会话'), '主会话')
+  assert.equal(helpers.leadTitleTail(null, '主会话'), '主会话')
+
+  // 主会话行：未绑定 = null
+  assert.equal(helpers.leadMainRow({ main: null }), null)
+  assert.equal(helpers.leadMainRow(null), null)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(helpers.leadMainRow(leadsFixture()))),
+    { sessionId: MAIN_SESSION, title: MAIN_SESSION_TITLE, status: 'online' },
+  )
+
+  // 任务组长文案：dispatchedSessionTitle 优先，其次会话 id 尾 8，都没有为空
+  assert.equal(helpers.taskLeadLabel({ dispatchedSessionTitle: 'A 组长会话' }), 'A 组长会话')
+  assert.equal(helpers.taskLeadLabel({ dispatchedSessionId: 'session-abcdef1234' }), 'cdef1234')
+  assert.equal(helpers.taskLeadLabel({ dispatchedSessionTitle: '  ', dispatchedSessionId: 'abcd1234' }), 'abcd1234')
+  assert.equal(helpers.taskLeadLabel({}), '')
+
+  // 可见任务涉及的工作区：当前工作区优先、去重
+  assert.deepEqual(
+    Array.from(helpers.taskWorkspaceCwds([{ cwd: WS_A }, { cwd: 'c:/work/a/' }, { cwd: WS_B }], WS_A)),
+    [WS_A, WS_B],
+  )
+  assert.deepEqual(Array.from(helpers.taskWorkspaceCwds([], '')), [])
+
+  // 完整看板：列出全部；右栏：只列可见任务的 key，缺组长的补 missing 行
+  const all = JSON.parse(JSON.stringify(helpers.workspaceLeadRows(leadsFixture(), [], { all: true })))
+  assert.deepEqual(
+    all.map((row) => row.key),
+    ['w1', 'w2', 'w3'],
+  )
+  assert.deepEqual(
+    all.map((row) => row.status),
+    ['online', 'busy', 'offline'],
+  )
+  const filtered = JSON.parse(JSON.stringify(helpers.workspaceLeadRows(leadsFixture(), [WS_A], { all: false })))
+  assert.deepEqual(
+    filtered.map((row) => row.label),
+    ['工作区 A'],
+  )
+  const missing = JSON.parse(JSON.stringify(helpers.workspaceLeadRows({ workspaces: [] }, [WS_B], { all: false })))
+  assert.equal(missing.length, 1)
+  assert.equal(missing[0].status, 'missing')
+  assert.equal(missing[0].missing, true)
+  assert.equal(missing[0].label, 'b')
+  assert.equal(missing[0].cwd, WS_B)
+})
+
+test('BoardTab 组长条：未绑定主会话 + 绑定按钮 → bind-main-session{当前会话 id}', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  assert.ok(leadBar(rendered.tree), '两块看板共用的组长条必须渲染')
+  assert.ok(leadBarText(rendered.tree).includes('未绑定主会话'))
+  assert.ok(leadBarText(rendered.tree).includes('把当前对话设为主会话'))
+
+  const bind = buttonByText(leadBar(rendered.tree), '把当前对话设为主会话')
+  assert.ok(bind, 'bind button must render')
+  assert.equal(bind.props.disabled, false)
+
+  bind.props.onClick()
+  await settle()
+  assert.deepEqual(rpcPayload(harness, 'bind-main-session'), { sessionId: SESSION_A })
+  const after = await rendered.instance.run()
+  assert.ok(
+    nodesWithClass(after, 'tb-banner').some((node) => includesText(node, '已把当前对话设为主会话')),
+    'binding success must show an ok banner',
+  )
+  // 绑定成功后重新拉 snapshot
+  assert.ok(countCalls(harness, 'snapshot') >= 2)
+})
+
+test('BoardTab 组长条：bind-main-session 失败时顶部错误条，不崩', async () => {
+  const harness = createHarness({
+    rpc: (channel, endpoint, payload) => {
+      if (endpoint === 'session-info') {
+        return Promise.resolve({ ok: true, value: { sessionId: payload && payload.sessionId, cwd: null } })
+      }
+      if (endpoint === 'bind-main-session') {
+        return Promise.resolve({ ok: false, error: { code: 'bad-request', message: 'sessionId required' } })
+      }
+      return Promise.resolve({ ok: true, value: makeSnapshot() })
+    },
+  })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  const bind = buttonByText(leadBar(rendered.tree), '把当前对话设为主会话')
+  assert.ok(bind)
+  assert.doesNotThrow(() => bind.props.onClick())
+  await settle()
+  const after = await rendered.instance.run()
+  const banners = nodesWithClass(after, 'tb-banner')
+  assert.ok(
+    banners.some((node) => node.props['data-tone'] === 'error' && includesText(node, '请求不合法')),
+    'failed lead RPC must surface an error banner',
+  )
+  assert.ok(leadBar(after), 'lead bar still renders after the failed RPC')
+})
+
+test('BoardTab 组长条：拿不到当前会话 id（历史会话）时绑定按钮禁用并提示', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'))
+
+  const bind = buttonByText(leadBar(tree), '把当前对话设为主会话')
+  assert.ok(bind, 'bind button must still render')
+  assert.equal(bind.props.disabled, true, 'no session id means the bind button is disabled')
+  assert.match(String(bind.props.title), /拿不到当前会话 id/)
+  assert.ok(leadBarText(tree).includes('拿不到当前会话 id'), 'disabled hint must be visible')
+  assert.equal(countCalls(harness, 'bind-main-session'), 0)
+})
+
+test('BoardTab 组长条：已绑定主会话 → 标题尾 8 + 在线点 + 打开/换绑/解除绑定', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot({ leads: leadsFixture() }) })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const barText = leadBarText(rendered.tree)
+  assert.ok(barText.includes('主会话 · ' + MAIN_SESSION_TITLE.slice(-8)), 'main title tail must render: ' + barText)
+  const mainCell = leadCell(rendered.tree, 'main', '主会话')
+  assert.ok(mainCell, 'main led cell must render')
+  const mainDot = collect(mainCell).find((node) => hasClass(node, 'tb-lead-dot'))
+  assert.ok(mainDot)
+  assert.equal(mainDot.props['data-status'], 'online')
+  assert.ok(includesText(mainCell, '在线'))
+
+  // 打开：走 uiWorkspace.openSession(主会话 id)
+  let next = await clickAndRun(rendered.instance, mainCell, '打开')
+  assert.deepEqual(harness.openSessionCalls, [MAIN_SESSION])
+
+  // 换绑：再用当前会话 id 绑一次
+  const rebindCell = leadCell(next, 'main', '主会话')
+  await clickAndRun(rendered.instance, rebindCell, '换绑')
+  assert.deepEqual(rpcPayload(harness, 'bind-main-session'), { sessionId: SESSION_A })
+
+  // 解除绑定：clear-main-session {}
+  const clearCell = leadCell(await rendered.instance.run(), 'main', '主会话')
+  await clickAndRun(rendered.instance, clearCell, '解除绑定')
+  assert.deepEqual(rpcPayload(harness, 'clear-main-session'), {})
+})
+
+test('BoardTab 组长条：主会话/工作区组长被归档 → 已归档状态 + 可重建组长', async () => {
+  const leads = leadsFixture()
+  leads.main = { ...leads.main, archived: true }
+  leads.workspaces = leads.workspaces.map((row) => (row.key === 'w1' ? { ...row, archived: true } : row))
+  const harness = createHarness({ snapshot: makeSnapshot({ leads }) })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const barText = leadBarText(rendered.tree)
+  assert.ok(barText.includes('已归档'), 'archived main/lead must render the archived state: ' + barText)
+
+  const mainCell = leadCell(rendered.tree, 'main', '主会话')
+  assert.ok(mainCell, 'main lead cell must render')
+  const mainDot = collect(mainCell).find((node) => hasClass(node, 'tb-lead-dot'))
+  assert.equal(mainDot.props['data-status'], 'archived')
+  assert.ok(includesText(mainCell, '已归档'))
+
+  const leadCellA = leadCell(rendered.tree, 'ws', '工作区 A')
+  assert.ok(leadCellA, 'archived workspace lead cell must render')
+  await clickAndRun(rendered.instance, leadCellA, '创建组长')
+  assert.deepEqual(rpcPayload(harness, 'ensure-workspace-lead'), { cwd: WS_A })
+})
+
+test('BoardTab 组长条：工作区组长只列本看板可见任务涉及的工作区（在线/忙状态点 + 打开）', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot({ leads: leadsFixture() }) })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const barText = leadBarText(rendered.tree)
+  assert.ok(barText.includes('组长 · 工作区 A'), 'visible workspace lead must render: ' + barText)
+  assert.ok(barText.includes('在线'))
+  assert.ok(!barText.includes('工作区 B'), 'lead of another workspace must not leak into the right board')
+  assert.ok(!barText.includes('工作区 C'), 'offline lead of another workspace must not leak either')
+
+  const leadCellA = leadCell(rendered.tree, 'ws', '工作区 A')
+  assert.ok(leadCellA, 'workspace lead cell must render')
+  await clickAndRun(rendered.instance, leadCellA, '打开')
+  assert.deepEqual(harness.openSessionCalls, [LEAD_A])
+})
+
+test('BoardTab 组长条：当前工作区没有组长 → 创建组长 → ensure-workspace-lead{cwd}', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const missingCell = leadCell(rendered.tree, 'ws', '组长 · a')
+  assert.ok(missingCell, 'current workspace without a lead must render a missing row')
+  const dot = collect(missingCell).find((node) => hasClass(node, 'tb-lead-dot'))
+  assert.equal(dot.props['data-status'], 'missing')
+  assert.ok(includesText(missingCell, '未创建'))
+
+  await clickAndRun(rendered.instance, missingCell, '创建组长')
+  assert.deepEqual(rpcPayload(harness, 'ensure-workspace-lead'), { cwd: WS_A })
+  const after = await rendered.instance.run()
+  assert.ok(
+    nodesWithClass(after, 'tb-banner').some((node) => includesText(node, '已创建工作区组长')),
+    'creating a lead must confirm with an ok banner',
+  )
+})
+
+test('PlatformBoard 组长条：列出全部工作区组长（含忙/离线），主会话打开走 openSession', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot({ leads: leadsFixture() }) })
+  const rendered = await renderComponent(harness.componentOf('main'), {})
+
+  const barText = leadBarText(rendered.tree)
+  for (const label of ['组长 · 工作区 A', '组长 · 工作区 B', '组长 · 工作区 C']) {
+    assert.ok(barText.includes(label), 'missing workspace lead row: ' + label)
+  }
+  assert.ok(barText.includes('在线'))
+  assert.ok(barText.includes('忙'))
+  assert.ok(barText.includes('离线'))
+
+  const mainCell = leadCell(rendered.tree, 'main', '主会话')
+  await clickAndRun(rendered.instance, mainCell, '打开')
+  assert.deepEqual(harness.openSessionCalls, [MAIN_SESSION])
+
+  // 根作用域的平台页没有 session 绑定（还没渲染过会话 header）→ 换绑禁用
+  const rebind = buttonByText(mainCell, '换绑')
+  assert.ok(rebind)
+  assert.equal(rebind.props.disabled, true)
+})
+
+test('PlatformBoard 组长条：先渲染过会话 header 后，绑定按钮可用并带当前会话 id', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  // 会话 header 会记录「最近渲染过的对话 id」（根作用域的 main 页拿不到 session 绑定）
+  await renderComponent(harness.componentOf('conversation.session.header.actions'), { sessionId: SESSION_A })
+  const rendered = await renderComponent(harness.componentOf('main'), {})
+
+  const bind = buttonByText(leadBar(rendered.tree), '把当前对话设为主会话')
+  assert.ok(bind, 'bind button must render')
+  assert.equal(bind.props.disabled, false, 'known current session id enables binding')
+  bind.props.onClick()
+  await settle()
+  assert.deepEqual(rpcPayload(harness, 'bind-main-session'), { sessionId: SESSION_A })
+})
+
+test('PlatformBoard 组长条：没有 leads.workspaces 时不显示「创建组长」（完整看板只列已有组长）', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const rendered = await renderComponent(harness.componentOf('main'), {})
+  assert.ok(leadBar(rendered.tree))
+  assert.equal(buttonByText(leadBar(rendered.tree), '创建组长'), null)
+  assert.ok(!leadBarText(rendered.tree).includes('组长 · '))
+})
+
+test('任务卡片 / 详情：卡片只留标题 + 操作按钮，组长与执行者移到详情浮层', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 'lead-1',
+        title: '带组长信息的任务',
+        status: 'doing',
+        cwd: WS_A,
+        assignee: 'worker-42',
+        dispatchedSessionId: LEAD_A,
+        dispatchedSessionTitle: 'A 组长会话',
+        updatedAt: minutesAgo(2),
+      },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const card = cardByTitle(rendered.tree, '带组长信息的任务')
+  assert.ok(card, 'card must render')
+  // t-33：卡片正文只剩标题 + 操作按钮，组长 / 执行者不再挂在卡片上（点标题看详情）
+  assert.equal(card.children.length, 2, 'card body must be title + action row')
+  const cardText = textOf(card)
+  assert.ok(!cardText.includes('组长: '), 'lead chip must not render on the card: ' + cardText)
+  assert.ok(!cardText.includes('执行者'), 'assignee must not render on the card: ' + cardText)
+  assert.equal(buttons(card.children[1]).length, 5, 'doing card keeps 详情/完成/打回/编辑/对话')
+  assert.deepEqual(
+    buttons(card.children[1]).map((node) => textOf(node).trim()),
+    ['详情', '完成', '打回', '编辑', '对话'],
+    'action row keeps every card action',
+  )
+  assert.deepEqual(harness.openSessionCalls, [])
+
+  const opened = await openDetailByTitle(rendered.instance, rendered.tree, '带组长信息的任务')
+  const { dts, dds } = detailLabels(opened)
+  assert.ok(dts.includes('组长'), 'detail must label the lead row')
+  assert.ok(dds.includes('A 组长会话'), 'detail must show the lead title')
+  assert.ok(dds.includes('worker-42'), 'detail keeps the assignee row')
+})
+
+test('组长条：leads 变化不 bump revision 也要在轮询后更新（运行时视图）', async () => {
+  let current = makeSnapshot()
+  const harness = createHarness({
+    rpc: (channel, endpoint, payload) => {
+      if (endpoint === 'session-info') {
+        return Promise.resolve({ ok: true, value: { sessionId: payload && payload.sessionId, cwd: null } })
+      }
+      return Promise.resolve({ ok: true, value: current })
+    },
+  })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  assert.ok(leadBarText(rendered.tree).includes('未绑定主会话'))
+
+  // revision 不变，只改运行时 leads（Host 的组长启停 / 绑主会话不会 bump revision）
+  current = makeSnapshot({ revision: 1, leads: leadsFixture() })
+  assert.equal(current.revision, 1)
+  assert.equal(typeof harness.intervals[0].fn, 'function')
+  harness.intervals[0].fn() // 模拟一次 2s 轮询
+  await settle()
+  const updated = await rendered.instance.run()
+  assert.ok(
+    leadBarText(updated).includes('主会话 · ' + MAIN_SESSION_TITLE.slice(-8)),
+    'runtime leads change must repaint the lead bar without a revision bump',
+  )
+})
+
+test('组长条：workspace-lead 三个新 skip reason 有中文映射', async () => {
+  const cases = [
+    ['lead-busy', '工作区组长正在运行，等它空下来再派'],
+    ['lead-unavailable', '工作区组长不可用：稍后重试，或在看板点「创建组长」'],
+    ['lead-no-workspace', '无法解析任务的工作区：请从目标工作区的会话里重新加这条任务'],
+  ]
+  for (const [reason, text] of cases) {
+    const harness = createHarness({ snapshot: makeSnapshot({ poll: Object.assign(pollWithDispatch(), { lastSkipReason: reason }) }) })
+    const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+    assert.ok(includesText(tree, text), 'missing skip text for ' + reason)
+  }
+})
+
+test('派发模式：config 缺 dispatchMode 时选择器回退 workspace-lead，不是 new', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot({ config: { pollEnabled: true, pollIntervalMs: 15000 } }) })
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  const select = selectByAria(tree, '派发到')
+  assert.ok(select)
+  assert.equal(select.props.value, 'workspace-lead')
+  assert.ok(includesText(select, '工作区组长（推荐）'))
+})
+
 test('doing 兜底 D：dispatchedSessionId 仍然优先于 poll 兜底', async () => {
   const snapshot = makeSnapshot({
     poll: pollWithDispatch(),
@@ -1764,4 +2276,511 @@ test('doing 兜底 D：dispatchedSessionId 仍然优先于 poll 兜底', async (
   assert.equal(runSession.props.title, 'session-ffff2222')
   runSession.props.onClick()
   assert.deepEqual(harness.openSessionCalls, ['session-ffff2222', 'session-ffff2222'])
+})
+
+/* ══════════════════════════════════════════════════════════════
+ * v0.2.0 粘贴图片附件：粘贴 → 上传 → 短引用 / 缩略图 → 详情 <img>
+ * ══════════════════════════════════════════════════════════════ */
+
+const ATTACHMENT_ID = '11111111-1111-4111-8111-111111111111'
+const ATTACHMENT_DATA_URL = 'data:image/png;base64,iVBORw0KGgo='
+
+/** 模拟上传 / 读取附件的 RPC（其余端点返回给定 snapshot）。 */
+function attachmentRpc(snapshot, options = {}) {
+  return (channel, endpoint, payload) => {
+    if (endpoint === 'session-info') {
+      return Promise.resolve({ ok: true, value: { sessionId: payload && payload.sessionId, cwd: options.sessionCwd || WS_A } })
+    }
+    if (endpoint === 'upload-attachment') {
+      return Promise.resolve({
+        ok: true,
+        value: {
+          id: ATTACHMENT_ID,
+          ref: 'attachment://' + ATTACHMENT_ID,
+          mime: 'image/png',
+          size: 8,
+          name: (payload && payload.name) || 'image.png',
+        },
+      })
+    }
+    if (endpoint === 'attachment') {
+      return Promise.resolve({
+        ok: true,
+        value: { id: payload && payload.id, mime: 'image/png', size: 8, dataUrl: ATTACHMENT_DATA_URL },
+      })
+    }
+    return Promise.resolve({ ok: true, value: snapshot })
+  }
+}
+
+function fakeImageFile(dataUrl = ATTACHMENT_DATA_URL, name = 'image.png') {
+  return { type: 'image/png', name, dataUrl }
+}
+
+/** 造一个 paste 事件；返回 { event, state }，state.prevented 记录是否拦截默认行为。 */
+function clipboardEvent(files, items) {
+  const state = { prevented: false }
+  const event = {
+    preventDefault() {
+      state.prevented = true
+    },
+    clipboardData: {
+      items:
+        items ||
+        files.map((file) => ({ kind: 'file', type: file.type, getAsFile: () => file })),
+      files: [],
+    },
+  }
+  return { event, state }
+}
+
+async function settleAsync(times = 4) {
+  for (let i = 0; i < times; i += 1) await new Promise((resolve) => setImmediate(resolve))
+}
+
+function noteTextarea(tree) {
+  return collect(tree).find((node) => node.type === 'textarea' && hasClass(node, 'tb-textarea')) || null
+}
+
+async function openNoteEditor(instance, tree) {
+  const addNote = buttons(tree).find((node) => textOf(node).trim() === '加备注')
+  assert.ok(addNote, '加备注 button must render')
+  addNote.props.onClick()
+  return instance.run()
+}
+
+test('BoardTab：备注粘贴图片 → 上传 → 短引用 + 缩略图；删除 / 提交都只动引用', async () => {
+  const snapshot = makeSnapshot()
+  const harness = createHarness({ snapshot, rpc: attachmentRpc(snapshot) })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  let tree = await openNoteEditor(rendered.instance, rendered.tree)
+  let textarea = noteTextarea(tree)
+  assert.ok(textarea, 'note textarea must render')
+  assert.equal(typeof textarea.props.onPaste, 'function', 'note textarea must listen for paste')
+
+  const first = clipboardEvent([fakeImageFile()])
+  assert.equal(textarea.props.onPaste(first.event), true)
+  assert.equal(first.state.prevented, true, 'image paste must prevent the default text insert')
+  await settleAsync()
+  tree = await rendered.instance.run()
+  textarea = noteTextarea(tree)
+  assert.ok(textarea.props.value.includes('![image](attachment://' + ATTACHMENT_ID + ')'), 'short ref must be inserted')
+  assert.equal(textarea.props.value.includes('base64'), false, 'note never stores base64')
+  const thumbs = nodesWithClass(tree, 'tb-attach-thumb')
+  assert.equal(thumbs.length, 1, 'pending image thumbnail must render')
+  assert.equal(thumbs[0].props.src, ATTACHMENT_DATA_URL)
+  const uploadCall = harness.rpcCalls.find((call) => call.endpoint === 'upload-attachment')
+  assert.ok(uploadCall, 'paste must call upload-attachment')
+  assert.equal(uploadCall.channel, '/taskboard')
+  assert.equal(uploadCall.payload.dataUrl, ATTACHMENT_DATA_URL)
+
+  // 删除待提交图片：缩略图与 note 引用一起删。
+  const remove = nodesWithClass(tree, 'tb-attach-remove')[0]
+  assert.ok(remove, 'remove button must render')
+  remove.props.onClick()
+  tree = await rendered.instance.run()
+  assert.equal(noteTextarea(tree).props.value.includes('attachment://'), false)
+  assert.equal(nodesWithClass(tree, 'tb-attach-thumb').length, 0)
+
+  // 再贴一次并提交：add-task 只带短引用。
+  noteTextarea(tree).props.onPaste(clipboardEvent([fakeImageFile()]).event)
+  await settleAsync()
+  tree = await rendered.instance.run()
+  composerInput(tree).props.onChange({ target: { value: '粘贴图片任务' } })
+  tree = await rendered.instance.run()
+  const submit = submitButton(tree)
+  assert.equal(submit.props.disabled, false)
+  submit.props.onClick()
+  await settleAsync()
+  const addCall = harness.rpcCalls.find((call) => call.endpoint === 'add-task')
+  assert.ok(addCall, 'submit must call add-task')
+  assert.equal(addCall.payload.note, '![image](attachment://' + ATTACHMENT_ID + ')')
+  assert.equal(String(addCall.payload.note).includes('data:image'), false)
+})
+
+test('BoardTab：普通文本粘贴不拦截、不触发上传', async () => {
+  const snapshot = makeSnapshot()
+  const harness = createHarness({ snapshot, rpc: attachmentRpc(snapshot) })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  const tree = await openNoteEditor(rendered.instance, rendered.tree)
+  const textarea = noteTextarea(tree)
+  assert.ok(textarea)
+
+  const text = clipboardEvent([], [{ kind: 'string', type: 'text/plain' }])
+  assert.equal(textarea.props.onPaste(text.event), false)
+  assert.equal(text.state.prevented, false, 'text paste must keep the browser default')
+  assert.equal(countCalls(harness, 'upload-attachment'), 0)
+})
+
+test('BoardTab：一次粘贴超过 4 张只上传前 4 张并提示分次粘贴', async () => {
+  const snapshot = makeSnapshot()
+  const harness = createHarness({ snapshot, rpc: attachmentRpc(snapshot) })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  let tree = await openNoteEditor(rendered.instance, rendered.tree)
+  const textarea = noteTextarea(tree)
+  assert.ok(textarea)
+
+  const files = Array.from({ length: 6 }, (_, index) => fakeImageFile(ATTACHMENT_DATA_URL, 'image-' + index + '.png'))
+  textarea.props.onPaste(clipboardEvent(files).event)
+  await settleAsync()
+  tree = await rendered.instance.run()
+  assert.equal(countCalls(harness, 'upload-attachment'), 4, 'a single paste must upload at most 4 images')
+  assert.ok(includesText(tree, '一次最多粘贴 4 张图片'), 'the over-limit hint must render')
+})
+
+test('PlatformBoard：备注粘贴图片同样可用，提交仍带必选工作区', async () => {
+  const snapshot = makeSnapshot()
+  const harness = createHarness({ snapshot, rpc: attachmentRpc(snapshot) })
+  const rendered = await renderComponent(harness.componentOf('main'), {})
+  let tree = await openNoteEditor(rendered.instance, rendered.tree)
+
+  const workspaceSelect = selectByAria(tree, '任务所属工作区')
+  assert.ok(workspaceSelect, 'platform composer must offer a workspace select')
+  workspaceSelect.props.onChange({ target: { value: WS_A } })
+  tree = await rendered.instance.run()
+
+  const textarea = noteTextarea(tree)
+  assert.ok(textarea)
+  const paste = clipboardEvent([fakeImageFile()])
+  assert.equal(textarea.props.onPaste(paste.event), true)
+  assert.equal(paste.state.prevented, true)
+  await settleAsync()
+  tree = await rendered.instance.run()
+  assert.ok(noteTextarea(tree).props.value.includes('![image](attachment://' + ATTACHMENT_ID + ')'))
+  assert.equal(nodesWithClass(tree, 'tb-attach-thumb').length, 1)
+
+  composerInput(tree).props.onChange({ target: { value: '平台贴图任务' } })
+  tree = await rendered.instance.run()
+  const submit = submitButton(tree)
+  assert.equal(submit.props.disabled, false)
+  submit.props.onClick()
+  await settleAsync()
+  const addCall = harness.rpcCalls.find((call) => call.endpoint === 'add-task')
+  assert.ok(addCall)
+  assert.equal(addCall.payload.cwd, WS_A)
+  assert.equal(addCall.payload.note, '![image](attachment://' + ATTACHMENT_ID + ')')
+})
+
+test('Detail：note / result 里的附件引用按需拉取并渲染 <img class="tb-rich-img">', async () => {
+  const note = '截图：\n\n![image](attachment://' + ATTACHMENT_ID + ')\n\n验收标准：按钮可点。'
+  const result = '已修复，效果见 ![image](attachment://' + ATTACHMENT_ID + ')'
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 't-attachment',
+        title: '带截图的完成',
+        status: 'done',
+        cwd: WS_A,
+        note,
+        result,
+        updatedAt: minutesAgo(2),
+      },
+    ],
+  })
+  const harness = createHarness({ snapshot, rpc: attachmentRpc(snapshot) })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  let tree = await openDetailByTitle(rendered.instance, rendered.tree, '带截图的完成')
+  await settleAsync()
+  tree = await rendered.instance.run()
+
+  const images = nodesWithClass(tree, 'tb-rich-img')
+  assert.equal(images.length, 2, 'note and result each render one image')
+  assert.equal(images[0].props.src, ATTACHMENT_DATA_URL)
+  assert.equal(images[0].props.alt, 'image')
+  // 同一 id 在 note / result 各出现一次，但只请求一次（缓存）。
+  const attachmentCalls = harness.rpcCalls.filter((call) => call.endpoint === 'attachment')
+  assert.equal(attachmentCalls.length, 1)
+  assert.equal(attachmentCalls[0].payload.id, ATTACHMENT_ID)
+})
+
+test('附件纯函数：引用插入去重 / 删除 / 识别粘贴图片 / 上限常量', () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const helpers = harness.exported.__test
+  assert.equal(helpers.attachmentRef(ATTACHMENT_ID), '![image](attachment://' + ATTACHMENT_ID + ')')
+  const note = helpers.insertAttachmentRef('验收标准', ATTACHMENT_ID)
+  assert.equal(note, '验收标准\n![image](attachment://' + ATTACHMENT_ID + ')')
+  assert.equal(helpers.insertAttachmentRef(note, ATTACHMENT_ID), note, 'same id must not be inserted twice')
+  assert.equal(helpers.attachmentIdsIn(note, note).join(','), ATTACHMENT_ID)
+  assert.equal(helpers.removeAttachmentRef(note, ATTACHMENT_ID), '验收标准')
+  assert.equal(helpers.maxPasteImages, 4)
+  assert.equal(helpers.clipboardImageFiles({ clipboardData: { items: [{ kind: 'string', type: 'text/plain' }] } }).length, 0)
+  assert.equal(
+    helpers
+      .clipboardImageFiles({ clipboardData: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => 'f' }] } })
+      .join(','),
+    'f',
+  )
+})
+
+
+/* ══════════════════════════════════════════════════════════════
+ * t-34 收尾：附件边界（5 MB 预检 / 上传计数 / 8 引用预检 / 缓存上限 / 占位）
+ * ══════════════════════════════════════════════════════════════ */
+
+/** 生成第 index 个合法 uuid（附件引用只认 uuid 形态）。 */
+function attachmentIdAt(index) {
+  return String(index + 1).padStart(8, '0') + '-1111-4111-8111-111111111111'
+}
+
+/** note 里放 count 个不同附件引用。 */
+function noteWithRefs(count) {
+  const parts = []
+  for (let i = 0; i < count; i += 1) parts.push('![image](attachment://' + attachmentIdAt(i) + ')')
+  return '验收标准：按钮可点。\n' + parts.join('\n')
+}
+
+test('BoardTab：粘贴前按 file.size 预检 5 MB，超限图片不发请求、混合批次只传合法的', async () => {
+  const snapshot = makeSnapshot()
+  const harness = createHarness({ snapshot, rpc: attachmentRpc(snapshot) })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  let tree = await openNoteEditor(rendered.instance, rendered.tree)
+  const textarea = noteTextarea(tree)
+  assert.ok(textarea)
+
+  const tooBig = fakeImageFile(ATTACHMENT_DATA_URL, 'huge.png')
+  tooBig.size = 5 * 1024 * 1024 + 1
+  const paste = clipboardEvent([tooBig])
+  assert.equal(textarea.props.onPaste(paste.event), true)
+  assert.equal(paste.state.prevented, true, 'image paste is still intercepted')
+  await settleAsync()
+  tree = await rendered.instance.run()
+  assert.equal(countCalls(harness, 'upload-attachment'), 0, 'oversized image must not be uploaded')
+  assert.ok(includesText(tree, '单张图片不能超过 5 MB'), 'size hint must render')
+  assert.ok(includesText(tree, '已跳过 1 张'))
+  assert.equal(nodesWithClass(tree, 'tb-attach-thumb').length, 0)
+
+  // 混合批次：大图跳过，小图照常上传
+  noteTextarea(tree).props.onPaste(clipboardEvent([tooBig, fakeImageFile()]).event)
+  await settleAsync()
+  tree = await rendered.instance.run()
+  assert.equal(countCalls(harness, 'upload-attachment'), 1)
+  assert.equal(nodesWithClass(tree, 'tb-attach-thumb').length, 1)
+  assert.ok(noteTextarea(tree).props.value.includes('attachment://' + ATTACHMENT_ID))
+})
+
+test('BoardTab：上传是计数——Enter / 提交按钮在上传中都不提交，连续粘贴不会提前解除禁用', async () => {
+  const snapshot = makeSnapshot()
+  const pendingUploads = []
+  const baseRpc = attachmentRpc(snapshot)
+  const rpc = (channel, endpoint, payload) => {
+    if (endpoint === 'upload-attachment') {
+      return new Promise((resolve) => {
+        pendingUploads.push(() =>
+          resolve({
+            ok: true,
+            value: { id: ATTACHMENT_ID, ref: 'attachment://' + ATTACHMENT_ID, mime: 'image/png', size: 8, name: 'image.png' },
+          }),
+        )
+      })
+    }
+    return baseRpc(channel, endpoint, payload)
+  }
+  const harness = createHarness({ snapshot, rpc })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  let tree = await openNoteEditor(rendered.instance, rendered.tree)
+  composerInput(tree).props.onChange({ target: { value: '上传中的任务' } })
+  tree = await rendered.instance.run()
+
+  // 两次连续粘贴 → 两个上传在飞（计数 2）
+  noteTextarea(tree).props.onPaste(clipboardEvent([fakeImageFile()]).event)
+  tree = await rendered.instance.run()
+  noteTextarea(tree).props.onPaste(clipboardEvent([fakeImageFile('data:image/png;base64,AAAA')]).event)
+  tree = await rendered.instance.run()
+  await settleAsync(6)
+  assert.equal(pendingUploads.length, 2)
+  assert.equal(submitButton(tree).props.disabled, true, 'uploading must keep submit disabled')
+
+  // 上传中按 Enter：不提交
+  composerInput(tree).props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} })
+  await settleAsync()
+  assert.equal(countCalls(harness, 'add-task'), 0, 'Enter must not submit while uploading')
+
+  // 只完成第一个上传：计数仍为 1 → 仍不能提交
+  pendingUploads[0]()
+  await settleAsync(6)
+  tree = await rendered.instance.run()
+  assert.equal(submitButton(tree).props.disabled, true, 'one finished upload must not re-enable submit')
+  composerInput(tree).props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} })
+  await settleAsync()
+  assert.equal(countCalls(harness, 'add-task'), 0)
+
+  // 全部完成 → 才允许提交
+  pendingUploads[1]()
+  await settleAsync(6)
+  tree = await rendered.instance.run()
+  assert.equal(submitButton(tree).props.disabled, false)
+  composerInput(tree).props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} })
+  await settleAsync()
+  assert.equal(countCalls(harness, 'add-task'), 1)
+})
+
+test('BoardTab：提交前统计 note 附件引用，超过 8 个给具体提示而不是通用「请求不合法」', async () => {
+  const snapshot = makeSnapshot()
+  const harness = createHarness({ snapshot, rpc: attachmentRpc(snapshot) })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  let tree = await openNoteEditor(rendered.instance, rendered.tree)
+  composerInput(tree).props.onChange({ target: { value: '引用超限的任务' } })
+  tree = await rendered.instance.run()
+
+  noteTextarea(tree).props.onChange({ target: { value: noteWithRefs(9) } })
+  tree = await rendered.instance.run()
+  submitButton(tree).props.onClick()
+  await settleAsync()
+  tree = await rendered.instance.run()
+  assert.equal(countCalls(harness, 'add-task'), 0, 'over-limit note must not be sent')
+  assert.ok(includesText(tree, '一条任务最多 8 个图片附件（当前 9 个）'), 'specific over-limit hint must render')
+
+  // 降到 8 个即恢复提交
+  noteTextarea(tree).props.onChange({ target: { value: noteWithRefs(8) } })
+  tree = await rendered.instance.run()
+  submitButton(tree).props.onClick()
+  await settleAsync()
+  const addCall = harness.rpcCalls.find((call) => call.endpoint === 'add-task')
+  assert.ok(addCall, 'note with 8 refs must be submitted')
+  assert.equal(addCall.payload.note, noteWithRefs(8))
+})
+
+test('Detail：附件缓存上限 8 条，淘汰最旧的就绪项且不吞刚加载的一张', async () => {
+  const ids = Array.from({ length: 9 }, (_, index) => attachmentIdAt(index))
+  const note = ids.map((id) => '![image](attachment://' + id + ')').join('\n')
+  const snapshot = makeSnapshot({
+    tasks: [{ id: 't-cache', title: '九张截图的任务', status: 'todo', cwd: WS_A, note, updatedAt: minutesAgo(1) }],
+  })
+  const harness = createHarness({ snapshot, rpc: attachmentRpc(snapshot) })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  let tree = await openDetailByTitle(rendered.instance, rendered.tree, '九张截图的任务')
+  await settleAsync(20)
+  tree = await rendered.instance.run()
+
+  assert.equal(harness.rpcCalls.filter((call) => call.endpoint === 'attachment').length, 9)
+  assert.equal(nodesWithClass(tree, 'tb-rich-img').length, 8, 'cache keeps at most 8 data URLs')
+  assert.equal(nodesWithClass(tree, 'tb-rich-attachment').length, 1, 'the evicted id falls back to the loading placeholder')
+})
+
+test('Detail：附件加载中 / 失败分别显示占位文本，不阻塞其它 Markdown 块', async () => {
+  const note = '截图：\n\n![image](attachment://' + ATTACHMENT_ID + ')\n\n验收标准：按钮可点。'
+  const snapshot = makeSnapshot({
+    tasks: [{ id: 't-placeholder', title: '占位任务', status: 'todo', cwd: WS_A, note, updatedAt: minutesAgo(1) }],
+  })
+
+  // 加载中：attachment 一直不返回
+  const loadingHarness = createHarness({
+    snapshot,
+    rpc: (channel, endpoint, payload) =>
+      endpoint === 'attachment' ? new Promise(() => {}) : attachmentRpc(snapshot)(channel, endpoint, payload),
+  })
+  const loadingRendered = await renderNarrow(loadingHarness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  const loadingTree = await openDetailByTitle(loadingRendered.instance, loadingRendered.tree, '占位任务')
+  assert.ok(includesText(loadingTree, '图片加载中…'), 'loading placeholder must render')
+  assert.ok(includesText(loadingTree, '验收标准：按钮可点。'), 'other blocks must still render')
+  assert.equal(nodesWithClass(loadingTree, 'tb-rich-img').length, 0)
+
+  // 加载失败：attachment 返回 not-found
+  const failedHarness = createHarness({
+    snapshot,
+    rpc: (channel, endpoint, payload) =>
+      endpoint === 'attachment'
+        ? Promise.resolve({ ok: false, error: { code: 'not-found', message: '附件不存在' } })
+        : attachmentRpc(snapshot)(channel, endpoint, payload),
+  })
+  const failedRendered = await renderNarrow(failedHarness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  let failedTree = await openDetailByTitle(failedRendered.instance, failedRendered.tree, '占位任务')
+  await settleAsync()
+  failedTree = await failedRendered.instance.run()
+  assert.ok(includesText(failedTree, '图片不可用'), 'failed placeholder must render')
+  assert.equal(nodesWithClass(failedTree, 'tb-rich-img').length, 0)
+  assert.ok(includesText(failedTree, '验收标准：按钮可点。'))
+})
+
+test('附件边界纯函数：5 MB 预检 / 上传计数 / 提交闸门 / 8 引用预检 / 死 locale 键已删', () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const helpers = harness.exported.__test
+
+  assert.equal(helpers.maxAttachmentBytes, 5 * 1024 * 1024)
+  assert.equal(helpers.maxAttachmentMb, 5)
+  assert.equal(helpers.maxNoteAttachments, 8)
+  assert.equal(helpers.maxAttachmentCache, 8)
+
+  const small = { size: 1024 }
+  const big = { size: 5 * 1024 * 1024 + 1 }
+  const budget = helpers.splitPasteImages([big, small, small, small, small, small])
+  assert.equal(budget.tooLarge, 1)
+  assert.equal(budget.accepted.length, 4, 'accepted keeps the 4-image paste cap')
+  assert.equal(budget.skipped, 1)
+  assert.equal(helpers.splitPasteImages([]).accepted.length, 0)
+  assert.equal(helpers.splitPasteImages(undefined).tooLarge, 0)
+  assert.equal(helpers.splitPasteImages([{}]).accepted.length, 1, 'unknown size is treated as 0, not as oversized')
+
+  assert.equal(helpers.isUploading(0), false)
+  assert.equal(helpers.isUploading(1), true)
+  assert.equal(helpers.isUploading(undefined), false)
+  assert.equal(helpers.isUploading(NaN), false)
+
+  assert.equal(helpers.submitBlocked({ uploading: 1, title: '任务' }), true)
+  assert.equal(helpers.submitBlocked({ uploading: 0, title: '任务' }), false)
+  assert.equal(helpers.submitBlocked({ uploading: 0, title: '   ' }), true)
+  assert.equal(helpers.submitBlocked({ uploading: 0, title: '任务', busy: 'add' }), true)
+  assert.equal(helpers.submitBlocked({ uploading: 0, title: '任务', workspaceRequired: true }), true)
+
+  const t = (key, params) => helpers.interpolate(helpers.DICT_ZH[key] || key, params)
+  assert.equal(helpers.noteAttachmentLimitText(t, ''), '')
+  assert.equal(helpers.noteAttachmentLimitText(t, noteWithRefs(8)), '')
+  assert.equal(helpers.noteAttachmentLimitText(t, noteWithRefs(9)), '一条任务最多 8 个图片附件（当前 9 个）')
+
+  // t-34 清理：卡片 meta / 页面副标题等 locale 键已无引用，zh/en 双份都删掉
+  for (const dict of [helpers.DICT_ZH, helpers.DICT_EN]) {
+    assert.equal(typeof dict['composer.imageTooLarge'], 'string')
+    assert.equal(typeof dict['composer.attachmentTooMany'], 'string')
+    for (const key of [
+      'card.assignee',
+      'card.result',
+      'card.notified',
+      'card.workspace',
+      'card.lead',
+      'card.deleteConfirm',
+      'page.subtitle',
+      'detail.status',
+      'lead.archivedHint',
+    ]) {
+      assert.equal(dict[key], undefined, 'dead locale key must be gone: ' + key)
+    }
+  }
+})
+
+test('BoardTab：同批上传单项失败（读取 / 上传）不丢已成功的图片', async () => {
+  const snapshot = makeSnapshot()
+  const baseRpc = attachmentRpc(snapshot)
+  const BAD_UPLOAD_DATA_URL = 'data:image/png;base64,QkFEWVBM'
+  const rpc = (channel, endpoint, payload) => {
+    if (endpoint === 'upload-attachment') {
+      if (payload.dataUrl === BAD_UPLOAD_DATA_URL) {
+        return Promise.resolve({ ok: false, error: { code: 'bad-request', message: '图片解析失败' } })
+      }
+      return Promise.resolve({
+        ok: true,
+        value: { id: ATTACHMENT_ID, ref: 'attachment://' + ATTACHMENT_ID, mime: 'image/png', size: 8, name: 'image.png' },
+      })
+    }
+    return baseRpc(channel, endpoint, payload)
+  }
+  const harness = createHarness({ snapshot, rpc })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  let tree = await openNoteEditor(rendered.instance, rendered.tree)
+
+  const badUpload = fakeImageFile(BAD_UPLOAD_DATA_URL, 'bad-upload.png')
+  const badRead = {
+    type: 'image/png',
+    name: 'bad-read.png',
+    get dataUrl() {
+      throw new Error('read boom')
+    },
+  }
+  noteTextarea(tree).props.onPaste(clipboardEvent([badUpload, badRead, fakeImageFile()]).event)
+  await settleAsync(8)
+  tree = await rendered.instance.run()
+
+  assert.equal(countCalls(harness, 'upload-attachment'), 2, 'the unreadable file never reaches upload; the other two do')
+  assert.equal(nodesWithClass(tree, 'tb-attach-thumb').length, 1, 'the successful upload must survive the batch')
+  assert.ok(noteTextarea(tree).props.value.includes('attachment://' + ATTACHMENT_ID), 'successful short ref must stay in the note')
+  assert.ok(includesText(tree, '图片解析失败'), 'the concrete upload error is surfaced')
 })

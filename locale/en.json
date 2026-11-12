@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Task board + dispatcher mode",
-    "description": "Sidebar task board with a dispatcher agent mode: the main agent only plans, dispatches, reviews and reports while subagents do the work. Four columns (todo / in progress / done / archived); the todo column is polled and handed to the main agent, which reviews subagent results and moves the board state."
+    "description": "Sidebar task board + workspace-lead dispatch (v0.2.0 default): you only talk to the main session — tasks are handed to each workspace's resident lead, which dispatches workers, and the four-column board (todo / in progress / done / archived) summarizes progress and results. The main session receives completion receipts and reports back to you."
   }
 }
