@@ -76,6 +76,7 @@ import {
   leadTaskTitle,
   loadAttachmentIndex,
   loadBoardFromDisk,
+  localStamp,
   normalizeBoard,
   normalizeConfig,
   normalizeConfig as normalizeConfigAlias,
@@ -356,10 +357,24 @@ test('buildDispatchText carries the task facts and instructions', () => {
   task.note = '验收：测试通过'
   task.cwd = 'C:\\work'
   const text = buildDispatchText(task, NOW)
+  assert.match(text, /看板时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{2}:\d{2}/)
+  assert.doesNotMatch(text, /看板时间：\d{4}-\d{2}-\d{2}T/)
   assert.match(text, /【任务看板 · 待开始】t-1 把 X 改成 Y/)
   assert.match(text, /验收：测试通过/)
   assert.match(text, /C:\\work/)
   assert.match(text, /taskboard_update/)
+})
+
+test('localStamp renders host-local wall clock with UTC offset', () => {
+  const ms = Date.UTC(2026, 10, 16, 4, 53, 50)
+  const date = new Date(ms)
+  const pad = (n) => String(n).padStart(2, '0')
+  const expected =
+    date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) +
+    ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds())
+  assert.ok(localStamp(ms).startsWith(expected + ' '))
+  assert.match(localStamp(ms), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{2}:\d{2}$/)
+  assert.equal(localStamp(NaN), '')
 })
 
 test('createBoardUserMessage matches the UserMessage shape', () => {
@@ -1183,7 +1198,8 @@ test('buildReceiptText flattens results and asks the main session to report', ()
   assert.match(text, /- t-1 A：## 结论 - 改了 X - 测了 Y/)
   assert.match(text, /- t-2 B：（无结论）/)
   assert.match(text, /向用户汇总以上结论，不要重复执行任务/)
-  assert.ok(text.includes('看板时间：' + new Date(NOW).toISOString()))
+  assert.ok(text.includes('看板时间：' + localStamp(NOW)))
+  assert.doesNotMatch(text, /看板时间：\d{4}-\d{2}-\d{2}T/)
   const long = buildReceiptText([{ id: 't-3', title: 'C', result: 'x'.repeat(500) }], NOW)
   assert.ok(long.includes('x'.repeat(200)))
   assert.equal(long.includes('x'.repeat(201)), false)

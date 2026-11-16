@@ -215,7 +215,10 @@ v0.2.0 的默认派发方式。目标不是「某个会话」，而是**任务�
   （用户可自己看板 / 问主会话）。`snapshot.leads.main.archived=true`，组长条显示「已归档」并提示换绑。
 - **投递**：合并成**一条** `agent.followup()` 用户消息（`source.kind='user'`），随后 `sessions.flush`。
   文本以 `【任务看板 · 汇报】` 开头，逐条 `- <id> <title>：<result 压成单行后的前 200 字，空结论写「（无结论）」>`，
-  结尾要求主会话「向用户汇总以上结论，不要重复执行任务」，并附 `看板时间：<ISO>`。
+  结尾要求主会话「向用户汇总以上结论，不要重复执行任务」，并附
+  `看板时间：<宿主本地时间 YYYY-MM-DD HH:mm:ss ±HH:MM>`（v0.2.6 起人读文案用带 UTC 偏移量的
+  本地时间，避免 +08:00 等时区用户把 ISO UTC 误读成差 8 小时；board.json / 任务字段里的
+  时间戳仍是 ISO UTC，协议口径不变）。派发文本（§1.3 第 2 步）结尾的「看板时间」同口径。
 - **记账**：`followup` 成功后，给本批每条任务写 `reportedAt=iso(now)` 并 `commitBoard` 一次；
   投递失败只 `console.warn`，不写 `reportedAt`，下一轮重试。
 - **flush 时机**：每次 tick 末尾、`update-task` RPC 之后、`taskboard_update` 工具执行之后（同一 flush 函数）；
@@ -1991,3 +1994,10 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   纯函数用例 = 276）；§5.4 同步。发布流程：`package.json` bump 到 `0.2.5` → 与 `main` 一起推送 annotated tag
   `v0.2.5`，触发 `.github/workflows/publish.yml`（校验 tag 与 `package.json` 版本一致 → `node --test`
   → `npm publish --access public --provenance` → 建 GitHub Release）；push `main` 触发 `ci.yml`（Node 20/22）。
+- v0.2.6（时区文案修复）：派发文本（【任务看板 · 待开始】）、完成回执（【任务看板 · 汇报】）与
+  `taskboard_list` / `taskboard_update` 工具输出的「更新时间」此前直接输出 ISO UTC
+  （如 `2026-11-16T00:53:50.946Z`），+08:00 用户看起来像差了 8 小时。新增 `localStamp(ms)`
+  （宿主本地时区 `YYYY-MM-DD HH:mm:ss ±HH:MM`，带 UTC 偏移量、解析失败返回空串），三处人读文案
+  改用它；**存储口径不变**——board.json / 任务字段（`createdAt` / `updatedAt` / `notifiedAt` /
+  `reportedAt`…）仍是 ISO UTC。测试：`test/host.test.mjs` 新增 `localStamp` 单测（本地墙上时间 +
+  偏移量 + NaN → ''），派发 / 回执用例断言「看板时间」为本地格式且无 ISO `T` 写法；§1.6 同步。
