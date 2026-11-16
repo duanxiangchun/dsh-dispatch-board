@@ -2001,3 +2001,14 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   改用它；**存储口径不变**——board.json / 任务字段（`createdAt` / `updatedAt` / `notifiedAt` /
   `reportedAt`…）仍是 ISO UTC。测试：`test/host.test.mjs` 新增 `localStamp` 单测（本地墙上时间 +
   偏移量 + NaN → ''），派发 / 回执用例断言「看板时间」为本地格式且无 ISO `T` 写法；§1.6 同步。
+
+- v0.2.7（修复平台侧边栏看板「待你处理」回答框打不进字，t-92）：v0.2.5 把看板拆成「对话侧（右栏）」
+  与「平台侧边栏」两份副本时，侧边栏副本的 bind 回写块漏抄 3 行（`needsUserTasks` / `answerDraft` /
+  `answerError`）。回答框是受控组件，草稿存在看板组件 state、经共享 `bind` 对象传给 Detail 浮层；
+  侧边栏不回写 → `bind.answerDraft` 永远 `undefined`、浮层回退 `''` → 每次按键被 React 复位、
+  点选项不填入、「回复并继续」恒禁用。修法（只改 `lib/client.js` 侧边栏看板回写块）：在
+  `boardBindRef.current.leadActions = leadActions` 之后补齐与对话侧逐字对齐的 3 字段（每次渲染刷新，
+  注释标明回归来源）。测试：新增 `test/client-bind-writeback.test.mjs` 源文本守卫——三个 bind 字段在
+  `lib/client.js` 里各出现 ≥2 次（对话侧 + 侧边栏两份副本各一），某份漏回写直接红。
+  `node --test` 全量 **278 pass / 0 fail**（v0.2.4 发布基线 273 → 274(t-87) → 276(t-89) → 278）；
+  §1–§8 协议章节无变化（字段 / 端点未动）。
