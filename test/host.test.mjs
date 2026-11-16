@@ -3900,6 +3900,71 @@ test('the pre-execute gate allows normal dispatch but denies when the card canno
   }
 })
 
+test('the pre-execute gate also covers the PTC nested callId (call-1:ptc:1)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-ptc-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead } = leadFixture()
+    const listeners = {}
+    const presetOf = (session) => (session && session.header && session.header.agentPreset) || 'taskboard-dispatch'
+    const gateCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'agentPresets' ? { presetForSession: presetOf } : undefined),
+    }
+    const rt = fakeRuntime(state, gateCtx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    assert.equal(registerLeadDispatchGate(gateCtx, rt), true)
+    assert.equal(registerLeadAutoHooks(gateCtx, rt), true)
+
+    // PTC（run_code）：程序化子调用走同一个 ToolExecutionPipeline，exec.callId 形如
+    // '<callId>:ptc:1'、rootCallId 指向最外层 run_code 调用；闸门必须照样先建卡再放行。
+    let nextCalls = 0
+    const next = async () => {
+      nextCalls += 1
+      return { kind: 'allow' }
+    }
+    const ptcExec = {
+      name: 'subagent',
+      callId: 'call-1:ptc:1',
+      rootCallId: 'call-1',
+      agent: lead,
+      arguments: { description: 'PTC 形态的闸门派发', prompt: '干活' },
+    }
+    assert.deepEqual(await listeners['tools/pre-execute'](ptcExec, next), { kind: 'allow' })
+    assert.equal(nextCalls, 1, '放行后工具体照常执行（worker 会启动）')
+    assert.equal(state.tasks.length, 1, '只为组长这一次派发建一张卡')
+    const created = state.tasks[0]
+    assert.equal(created.title, 'PTC 形态的闸门派发')
+    assert.equal(created.note, '干活')
+    assert.equal(created.status, 'doing', '闸门建卡即 doing（与 native 形态一致）')
+    assert.equal(created.autoDispatch, LEAD_AUTO_MARK, '与 native 形态一样打「宿主自动任务」标记')
+    assert.equal(created.assignee, '', '闸门阶段还不知道 worker 会话 id')
+
+    // tools/result 的 PTC 形态（同一个 exec 对象）复用闸门建的卡：只补 assignee，不重复建卡。
+    listeners['tools/result'](ptcExec, { isError: false, value: { kind: 'activation', subagentId: 'worker-ptc-gate' }, content: [] })
+    assert.equal(state.tasks.length, 1, 'PTC 形态的 tools/result 不重复建卡')
+    assert.equal(state.tasks[0].assignee, 'worker-ptc-gate')
+    assert.equal(state.tasks[0].autoDispatch, LEAD_AUTO_MARK)
+
+    // subagent/end 收尾同一张卡（监听器是异步的，等一个 tick）。
+    listeners['subagent/end']({
+      runId: 'run-ptc-gate',
+      provider: 'spawn',
+      id: 'worker-ptc-gate',
+      local: true,
+      stopReason: 'completed',
+      lastAssistantMessage: [{ type: 'text', text: 'PTC worker 完工' }],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(state.tasks[0].status, 'done', 'PTC 派发的 worker 结束照常自动收尾')
+    assert.match(state.tasks[0].result, /PTC worker 完工/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('a non-activation tools/result keeps the gate card as a visible todo record (block / unknown shape)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-release-'))
   try {

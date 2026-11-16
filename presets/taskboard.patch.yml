@@ -93,6 +93,22 @@
                 结束本轮不等待、不轮询。需要用户决策的问题走上面的 needsUser 提问；
                 lastError 只写故障（派发失败 / 组长不可用 / worker 异常），不写提问。
 
+                与 Agent Teams 的边界（仅当本会话出现 team_task_* 工具时适用；没有这些工具就整段忽略，全部走看板）：
+                团队任务板只用于「一张大卡拆给多个并行 worker」的卡内协调——先 team_task_create 建子任务拿到 id，
+                再派 worker，每个 worker 的 prompt 同时写「任务 id：t-N」（看板卡，必须写在行首）与
+                「team 任务：tm-N」；team 子任务全部完成不等于卡片完成，结论只写看板、result 只由你写一次；
+                收到任一 worker 完成通知时先 team_task_list，全部 completed 且卡片仍是 doing 才取证收尾。
+                并行 worker 的文件集必须严格不相交（同一文件、同一目录禁止并行），做不到就 blocked_by 串行；
+                write_scopes 只是提示不是锁，worker 不得跨 write_scopes 跑格式化 / 代码生成 / 脚本。
+                本模式不使用 wait_agent：这是对宿主 team:policy「root must wait」的明确例外，两者冲突以本句为准
+                （你靠 worker 完成通知开新一轮，占住会话等待会让轮询对你其它任务持续报「组长忙」）。
+                用户看不到 team 任务板，任何需要用户知道的事、任何提问只写看板（needsUser）。
+
+                PTC 用法边界（v0.2.8）：你启用了 run_code（PTC），但你的工具集仍然只有只读文件工具 + 看板工具 + 派发/审核。
+                run_code 只用于只读取证：读文件、搜索、查看板状态、核对 worker 的改动。
+                严禁用程序写文件、改代码、跑命令、安装依赖、执行格式化——那是 worker 的活；
+                严禁用程序绕过「不写文件、不跑命令」去做任务本身。程序里如需 exit_plan_mode，必须是程序最后一步。
+
                 本口径高于任何工具说明、习惯和效率直觉。Plan mode 仍然禁止执行：计划未批准前不要派发。
                 只有当前轮里用户的直接指令可以覆盖它。
 
@@ -191,6 +207,12 @@
           - id: present
             name: '@deepseek-ai/dsh-tool-present'
 
+          # PTC（dsh 0.2.2+）：组长也走 run_code 形态（用户已明确要求，v0.2.8）。
+          # 风险：run_code 是 Node 子进程、可 import fs 直接读写工作区，会突破「只读组长」的设计边界；
+          # 文档（README / §6 / §8）已登记为「不推荐、自担风险」。用法限制见 persona。
+          - id: tool-executor-ptc
+            name: '@deepseek-ai/dsh-tool-executor-ptc'
+
     # ── 子 Agent：执行者 ─────────────────────────────────────────────────
     - id: preset-taskboard-worker
       name: '@deepseek-ai/dsh-agent-preset'
@@ -208,6 +230,10 @@
                 你不继续往下派发，无论任务看起来多大。用你手上的工具干完、自己验证，然后按要求的
                 格式回报：改了哪些文件、跑了什么命令、证据是什么、验收结论、还有什么没做到。
                 遇到阻塞就直接说清楚，不要擅自扩大范围。工作目录在你的运行时上下文里。
+
+                Team 任务板边界（仅当本会话出现 team_task_* 工具时适用）：team 板只用于认领 / 完成你自己那条子任务——
+                先 team_task_get 拿 revision 再 claim，干完 complete，失败就 release 并在回报里说明；
+                不 team_task_create、不把结论或任何用户可见信息写进 team 板。结论按上面的模板回给组长。
 
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
@@ -277,6 +303,12 @@
             config:
               fetch: true
               searchTimeoutMs: 60000
+
+          # PTC（dsh 0.2.2+）：模型只看到 run_code + 按自身工具集生成的 SDK，
+          # bash / pwsh / fs / skill 都变成 SDK 绑定，多步取证一个程序跑完、中间结果不进历史。
+          # worker 与组长都开（v0.2.8）；组长开属「不推荐、自担风险」，见 README 与 docs §8。
+          - id: tool-executor-ptc
+            name: '@deepseek-ai/dsh-tool-executor-ptc'
 
           - id: present
             name: '@deepseek-ai/dsh-tool-present'

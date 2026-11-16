@@ -463,6 +463,52 @@ patch 里设置提问（`needsUser:true`，或带 `question`）→ `conflict`「
 `needsUser` 是待决策。组长 persona 要求决策类问题必须走 `needsUser`（§6），
 不要把问题塞进 `lastError`——`lastError` 只写「为什么没做成」。
 
+### 1.10 与 Agent Teams 的分工（v0.2.8）
+
+DSH 的 Agent Teams（`team_task_create` / `team_task_get` / `team_task_list` / `team_task_update`）与本插件
+的看板是两套东西：看板是用户可见的工单流，team 板是**会话内的临时协调板**。组长与 worker 都可能拿到
+这批工具，所以 persona 里写死分工边界，避免把用户该看到的活记进用户看不到的板里。
+
+**① 双条件可用性。** 只有 profile 加载 `agent-team` 插件**且** root 会话开启 Team 模式时才会注入
+`team_task_*`（Team 模式 `defaultEnabled=false`，默认关闭）。因此同一个插件版本、同一个会话池里，
+有的会话有这批工具、有的没有——所有 Agent Teams 条款都必须带「没有 `team_task_*` 就整段忽略、
+全部走看板」的条件句。
+
+**② 两套任务板的语义对照**
+
+| 维度 | 看板（`taskboard_*`） | team 任务板（`team_task_*`） |
+| --- | --- | --- |
+| 定位 | 用户可见工单流（四列 + 待你处理） | 会话内协调（一张大卡拆给多个并行 worker） |
+| 用户可见 | 是（右栏 / 平台侧边栏两份看板副本） | 否（纯会话内，用户看不到） |
+| revision | 由宿主维护（`commitBoard` 写盘 + `reloadBoardIfStale` 比对） | 由模型 CAS（`claim` 必须带 revision） |
+| 完成回执 | 有（`done` → `flushReceipts()` 汇总给主会话，§1.6；失败原因写 `lastError`） | 无回执、无汇报通道 |
+| 问答闭环 | 有（`needsUser` → 用户回答 followup 给组长，§1.9） | 无（不能当提问 / 验收通道） |
+
+**③ `任务 id：t-N` 必须写在行首，这决定「一卡多 worker」能否成立。** 闸门认领已有卡片有两条路径：
+`dispatchTaskIdFromPrompt` 归一后要求「任务 id:」在行首（`lib/index.js:3197-3202`），命中后只要卡片不是
+`archived` 就复用（不看是否已挂 worker，返工 / 同卡第 2 个并行 worker 都靠它）；而 `看板任务：t-N`
+引用写法（`dispatchReferencedTaskId`）还要过 `canReuseMentionedTask`（`lib/index.js:3205-3209`、
+`lib/index.js:3033-3037`），只认 `todo` / `doing` **且未挂真实 worker 会话 id** 的卡片。所以第 2 个 worker
+起，prompt 若只写「看板任务：t-N」会认领失败、每人都新建一张重复卡；必须写行首「任务 id：t-N」。
+
+**④ 第 2..N 个 worker 与看板卡没有关联，失败原因记不到卡上。** 宿主自动收尾（`subagent/end` → `done`
++ `result`）只认 `findTaskByWorker`（`lib/index.js:2821-2833`）找到的任务，而它要求任务带 `autoDispatch`
+标记——那是宿主建卡时打的。同一张卡上的其它并行 worker 不满足这个条件，宿主既不会替它们写回、也不会
+把失败记到卡上；组长必须在自己的 `result` 里写清分工与各 worker 的产出 / 失败原因，不能假设宿主会补。
+
+**⑤ team 板以 root 会话为 owner，组长会话重建即全新空板。** team 子任务的生命周期跟着 root 会话走；
+组长会话（`config.workspaceLeads` 映射的那个会话）被归档 / 重建后，旧子任务自动作废、旧 `tm-N` 不能
+再 claim，必须重新 `team_task_create` 再派 worker。看板卡片在 `board.json` 里，不受影响。
+
+**⑥ `write_scopes` 只报警不阻止。** `team_task_create` / `team_task_update` 的 `write_scopes` 是
+**建议性**字段：重叠只会给出提示、不会加锁。worker 带 bash / pwsh，格式化、代码生成、脚本运行不受文件
+版本保护。因此并行 worker 的文件集必须由组长在派发前切成严格不相交的集合（同一文件、同一目录禁止
+并行），做不到就用 `blocked_by` 串行。
+
+**分工口径**：卡内协调（谁做哪块、依赖顺序）用 team 板；状态、结论、提问、验收只写看板。组长
+**不使用 `wait_agent`**——这是对宿主 `team:policy`「root must wait」的明确例外，冲突时以 persona 为准
+（见 §8）。
+
 ---
 
 ## 2. 持久化
@@ -1321,10 +1367,12 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
     **只读** tool-fs（read/readImage=true，write/edit/applyPatch=false）+ tool-fs-search + tool-jobs +
     planning(realm: planMode，**必须给非空 section**) + compaction(realm) +
     delegation(realm: workflowEngine) = tool-subagent-control + tool-subagent(spawn, agentPreset=taskboard-worker, maxDepth=1) +
-    tool-ask-user + tool-todo(**必须给 allowParallelInProgress**) + present。
+    tool-ask-user + tool-todo(**必须给 allowParallelInProgress**) + present +
+    tool-executor-ptc（v0.2.8，按用户要求开；**不推荐 / 自担风险**，见 PTC 条与 §8）。
   - `taskboard-worker`（order 41）：worker persona + agent-instructions + time-context + bash/pwsh（按平台 disabled）+
     完整 tool-fs + tool-fs-search + tool-jobs + skill-filesystem + tool-skill + compaction + tool-ask-user +
-    tool-todo(allowParallelInProgress) + tool-web + present。**不含**任何委派工具。
+    tool-todo(allowParallelInProgress) + tool-web + tool-executor-ptc（v0.2.8，PTC 执行器，见下条）+ present。
+    **不含**任何委派工具。
 - persona（`taskboard-dispatch`）必须写清「**工作区组长**」口径：
   1. 你是本工作区的常驻组长，只处理本工作区（当前工作目录）的任务；用户只和主会话对话，
      你不直接面对用户，也不做面向用户的汇报；
@@ -1362,6 +1410,29 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
      - **审核结论必须落看板**：直聊派活的任务由宿主自动置 `done`，组长审核后仍要用
        `taskboard_update {id, result:"…"}` 把审核结论写回该任务；写不进去就 `taskboard_add` 新建一条
        记录任务，不能只留在聊天里。
+  9. v0.2.8（Agent Teams 协作边界，`presets/taskboard.patch.yml` persona 同步）：**仅当本会话出现
+     `team_task_*` 工具时适用**（profile 加载 `agent-team` 且 root 会话开启 Team 模式才注入；没有就整段
+     忽略、全部走看板）。team 板只用于「一张大卡拆给多个并行 worker」的卡内协调：先 `team_task_create`
+     建子任务拿 id 再派 worker，worker prompt 同时写行首「任务 id：t-N」与「team 任务：tm-N」；结论 /
+     提问 / 验收只写看板。**本模式不使用 `wait_agent`**（对宿主 `team:policy`「root must wait」的明确
+     例外，冲突以 persona 为准）。并行 worker 的文件集必须严格不相交，`write_scopes` 只提示不加锁。
+- **worker 与组长预设都启用 PTC 执行器（v0.2.8，`@deepseek-ai/dsh-tool-executor-ptc`）**：dsh **0.2.2+** 才提供这个
+  内置执行器；在 preset 的 `plugins:` 里多列一行（`- id: tool-executor-ptc` +
+  `name: '@deepseek-ai/dsh-tool-executor-ptc'`）就是 `ptc` 模式相对 `standard` 的唯一差别——模型从此只看到
+  `run_code` + 按自身工具集生成的 SDK（`bash` / `pwsh` / `fs` / `skill` 都变成 SDK 绑定，多步取证一个
+  程序跑完、中间结果不进历史）。**worker 与组长都启用 PTC（v0.2.8，用户决定）**：`taskboard-worker` 的
+  `plugins:` 末尾（`present` 之前）与 `taskboard-dispatch` 的 `plugins:` 末尾（`present` 之后）各一行。
+  **风险登记（组长侧）**：`run_code` 是 Node 子进程、能 `import('node:fs/promises')` 直接读写工作区，
+  权限等于会话沙箱（默认 workspace-write，本机 taskboard profile 是 danger-full-access）——**「只读组长」的
+  安全边界被打破**。组长开 PTC 属**不推荐、自担风险**的配置，仅以 persona 用法限制（只读取证；禁止用程序
+  写文件 / 改代码 / 跑命令 / 安装依赖 / 执行格式化）与评审纪律兜底；需要严格只读时删掉 dispatch 侧
+  `tool-executor-ptc` 两行即恢复 native（见 README 警告与 §8）。宿主缺 `ptcRuntime` 时这一行挂载失败
+  （pending），运行时**静默回落到 native** 工具形态，派发与看板语义不受影响。
+- **PTC 呈现与看板挂钩等价（v0.2.8）**：worker 换成 `run_code` 形态后，程序化子调用仍走同一个
+  `ToolExecutionPipeline`，闸门（`tools/pre-execute`）/ `tools/result` / `subagent/end` 的命中方式与
+  native 工具形态完全一致（结论见 §1.8「标准 tool-call 与 PTC 完全等价」，此处不重复）——开 PTC
+  **不改变**看板语义：派发前照样建卡 / 认领、worker 启动后照样挂 `assignee`、结束后照样写回 `done`。
+  `test/host.test.mjs` 补了一条 PTC 形态（`exec.callId` 形如 `call-1:ptc:1`、带 `rootCallId`）的闸门用例。
 - 不在预设里写死 `agentOptions.provider/model`（可移植性）：子 Agent 继承主 Agent 路由。
 - 已知坑（都已在 patch 里修掉，改预设时别踩）：`dsh-plan-mode` 的 `section` 必填；
   `dsh-tool-todo` 的 `allowParallelInProgress` 必填；`tool-subagent` 的 `persona/toolFilter/backgroundMode`
@@ -1468,6 +1539,8 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 | 手动在模式选择器里开的「任务看板 · 工作区组长（自动）」会话不会被自动接管 | 看板只认 `config.workspaceLeads`（懒创建 / `ensure-workspace-lead` 修复）；手动会话不写映射、不派任务，建议交给插件自动创建。后续版本可让懒创建优先复用同工作区空闲的该预设会话（v0.2.x 待办） |
 | §1.8 的闸门 / 挂钩依赖 dsh 的 `subagent` 工具名、`tools/pre-execute` 事件与输出形状（`value = {kind:'activation', subagentId}`）、`subagent/end` 事件字段 | **闸门是 fail-open 的**：只认 `exec.name === 'subagent'`；dsh 改了工具名 / 不再发 `tools/pre-execute` 时它不会拦截，派发退化成 0.2.3 的「观察后补建」（直聊派活可能再次漏卡），但不会误拦正常调用。`tools/result` 侧仍要求 `result.isError !== true` + `value.kind === 'activation'` + 非空 `subagentId`；**形状变了 / `post-execute` block / 取消时不删卡（fail-safe）**：只把闸门预建的卡降级为 `todo` 并写 `lastError='派发未启动：…'`——宁可留一张可见的待开始卡，也不误删 worker 可能正在用的卡；不会误建或误置 done。`subagent/end` 缺 `lastAssistantMessage` 时 `result` 留空、任务照样置 done；缺 `stopReason` 时按非 completed 处理（保持 doing）。升级 dsh 后跑 `node --test` 的闸门回归（`registerLeadDispatchGate` 注入假事件 + 断言 `{global:true}` 第三参 + deny 分支）与 §7 第 10 项真实链路 |
 | 组长在直聊里「先 `taskboard_add` 再 `subagent`」会造成两条任务 | persona 已写明「直聊派活不需要手动 add」（§6）；如果 worker prompt 带「任务 id：t-N」或标题，闸门会复用那条卡片（不会多一条）；prompt 完全没提任务时才会各自建卡，属预期（用户可见、可删） |
+| Team 模式与 `team:policy` 的 wait 例外 | 组长不使用 `wait_agent`，与宿主 policy「root must wait」有意偏离，冲突时以 persona 为准（组长靠 worker 完成通知开新一轮；占住会话等待会让轮询对其它任务持续报「组长忙」，§1.10） |
+| 组长启用 PTC（v0.2.8） | `run_code` 是 Node 子进程，可绕开「只读组长」边界直接读写工作区文件（权限=会话沙箱）；**不推荐、自担风险**，仅靠 persona 用法限制与评审纪律兜底 |
 
 ---
 
@@ -2012,3 +2085,24 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   `lib/client.js` 里各出现 ≥2 次（对话侧 + 侧边栏两份副本各一），某份漏回写直接红。
   `node --test` 全量 **278 pass / 0 fail**（v0.2.4 发布基线 273 → 274(t-87) → 276(t-89) → 278）；
   §1–§8 协议章节无变化（字段 / 端点未动）。
+
+- v0.2.8（与 Agent Teams 的分工 + worker 与组长预设启用 PTC 执行器；**`lib/` 零改动**）：`presets/taskboard.patch.yml`
+  两个 persona 各追加一段 Agent Teams 边界条款（条件句：仅当本会话出现 `team_task_*` 工具时适用，没有就
+  整段忽略、全部走看板；team 板只做「一张大卡拆给多个并行 worker」的卡内协调，结论 / 提问 / 验收只写
+  看板；并行 worker 文件集严格不相交、`write_scopes` 只是提示；组长不使用 `wait_agent`，对宿主
+  `team:policy`「root must wait」明确例外）；`docs/architecture.md` 新增 §1.10 与 §6 第 9 条、§8 wait 例外
+  一行、本条变更记录；`AGENTS.md`「看板工作流约定」补第 5 条；`package.json` 0.2.7 → 0.2.8。
+  追加（同一未发布版本，PTC 执行器）：`taskboard-worker` 预设的 `plugins:` 末尾（`present` 之前）加一行
+  `- id: tool-executor-ptc` / `name: '@deepseek-ai/dsh-tool-executor-ptc'`——dsh 0.2.2+ 的 PTC 执行器，
+  模型只看到 `run_code` + 按自身工具集生成的 SDK，多步取证一个程序跑完、中间结果不进历史；
+  起初只给 worker 开，组长 `taskboard-dispatch` 保持 native（理由 = 只读边界：`run_code` 是 Node 子进程、
+  能 `import('node:fs/promises')`，权限等于会话沙箱）；宿主缺 `ptcRuntime` 时该行 pending → 静默回落 native。
+  **组长 `taskboard-dispatch` 也启用 PTC**（用户要求；文档登记为不推荐/自担风险，见 §8）：同一对行插在
+  dispatch 的 `plugins:` 末尾（`present` 之后、`taskboard-worker` 声明之前）；组长 persona 增加 PTC 用法边界
+  （只读取证、禁止写文件/跑命令）；测试仍 279/279。
+  §6 新增 PTC 条（本次按「worker 与组长都启用 + 组长侧风险登记」改写）与「PTC 呈现与看板挂钩等价」条；
+  `test/host.test.mjs` 新增 1 条 PTC 形态闸门用例
+  （`callId: 'call-1:ptc:1'` + `rootCallId`：建卡 / `autoDispatch` / `assignee` / `subagent/end` 收尾与
+  native 形态等价）；`README.md` 补 dsh ≥ 0.2.2-rc.1 的兼容性说明与「组长开 PTC = 不推荐开关」的醒目警告。
+  `lib/index.js` / `lib/client.js` **零改动**。测试：`node --test` 全量 **279 pass / 0 fail**（v0.2.7 基线
+  278 → 279；新增的是 PTC 形态闸门用例）。

@@ -118,6 +118,17 @@ dsh web
 不需要任何额外安装步骤，也不写盘。默认的「工作区组长模式」下组长会话由插件自动创建，
 你通常不需要手动开这两个模式。
 
+> **兼容性**：需要 **dsh ≥ 0.2.2-rc.1**（`package.json` 的 `engines.dsh`）。`taskboard-worker` 用到 dsh
+> 0.2.2 才提供的 PTC 执行器 `@deepseek-ai/dsh-tool-executor-ptc`（运行时 `ctx.ptcRuntime`）；
+> dsh **0.1.x 没有这个包**，模式声明会挂载失败（看板页顶部出现红色诊断条，两个模式都不可用）。
+> worker 侧 PTC 在宿主缺 `ptcRuntime` 时会静默回落到 native 工具形态，不影响派发与看板。
+
+> ⚠️ **不推荐开关：工作区组长也启用了 PTC**（v0.2.8，按用户要求）。PTC 的 `run_code` 是 Node 子进程，
+> 可以 `import('node:fs/promises')` 直接读写工作区，权限等于会话沙箱（默认 `workspace-write`）——
+> 这会**突破「组长只读」的设计边界**。插件仅用 persona 用法限制（只读取证、禁止写文件/跑命令）兜底，
+> 属**自担风险**的配置；需要严格只读时，把 `presets/taskboard.patch.yml` 里 `taskboard-dispatch` 的
+> `tool-executor-ptc` 两行删掉即可恢复 native。
+
 ## 用法
 
 > v0.2.0 默认是「工作区组长模式」，流程见上面的「工作区组长模式怎么用」。下面是完整步骤（含旧模式差异）。

@@ -37,6 +37,12 @@ Host 半 `lib/index.js`（ESM，Cordis 插件），Client 半 `lib/client.js`（
    或「看板任务：t-N」）与标题，宿主据此复用原卡片（轮询任务的 worker 不要另立卡）；直聊派活由宿主
    自动建卡，**不要**再手动 `taskboard_add` 补记。遇到「派发已中止：没有看板卡片…」先修 `board.json`
    写权限或先建卡再重试，不要绕过闸门。
+5. **`team_task_*` 只用于卡内协调（v0.2.8）**：仅当本会话出现 `team_task_*` 工具时适用（profile 加载
+   `agent-team` 且 root 会话开启 Team 模式才注入，默认关；没有就整段忽略、全部走看板）。team 板只用于
+   看板卡执行期的卡内协调——先 `team_task_create` 建子任务拿到 id，再派 worker，worker prompt 同时带
+   看板卡号（行首「任务 id：t-N」）与 team 任务号（「team 任务：tm-N」）；**结论、提问、验收只走看板**，
+   不得写进 team 任务板；并行 worker 的文件集必须严格不相交。组长不使用 `wait_agent`（对宿主
+   `team:policy`「root must wait」的明确例外，冲突时以 persona 为准）。
 
 ## 验证流程
 
