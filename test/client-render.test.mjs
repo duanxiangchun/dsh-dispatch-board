@@ -2067,19 +2067,26 @@ function detailSessionButtons(tree) {
   return buttons(row)
 }
 
-test('extractSessionId / workerSessionOf：从装饰过的 assignee 里提取会话 id，普通标签不算会话', () => {
+test('extractSessionId / workerSessionOf：从装饰过的 assignee 里提取会话 id，普通标签 / subagent 名字不算会话', () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
   const { workerSessionOf, extractSessionId } = harness.exported.__test
   const WORKER_UUID = '5a6b02f1-6f5b-4719-a00c-c27396eff557'
   const LEAD_SESSION = 'session-6a5f0f02-489d-46c3-b8cc-f537ece53092'
+  // v0.2.9：`session-` 后必须是纯数字 / UUID / hex——历史 hex id 仍算会话。
+  const HEX_SESSION = 'session-aaaa1111'
 
   // ── 纯 id：原有行为不变 ──
   assert.equal(workerSessionOf(null), '')
   assert.equal(workerSessionOf({}), '')
   assert.equal(workerSessionOf({ assignee: '' }), '')
   assert.equal(workerSessionOf({ assignee: '   ' }), '')
-  assert.equal(workerSessionOf({ assignee: 'session-worker1111' }), 'session-worker1111')
-  assert.equal(workerSessionOf({ assignee: '  session-abc-123  ' }), 'session-abc-123', 'assignee is trimmed')
+  assert.equal(workerSessionOf({ assignee: HEX_SESSION }), HEX_SESSION, '历史 hex 形态仍是会话 id')
+  assert.equal(workerSessionOf({ assignee: '  ' + HEX_SESSION + '  ' }), HEX_SESSION, 'assignee is trimmed')
+  assert.equal(
+    workerSessionOf({ assignee: 'session-1747351234567' }),
+    'session-1747351234567',
+    '纯数字（时间戳）形态仍是会话 id',
+  )
   assert.equal(workerSessionOf({ assignee: WORKER_UUID }), WORKER_UUID, 'bare UUID (host subagentId) is a session id')
   assert.equal(workerSessionOf({ assignee: LEAD_SESSION }), LEAD_SESSION)
   assert.equal(
@@ -2099,15 +2106,15 @@ test('extractSessionId / workerSessionOf：从装饰过的 assignee 里提取会
     [LEAD_SESSION + ' (sub-agent)', LEAD_SESSION],
     ['组长：' + LEAD_SESSION, LEAD_SESSION],
     ['worker: ' + LEAD_SESSION + '（子 Agent）', LEAD_SESSION],
-    ['session-worker1111 extra', 'session-worker1111'],
-    ['session-abc-123.', 'session-abc-123'],
+    [HEX_SESSION + ' extra', HEX_SESSION],
+    [HEX_SESSION + '.', HEX_SESSION],
   ]
   decorated.forEach(([text, expected]) => {
     assert.equal(extractSessionId(text), expected, 'extractSessionId: ' + text)
     assert.equal(workerSessionOf({ assignee: text }), expected, 'workerSessionOf: ' + text)
   })
 
-  // ── 不误判：普通标签 / 中文 / 空 / 非字符串 / 被别的词粘住的片段 ──
+  // ── 不误判：普通标签 / subagent 名字 / 中文 / 空 / 非字符串 / 被别的词粘住的片段 ──
   const notSessions = [
     'worker-42',
     'main',
@@ -2117,6 +2124,12 @@ test('extractSessionId / workerSessionOf：从装饰过的 assignee 里提取会
     '   ',
     'session-',
     'session-（待定）',
+    // v0.2.9 根因：组长把 subagent 名字写进 assignee，旧正则把它当会话 id。
+    'session-jump-bug',
+    'session-jump-fix',
+    'session-worker1111',
+    'session-abc-123',
+    'dsh-agent-teams',
     '6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a',
     'task-' + WORKER_UUID,
     WORKER_UUID + '0',
@@ -2131,10 +2144,26 @@ test('extractSessionId / workerSessionOf：从装饰过的 assignee 里提取会
   assert.equal(extractSessionId(42), '')
   assert.equal(extractSessionId({ assignee: WORKER_UUID }), '')
   assert.equal(workerSessionOf({ assignee: 42 }), '', 'non-string assignee is not a session')
+
+  // ── v0.2.9：宿主字段 workerSessionId（优先）与老 Host 的 assignee 回退 ──
+  const { workerSessionIdOf, taskWorkerSession } = harness.exported.__test
+  assert.equal(workerSessionIdOf({ workerSessionId: WORKER_UUID, assignee: 'session-jump-bug' }), WORKER_UUID)
+  assert.equal(
+    taskWorkerSession({ workerSessionId: WORKER_UUID, assignee: 'session-jump-bug' }),
+    WORKER_UUID,
+    '宿主字段优先于 assignee 里的 subagent 名字',
+  )
+  assert.equal(taskWorkerSession({ assignee: WORKER_UUID }), WORKER_UUID, '老 Host（无宿主字段）回退 assignee')
+  assert.equal(taskWorkerSession({ assignee: 'session-jump-bug' }), '', '名字 assignee + 无宿主字段 → 没有执行会话')
+  assert.equal(workerSessionIdOf({ workerSessionId: 'session-jump-bug' }), '', '脏宿主字段也不当会话 id')
+  assert.equal(workerSessionIdOf(null), '')
+  assert.equal(taskWorkerSession(null), '')
 })
 
 test('卡片「对话」按钮：优先 worker 子会话，其次组长 / 发起会话；非会话 assignee 不出按钮', async () => {
   const WORKER_UUID = '6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b'
+  // v0.2.9：旧夹具 `session-worker1111` 是 subagent 名字，收紧后不再算会话 id → 换成 UUID 夹具。
+  const WORKER_UUID_3 = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
   const snapshot = makeSnapshot({
     tasks: [
       { id: 'c-1', title: '只有发起会话', status: 'todo', cwd: WS_A, sessionId: 'session-aaaa1111', updatedAt: minutesAgo(2) },
@@ -2146,7 +2175,7 @@ test('卡片「对话」按钮：优先 worker 子会话，其次组长 / 发起
         cwd: WS_A,
         sessionId: 'session-cccc3333',
         dispatchedSessionId: 'session-dddd4444',
-        assignee: 'session-worker1111',
+        assignee: WORKER_UUID_3,
         updatedAt: minutesAgo(2),
       },
       { id: 'c-4', title: '只有 worker', status: 'todo', cwd: WS_A, assignee: WORKER_UUID, updatedAt: minutesAgo(2) },
@@ -2161,12 +2190,14 @@ test('卡片「对话」按钮：优先 worker 子会话，其次组长 / 发起
         assignee: WORKER_UUID + '（worker）',
         updatedAt: minutesAgo(2),
       },
+      // v0.2.9 根因：组长把 subagent 名字写进 assignee（真实现场 session-jump-bug / session-jump-fix）。
+      { id: 'c-7', title: 'subagent 名字执行者', status: 'todo', cwd: WS_A, assignee: 'session-jump-bug', updatedAt: minutesAgo(2) },
     ],
   })
   const harness = createHarness({ snapshot })
   const { tree } = await renderComponent(harness.componentOf('main'), {})
 
-  assert.equal(nodesWithClass(tree, 'tb-card').length, 6)
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 7)
   const chatButtons = buttons(tree).filter((node) => textOf(node).trim() === '对话')
   assert.equal(chatButtons.length, 5, 'only tasks with a real linked session expose the 对话 action')
 
@@ -2183,19 +2214,19 @@ test('卡片「对话」按钮：优先 worker 子会话，其次组长 / 发起
   assert.deepEqual(harness.openSessionCalls, ['session-aaaa1111'], 'creator session id is used when no dispatch ran')
   clickChat('只有组长会话', 'session-bbbb2222')
   assert.deepEqual(harness.openSessionCalls, ['session-aaaa1111', 'session-bbbb2222'])
-  clickChat('三者都有', 'session-worker1111')
+  clickChat('三者都有', WORKER_UUID_3)
   assert.deepEqual(
     harness.openSessionCalls,
-    ['session-aaaa1111', 'session-bbbb2222', 'session-worker1111'],
+    ['session-aaaa1111', 'session-bbbb2222', WORKER_UUID_3],
     'worker session (assignee) wins over lead and creator session',
   )
   clickChat('只有 worker', WORKER_UUID)
-  assert.deepEqual(harness.openSessionCalls, ['session-aaaa1111', 'session-bbbb2222', 'session-worker1111', WORKER_UUID])
+  assert.deepEqual(harness.openSessionCalls, ['session-aaaa1111', 'session-bbbb2222', WORKER_UUID_3, WORKER_UUID])
   // t-39 根因回归：assignee 是 `…（worker）` 时仍选 worker，而不是回退到 dispatchedSessionId（组长）
   clickChat('装饰过的 worker', WORKER_UUID)
   assert.deepEqual(
     harness.openSessionCalls,
-    ['session-aaaa1111', 'session-bbbb2222', 'session-worker1111', WORKER_UUID, WORKER_UUID],
+    ['session-aaaa1111', 'session-bbbb2222', WORKER_UUID_3, WORKER_UUID, WORKER_UUID],
     'decorated assignee still resolves to the worker session, not the lead session',
   )
 
@@ -2205,9 +2236,93 @@ test('卡片「对话」按钮：优先 worker 子会话，其次组长 / 发起
     !buttons(labelCard).some((node) => textOf(node).trim() === '对话'),
     'a plain label assignee (worker-42) must not be treated as a session',
   )
+  // v0.2.9：subagent 名字看起来像 `session-…` 但不是会话 id → 既不出按钮，也不产生候选。
+  const namedCard = cardByTitle(tree, 'subagent 名字执行者')
+  assert.ok(namedCard)
+  assert.ok(
+    !buttons(namedCard).some((node) => textOf(node).trim() === '对话'),
+    'a subagent name (session-jump-bug) must not be treated as a session',
+  )
+})
+
+test('宿主 workerSessionId 优先：assignee 是 subagent 名字时「对话」仍指向真会话，详情同源（v0.2.9）', async () => {
+  const HOST_WORKER = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 'h-1',
+        title: '宿主记了执行会话',
+        status: 'doing',
+        cwd: WS_A,
+        sessionId: 'session-aaaa1111',
+        dispatchedSessionId: 'session-bbbb2222',
+        // 真实现场：组长把 subagent 名字写进 assignee，宿主把真会话 id 记在 workerSessionId。
+        assignee: 'session-jump-fix',
+        workerSessionId: HOST_WORKER,
+        workerRunState: 'failed',
+        updatedAt: minutesAgo(2),
+      },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const card = cardByTitle(tree, '宿主记了执行会话')
+  assert.ok(card)
+  const chat = buttons(card).find((node) => textOf(node).trim() === '对话')
+  assert.ok(chat, 'the card must expose 对话 (host wrote a real worker session id)')
+  assert.equal(chat.props.title, HOST_WORKER, 'workerSessionId wins over the subagent name in assignee')
+  chat.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, [HOST_WORKER], 'the host-recorded worker session is the jump target')
+  const afterChat = await instance.run()
+  assert.equal(noticeBanners(afterChat).length, 0, 'an openable first candidate needs no notice')
+
+  // 详情浮层「执行对话」同一口径（不再拿 assignee 的名字冒充会话）。
+  const opened = await openDetailByTitle(instance, afterChat, '宿主记了执行会话')
+  const runner = detailSessionButtons(opened).find((node) => textOf(node).startsWith('执行对话'))
+  assert.ok(runner, 'detail must render the 执行对话 button from workerSessionId')
+  assert.equal(runner.props.title, HOST_WORKER)
+})
+
+test('卡片「对话」：唯一候选就是当前会话 → 不调用 openSession，给「执行对话已失效」提示（v0.2.9）', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 'cur-1',
+        title: '只剩当前会话',
+        status: 'todo',
+        cwd: WS_A,
+        // 唯一候选 = 发起会话 = 用户当前所在会话：openSession 是同步 void，打开它等于什么都没发生。
+        sessionId: SESSION_A,
+        updatedAt: minutesAgo(2),
+      },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const card = cardByTitle(tree, '只剩当前会话')
+  assert.ok(card)
+  const chat = buttons(card).find((node) => textOf(node).trim() === '对话')
+  assert.ok(chat)
+  assert.equal(chat.props.title, SESSION_A)
+  chat.props.onClick()
+  assert.deepEqual(harness.openSessionCalls, [], 'opening the current session is a no-op: never call openSession')
+  const next = await instance.run()
+  const banners = noticeBanners(next)
+  assert.equal(banners.length, 1, 'a no-op target must be reported, not silently ignored')
+  assert.equal(banners[0].props['data-tone'], 'warn')
+  assert.ok(
+    textOf(banners[0]).includes('执行对话已失效'),
+    'banner must say the worker conversation is gone, got: ' + textOf(banners[0]),
+  )
+  assert.ok(textOf(banners[0]).includes('没有可跳转的会话'))
+  assert.deepEqual(harness.sandboxErrors, [])
 })
 
 test('详情「关联对话」：发起 / 执行（worker）/ 组长三个按钮各自可点，无会话给 muted 文案', async () => {
+  // v0.2.9：执行对话用真会话 id（UUID）；`session-worker1111` 是 subagent 名字，收紧后不算会话。
+  const WORKER = 'aaaaaaaa-bbbb-4ccc-8ddd-1234567890ab'
   const snapshot = makeSnapshot({
     tasks: [
       {
@@ -2217,7 +2332,7 @@ test('详情「关联对话」：发起 / 执行（worker）/ 组长三个按钮
         cwd: WS_A,
         sessionId: 'session-cccc3333',
         dispatchedSessionId: 'session-dddd4444',
-        assignee: 'session-worker1111',
+        assignee: WORKER,
         updatedAt: minutesAgo(2),
       },
       {
@@ -2241,7 +2356,7 @@ test('详情「关联对话」：发起 / 执行（worker）/ 组长三个按钮
   let sessionButtons = detailSessionButtons(opened)
   assert.deepEqual(
     sessionButtons.map((node) => textOf(node)),
-    ['发起对话 · cccc3333', '执行对话 · rker1111', '组长对话 · dddd4444'],
+    ['发起对话 · cccc3333', '执行对话 · 567890ab', '组长对话 · dddd4444'],
     'creator / worker / lead buttons render in that order',
   )
 
@@ -2249,15 +2364,15 @@ test('详情「关联对话」：发起 / 执行（worker）/ 组长三个按钮
   const runner = sessionButtons[1]
   const lead = sessionButtons[2]
   assert.equal(creator.props.title, 'session-cccc3333')
-  assert.equal(runner.props.title, 'session-worker1111')
+  assert.equal(runner.props.title, WORKER)
   assert.equal(lead.props.title, 'session-dddd4444')
 
   creator.props.onClick()
   assert.deepEqual(harness.openSessionCalls, ['session-cccc3333'])
   runner.props.onClick()
-  assert.deepEqual(harness.openSessionCalls, ['session-cccc3333', 'session-worker1111'])
+  assert.deepEqual(harness.openSessionCalls, ['session-cccc3333', WORKER])
   lead.props.onClick()
-  assert.deepEqual(harness.openSessionCalls, ['session-cccc3333', 'session-worker1111', 'session-dddd4444'])
+  assert.deepEqual(harness.openSessionCalls, ['session-cccc3333', WORKER, 'session-dddd4444'])
 
   // 没有 worker、只有 dispatchedSessionId → 不再叫「执行对话」，改为「组长对话」
   const closeButton = buttons(opened).find((node) => node.props['aria-label'] === '关闭')
@@ -2417,7 +2532,7 @@ test('平台看板（main 槽位）卡片「对话」：目标可打开时调用
   assert.deepEqual(harness.sandboxErrors, [])
 })
 
-test('平台看板（main 槽位）卡片「对话」：worker 会话打不开时回退组长会话（不再是点了没反应）', async () => {
+test('平台看板（main 槽位）卡片「对话」：worker 会话打不开时回退组长会话，且回退必须可见（v0.2.9）', async () => {
   const WORKER = 'b60e5afa-b565-4b99-98d1-079ed5f29a5f'
   const LEAD = 'session-lead2222'
   const snapshot = makeSnapshot({
@@ -2451,7 +2566,14 @@ test('平台看板（main 槽位）卡片「对话」：worker 会话打不开�
   chat.props.onClick()
   assert.deepEqual(harness.openSessionCalls, [WORKER, LEAD], 'unopenable worker falls back to the lead session')
   const next = await instance.run()
-  assert.equal(noticeBanners(next).length, 0, 'a successful fallback needs no warning banner')
+  // v0.2.9 根因：回退到组长后旧行为只清提示、什么都不说，用户看到的是「点了没反应」。
+  // 现在回退**必须**出 warn，且写明打开的是哪个会话。
+  const banners = noticeBanners(next)
+  assert.equal(banners.length, 1, 'a fallback must be visible: exactly one warn banner')
+  assert.equal(banners[0].props['data-tone'], 'warn')
+  assert.ok(textOf(banners[0]).includes('执行对话不可用'), 'banner must say the worker conversation is unavailable, got: ' + textOf(banners[0]))
+  assert.ok(textOf(banners[0]).includes('已打开组长对话'), 'banner must say it opened the lead conversation')
+  assert.ok(textOf(banners[0]).includes('lead2222'), 'banner names the opened session tail')
   assert.ok(
     harness.warnings.some((line) => line.includes('跳转会话失败')),
     'the failed worker attempt is still logged, got: ' + JSON.stringify(harness.warnings),
@@ -2502,7 +2624,8 @@ test('平台看板（main 槽位）卡片「对话」：全部会话都打不开
 
 test('详情浮层会话按钮失败：提示渲染在浮层内部（不被 .tb-detail-mask 遮住），成功跳转后清掉', async () => {
   const CREATOR = 'session-cccc3333'
-  const WORKER = 'session-worker1111'
+  // v0.2.9：执行对话夹具必须是真会话 id（`session-worker1111` 是 subagent 名字）。
+  const WORKER = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
   const snapshot = makeSnapshot({
     tasks: [
       {

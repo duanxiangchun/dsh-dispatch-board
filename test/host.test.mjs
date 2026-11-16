@@ -77,6 +77,7 @@ import {
   loadAttachmentIndex,
   loadBoardFromDisk,
   localStamp,
+  looksLikeSessionId,
   normalizeBoard,
   normalizeConfig,
   normalizeConfig as normalizeConfigAlias,
@@ -284,11 +285,16 @@ test('sending a task back to todo re-arms dispatch bookkeeping', () => {
   task.notifiedAt = new Date(NOW).toISOString()
   task.notificationCount = 3
   task.assignee = 'child-1'
+  // v0.2.9：执行会话记账由宿主写；回到 todo 必须一起清（旧 worker 的会话不该再被跳转）。
+  task.workerSessionId = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
+  task.workerRunState = 'failed'
   applyTaskUpdate(state, 't-1', { status: 'todo' }, NOW + 1000)
   assert.equal(task.notifiedAt, null)
   assert.equal(task.notificationCount, 0)
   assert.equal(task.assignee, '')
   assert.equal(task.startedAt, null)
+  assert.equal(task.workerSessionId, null, '→todo 清空 workerSessionId')
+  assert.equal(task.workerRunState, null, '→todo 清空 workerRunState')
 })
 
 test('applyTaskUpdate rejects unknown id and empty title', () => {
@@ -2534,6 +2540,31 @@ test('normalizeTask keeps only the known autoDispatch marker', () => {
   assert.equal(isLeadAutoTask(state.tasks[1]), false)
 })
 
+test('normalizeTask keeps host-only workerSessionId / workerRunState (old board → null)', () => {
+  const WORKER = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
+  const { state } = normalizeBoard({
+    version: 1,
+    tasks: [
+      { id: 't-1', title: '带宿主字段', workerSessionId: WORKER, workerRunState: 'failed' },
+      { id: 't-2', title: '脏值', workerSessionId: 42, workerRunState: 'weird' },
+      { id: 't-3', title: '老 board（没有这两个字段）' },
+      { id: 't-4', title: '空串 id', workerSessionId: '   ', workerRunState: 'ended' },
+    ],
+  })
+  assert.equal(state.tasks[0].workerSessionId, WORKER)
+  assert.equal(state.tasks[0].workerRunState, 'failed')
+  assert.equal(state.tasks[1].workerSessionId, null, '非字符串 → null')
+  assert.equal(state.tasks[1].workerRunState, null, '未知运行状态 → null')
+  assert.equal(state.tasks[2].workerSessionId, null, '老 board 缺字段 = null（不迁移）')
+  assert.equal(state.tasks[2].workerRunState, null)
+  assert.equal(state.tasks[3].workerSessionId, null, '空串不采用')
+  assert.equal(state.tasks[3].workerRunState, 'ended')
+  // 宿主独占字段不进模型工具输出（封闭契约，§4.4）。
+  const brief = taskBrief(state.tasks[0])
+  assert.equal(Object.prototype.hasOwnProperty.call(brief, 'workerSessionId'), false)
+  assert.equal(Object.prototype.hasOwnProperty.call(brief, 'workerRunState'), false)
+})
+
 test('a lead dispatching in a direct chat creates one doing board task', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-lead-auto-'))
   try {
@@ -3479,6 +3510,194 @@ test('a dispatch without a card gets one before the worker starts (gate auto-cre
     assert.equal(state.tasks[0].autoDispatch, LEAD_AUTO_MARK)
     assert.equal(rt.leadAuto.created, 1, '闸门建卡后 handleSubagentDispatch 不再计数')
     assert.equal(rt.leadAuto.lastWorkerSessionId, 'worker-1')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('looksLikeSessionId 收紧：subagent 名字（session-jump-bug）不再被当成会话 id', () => {
+  const WORKER = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
+  const sessions = [WORKER, 'session-' + WORKER, 'session-1747351234567', 'session-aaaa1111']
+  for (const value of sessions) assert.equal(looksLikeSessionId(value), true, '真实会话 id：' + value)
+  const labels = ['session-jump-bug', 'session-jump-fix', 'session-worker1111', 'dsh-agent-teams', 'worker-42', 'main', 'session-', '']
+  for (const value of labels) assert.equal(looksLikeSessionId(value), false, '不是会话 id：' + JSON.stringify(value))
+  // 认领判定跟着修好：组长把名字写进 assignee 不会让卡片变得「不可认领」。
+  assert.equal(canReuseMentionedTask({ status: 'todo', assignee: 'session-jump-bug' }), true)
+  assert.equal(canReuseMentionedTask({ status: 'todo', assignee: WORKER }), false, '真挂了 worker 的卡仍不被抢')
+})
+
+test('workerSessionId：闸门建卡为 null，tools/result 总是写本次 childId + running', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-worker-session-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = { description: '直聊派活', prompt: '把 X 改成 Y' }
+    const exec = { callId: 'call-ws-1', name: 'subagent', agent: lead, arguments: args }
+
+    const outcome = prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW)
+    assert.equal(outcome.created, true)
+    const task = state.tasks[0]
+    assert.equal(task.workerSessionId, null, 'worker 还没启动：执行会话未知')
+    assert.equal(task.workerRunState, null)
+
+    const WORKER = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
+    const attached = handleSubagentDispatch(rt, { agent: lead, childId: WORKER, args, exec }, NOW + 1)
+    assert.equal(attached.reason, 'prepared')
+    assert.equal(task.assignee, WORKER)
+    assert.equal(task.workerSessionId, WORKER, '宿主记下真正在跑的执行会话 id')
+    assert.equal(task.workerRunState, 'running')
+
+    // 真实现场：组长用 taskboard_update 把 assignee 写成 subagent 名字（board.json 里的 session-jump-fix）。
+    applyTaskUpdate(state, task.id, { assignee: 'session-jump-fix' }, NOW + 2)
+    assert.equal(task.assignee, 'session-jump-fix')
+    assert.equal(task.workerSessionId, WORKER, '模型写 assignee 不影响宿主独占字段')
+    assert.equal(task.workerRunState, 'running')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('workerSessionId：轮询任务重派时总是刷新为新 worker 会话（旧 assignee 不阻挡）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-worker-session-redispatch-'))
+  try {
+    const state = createEmptyBoard()
+    const polled = deliveredPolledTask(state, NOW, { title: '轮询任务' })
+    // 上一轮组长把 subagent 名字写进 assignee，旧的执行会话也已经中断。
+    polled.assignee = 'session-jump-fix'
+    polled.workerSessionId = 'aaaaaaaa-bbbb-4ccc-8ddd-1234567890ab'
+    polled.workerRunState = 'failed'
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = { description: '返工', prompt: '## 任务\n- 任务 id：`t-1`\n- 标题：轮询任务' }
+    const exec = { callId: 'call-ws-2', name: 'subagent', agent: lead, arguments: args }
+
+    const gate = prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW + 10_000)
+    assert.equal(gate.created, false, '显式任务 id 复用原卡')
+    assert.equal(gate.reused, 'task-id')
+    assert.equal(canReuseMentionedTask(polled), true, '名字 assignee 不再是「已挂 worker」')
+
+    const WORKER2 = 'b60e5afa-b565-4b99-98d1-079ed5f29a5f'
+    handleSubagentDispatch(rt, { agent: lead, childId: WORKER2, args, exec }, NOW + 10_001)
+    assert.equal(polled.assignee, 'session-jump-fix', '轮询任务的 assignee 不被宿主覆盖（组长审核的对象）')
+    assert.equal(polled.workerSessionId, WORKER2, '执行会话 id 总是覆盖为本次 worker（不看 assignee / autoDispatch）')
+    assert.equal(polled.workerRunState, 'running')
+    assert.equal(polled.autoDispatch, null, '轮询任务仍不带自动收尾标记')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('workerSessionId：非 completed 的 subagent/end 保留 id、标 failed（不清 assignee）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-worker-session-failed-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = { description: '会中断的活', prompt: '把 X 改成 Y' }
+    const exec = { callId: 'call-ws-3', name: 'subagent', agent: lead, arguments: args }
+    const WORKER = 'c1d2e3f4-a5b6-47c8-9d0e-1f2a3b4c5d6e'
+
+    prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW)
+    handleSubagentDispatch(rt, { agent: lead, childId: WORKER, args, exec }, NOW + 1)
+    const outcome = await handleSubagentEnd(
+      rt,
+      { id: WORKER, stopReason: 'error', lastAssistantMessage: [{ type: 'text', text: '会话中断了' }] },
+      NOW + 2,
+    )
+
+    const task = state.tasks[0]
+    assert.equal(outcome.reason, 'worker-error')
+    assert.equal(task.status, 'doing', '非 completed 不置 done')
+    assert.match(task.lastError, /worker 结束（error）/)
+    assert.equal(task.workerSessionId, WORKER, '异常中断也保留执行会话 id（看板「对话」仍可试它）')
+    assert.equal(task.workerRunState, 'failed')
+    assert.equal(task.assignee, WORKER, 'assignee 不被清空')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('workerSessionId：completed 的 subagent/end 保留 id、标 ended', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-worker-session-ended-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    const args = { description: '正常完成', prompt: '把 X 改成 Y' }
+    const exec = { callId: 'call-ws-4', name: 'subagent', agent: lead, arguments: args }
+    const WORKER = 'd4e5f6a7-b8c9-40d1-8e2f-3a4b5c6d7e8f'
+
+    prepareLeadDispatch(rt, { agent: lead, exec, args }, NOW)
+    handleSubagentDispatch(rt, { agent: lead, childId: WORKER, args, exec }, NOW + 1)
+    const outcome = await handleSubagentEnd(
+      rt,
+      { id: WORKER, stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: '## 结论\n\n- 完成' }] },
+      NOW + 2,
+    )
+
+    const task = state.tasks[0]
+    assert.equal(outcome.updated, true)
+    assert.equal(task.status, 'done')
+    assert.equal(task.workerSessionId, WORKER, '正常结束保留执行会话 id（仍可回看 worker 对话）')
+    assert.equal(task.workerRunState, 'ended')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('requeueTasksOfLead：组长归档重排时清空 workerSessionId / workerRunState', () => {
+  const state = boardWith('归档组长名下的任务')
+  const task = state.tasks[0]
+  const WORKER = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
+  applyTaskUpdate(state, 't-1', { status: 'doing' }, NOW)
+  task.assignee = WORKER
+  task.workerSessionId = WORKER
+  task.workerRunState = 'running'
+  task.dispatchedSessionId = 'archived-lead'
+
+  const requeued = requeueTasksOfLead(state, 'archived-lead', NOW + 1000)
+  assert.equal(requeued, 1)
+  assert.equal(task.status, 'todo')
+  assert.equal(task.assignee, '')
+  assert.equal(task.workerSessionId, null, '重排回 todo 清空执行会话 id')
+  assert.equal(task.workerRunState, null)
+})
+
+test('workerSessionId / workerRunState 是宿主独占字段：模型工具与 update-task patch 都写不进去', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-worker-session-hostonly-'))
+  try {
+    const state = createEmptyBoard()
+    addTask(state, { title: '宿主字段' }, NOW)
+    const { ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    const registered = []
+    registerTools({ tools: { register: (definition) => registered.push(definition) } }, rt)
+    const updateTool = registered.find((tool) => tool.name === 'taskboard_update')
+    const WORKER = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
+
+    // 1) 工具参数是封闭契约：宿主独占字段没有声明，也不在 execute 的 field 白名单里。
+    assert.equal(Object.prototype.hasOwnProperty.call(updateTool.parameters.properties, 'workerSessionId'), false)
+    assert.equal(Object.prototype.hasOwnProperty.call(updateTool.parameters.properties, 'workerRunState'), false)
+    const out = await updateTool.execute({
+      id: 't-1',
+      result: '审核结论',
+      workerSessionId: WORKER,
+      workerRunState: 'ended',
+    })
+    const task = state.tasks[0]
+    assert.equal(out.task.result, '审核结论', '正常字段照常写入')
+    assert.equal(task.workerSessionId, null, '模型传 workerSessionId 被忽略')
+    assert.equal(task.workerRunState, null, '模型传 workerRunState 被忽略')
+
+    // 2) RPC update-task 的 patch 直接交给 applyTaskUpdate：未知键静默忽略（不抛错、不写入）。
+    const patched = applyTaskUpdate(state, 't-1', { workerSessionId: WORKER, workerRunState: 'failed' }, NOW + 10)
+    assert.equal(patched.workerSessionId, null)
+    assert.equal(patched.workerRunState, null)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
