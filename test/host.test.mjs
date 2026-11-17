@@ -3095,7 +3095,7 @@ test('the tools/result hook only fires on a successful subagent activation', () 
     ]
     for (const [exec, result] of ignored) listeners['tools/result'](exec, result)
     assert.equal(state.tasks.length, 0, '以上都不建任务（命中条件收紧）')
-    assert.equal(rt.leadAuto.skipped, 0, '监听器入口就返回，不计数（§3.2 的 skipped 口径）')
+    assert.equal(rt.leadAuto.skipped, 1, '缺 id 且没有闸门卡片的 activation 会走到 handler，但没有动作 → 计一次 skipped（§3.2 口径）')
 
     // 真正的成功派发才建任务。
     listeners['tools/result'](
@@ -4183,6 +4183,120 @@ test('the pre-execute gate also covers the PTC nested callId (call-1:ptc:1)', as
     await new Promise((resolve) => setTimeout(resolve, 0))
     assert.equal(state.tasks[0].status, 'done', 'PTC 派发的 worker 结束照常自动收尾')
     assert.match(state.tasks[0].result, /PTC worker 完工/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a current-dsh activation (name only) keeps the gate card doing and backfills workerSessionId from the catalog', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-activation-name-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead } = leadFixture()
+    const listeners = {}
+    const parentId = lead.session.id
+    const subagents = {
+      listDescendants: async () => [
+        { kind: 'child', id: 'child-name-only', parentId, name: 'worker-name', mode: 'continuable', depth: 1 },
+      ],
+    }
+    const hookCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) =>
+        name === 'agentPresets'
+          ? { presetForSession: () => 'taskboard-dispatch' }
+          : name === 'subagents'
+            ? subagents
+            : undefined,
+    }
+    const rt = fakeRuntime(state, hookCtx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    assert.equal(registerLeadDispatchGate(hookCtx, rt), true)
+    assert.equal(registerLeadAutoHooks(hookCtx, rt), true)
+
+    const exec = { name: 'subagent', callId: 'call-name-only', agent: lead, arguments: { description: 'name-only 派发', prompt: '干活' } }
+    assert.deepEqual(await listeners['tools/pre-execute'](exec, async () => ({ kind: 'allow' })), { kind: 'allow' })
+    assert.equal(state.tasks.length, 1)
+    assert.equal(state.tasks[0].status, 'doing')
+
+    // 当前 dsh 的 subagent 输出：{kind:'activation', name}，没有 subagentId。
+    listeners['tools/result'](exec, { isError: false, value: { kind: 'activation', name: 'worker-name' }, content: [] })
+    const card = state.tasks[0]
+    assert.equal(card.status, 'doing', 'activation 即已启动：不能降级回 todo（否则轮询会再派一次）')
+    assert.equal(card.autoDispatch, LEAD_AUTO_MARK, '仍归宿主自动任务')
+    assert.equal(card.assignee, 'worker-name', '先用 name 占位')
+    assert.equal(card.workerSessionId, null, '会话 id 由 catalog 异步回填')
+    assert.equal(card.workerRunState, 'running')
+    assert.equal(card.lastError, '')
+    assert.equal(rt.leadAuto.aborted, 0, '不能走「派发未启动」降级分支')
+    assert.deepEqual(selectDispatchCandidates(state, NOW), [], 'doing 卡不会进入轮询候选（不会二次派发）')
+
+    // 异步回填：subagents.listDescendants(parent).name → childId。
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(card.workerSessionId, 'child-name-only', 'name 在同一父级下唯一，回填子会话 id')
+    assert.equal(rt.leadAuto.lastWorkerSessionId, 'child-name-only')
+
+    // subagent/end 用 childId 收尾同一张卡。
+    listeners['subagent/end']({
+      runId: 'run-name-only',
+      provider: 'spawn',
+      parentSessionId: parentId,
+      id: 'child-name-only',
+      local: true,
+      stopReason: 'completed',
+      lastAssistantMessage: [{ type: 'text', text: 'name-only worker 完成' }],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(card.status, 'done')
+    assert.match(card.result, /name-only worker 完成/)
+    assert.equal(card.workerRunState, 'ended')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('subagent/end claims the only running auto card by parentSessionId when the worker id was not backfilled', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-activation-end-fallback-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead } = leadFixture()
+    const listeners = {}
+    const parentId = lead.session.id
+    const hookCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      // 故意不提供 subagents 服务：回填不可用。
+      get: (name) => (name === 'agentPresets' ? { presetForSession: () => 'taskboard-dispatch' } : undefined),
+    }
+    const rt = fakeRuntime(state, hookCtx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    assert.equal(registerLeadDispatchGate(hookCtx, rt), true)
+    assert.equal(registerLeadAutoHooks(hookCtx, rt), true)
+
+    const exec = { name: 'subagent', callId: 'call-end-fallback', agent: lead, arguments: { description: 'end 兜底认领', prompt: '干活' } }
+    await listeners['tools/pre-execute'](exec, async () => ({ kind: 'allow' }))
+    listeners['tools/result'](exec, { isError: false, value: { kind: 'activation', name: 'worker-no-catalog' }, content: [] })
+    const card = state.tasks[0]
+    assert.equal(card.status, 'doing')
+    assert.equal(card.workerSessionId, null, '没有 catalog 服务 → 回填不了')
+
+    listeners['subagent/end']({
+      runId: 'run-end-fallback',
+      provider: 'spawn',
+      parentSessionId: parentId,
+      id: 'child-end-fallback',
+      local: true,
+      stopReason: 'completed',
+      lastAssistantMessage: [{ type: 'text', text: 'end 兜底收尾' }],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(card.status, 'done', '该组长名下只有这一条 running 自动卡 → 按 parentSessionId 认领')
+    assert.match(card.result, /end 兜底收尾/)
+    assert.equal(card.workerSessionId, 'child-end-fallback', '收尾时补上真实 worker 会话 id')
+    assert.equal(card.workerRunState, 'ended')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

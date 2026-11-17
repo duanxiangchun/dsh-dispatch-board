@@ -298,8 +298,8 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 | 事件 | 来源 | 用途 |
 | --- | --- | --- |
 | `tools/pre-execute` | `@deepseek-ai/dsh-tools` 的**派发前** allow/deny 瀑布（`(exec, next)`） | **强制建卡闸门**：只拦 `exec.name === 'subagent'` 且调用方预设是 `taskboard-dispatch` 的调用；认领 / 新建卡片，失败返回 `{kind:'deny', reason, info:{name:'TaskboardDispatchError', code}}`（worker 不启动） |
-| `tools/result` | 工具调用结束后的**观察事件**（emit，监听器异常被宿主隔离） | worker 真的启动后把 `subagentId` 挂到闸门准备的卡片上：**总是**写 `workerSessionId = subagentId` + `workerRunState='running'`（宿主独占字段，§2），`assignee` 按旧规则补/覆盖；worker 没启动 / 无法确认启动（被 deny / 启动失败 / 取消 / `post-execute` block / 返回形状变化）→ **不删卡**，只把闸门预建的卡片降级为 `todo` + `lastError='派发未启动：…'` |
-| `subagent/end` | `@deepseek-ai/dsh-subagent` 生命周期事件（`{runId, provider, id, local, stopReason, lastAssistantMessage}`） | worker 结束 → 给**带标记的自动任务**写回 `done` + `result`（轮询任务交给组长审核） |
+| `tools/result` | 工具调用结束后的**观察事件**（emit，监听器异常被宿主隔离） | worker 真的启动后把 worker 信息挂到闸门准备的卡片上：**总是**写 `workerRunState='running'` 和本次 worker 的 `assignee`；`workerSessionId` 有 `result.value.subagentId` 时直接写，没有时（当前 dsh 的 `subagent` 只返回 `{kind:'activation', name}`）按 `name` 从子 Agent 目录异步回填（§2）。**`kind==='activation'` 即视为已启动**——不再因为缺 `subagentId` 把卡片降级；只有非 activation / 错误 / 取消 / `post-execute` block / 返回形状不是 activation 时才降级为 `todo` + `lastError='派发未启动：…'`（不删卡） |
+| `subagent/end` | `@deepseek-ai/dsh-subagent` 生命周期事件（`{runId, provider, parentSessionId, id, local, stopReason, lastAssistantMessage}`） | worker 结束 → 给**带标记的自动任务**写回 `done` + `result`（轮询任务交给组长审核）；`id` 还没回填时按 `parentSessionId` + 唯一 running 自动卡兜底认领 |
 
 - 监听器以 `{ global: true }` 注册：不受 scope 过滤（`tools/*` 的 carrier 按调用 Agent 过滤），
   宿主插件自身在 handler 里先按预设过滤，不会误伤别的 Agent。
@@ -307,7 +307,8 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
   `ToolExecutionPipeline`（`prepare` → `tools/pre-execute` → `tools/execute` → `tools/post-execute` →
   `tools/result`），因此两种模式下闸门与挂钩的命中方式一致。
 - **不覆盖**：绕过 tools 管线、直接调用 `ctx.subagents.startActivation()` 的第三方插件；以及
-  非 `spawn` 的 provider 若改了工具输出形状（`result.value.subagentId` 不再是字符串）。
+  非 `spawn` 的 provider 若返回的 activation 没有 `name`：无法回填 `workerSessionId`
+  （卡片仍保持 `doing`、不会重复派发，但自动收尾和「对话」链接可能缺失）。
 
 **闸门判定顺序（`prepareLeadDispatch`，worker 启动前）**
 
@@ -351,8 +352,8 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 | `note` | `prompt` 原文（截 4000 字符），详情浮层能看到实际派了什么活 |
 | `cwd` | 组长会话的 `session.header.cwd`（= 当前工作区）；取不到用 sessions 服务兜底，再取不到用 `subagent` 入参的 `cwd`。命中 `workspaceRegistry` 时用注册表里的规范 `path`（`workspaceIdForCwd` → `workspacePathForCwd`，看板工作区过滤与注册表一致） |
 | `status` | `doing`（`startedAt` = 建卡时间；自动任务不参与轮询——轮询只扫 `todo`——`notifiedAt` 保持 `null`，`notificationCount` 为 `0`） |
-| `assignee` | 闸门阶段为空；`tools/result` 确认 worker 启动后写 worker 会话 id（自动卡片总是覆盖为当前 worker；轮询任务只在为空时补，组长审核的对象不被覆盖）。**组长也可以把它写成 subagent 的 label / 名字**（自由文本，模型工具允许）：这种值不保证是会话 id，跳转一律以 `workerSessionId` 为准 |
-| `workerSessionId` / `workerRunState` | **v0.2.9 宿主独占**：闸门建卡 `null`，`tools/result` **总是覆盖**为本次 `subagentId` + `'running'`，`subagent/end` 结束标 `'ended'` / `'failed'`（保留 id），回到 `todo` 清空。**重派总是刷新 `workerSessionId`**——不看 `autoDispatch`、不看现有 `assignee`，所以重派后不会再指向旧 worker（§2） |
+| `assignee` | 闸门阶段为空；`tools/result` 确认 worker 启动后写 worker 标识：有 `subagentId` 写 id，没有时写 activation 的 `name`（自动卡片总是覆盖为当前 worker；轮询任务只在为空时补，组长审核的对象不被覆盖）。**组长也可以把它写成 subagent 的 label / 名字**（自由文本，模型工具允许）：这种值不保证是会话 id，跳转一律以 `workerSessionId` 为准 |
+| `workerSessionId` / `workerRunState` | **v0.2.9 宿主独占**：闸门建卡 `null`；`tools/result` **总是**把 `workerRunState` 写 `'running'`，`workerSessionId` 有 `subagentId` 时直接写，没有时（v0.3.1：当前 dsh 的 `subagent` 只有 `{kind:'activation', name}`）先置 `null`、按 `name` 从子 Agent 目录回填；`subagent/end` 结束标 `'ended'` / `'failed'`（保留 id），回到 `todo` 清空。**重派总是刷新 worker 字段**——不看 `autoDispatch`、不看现有 `assignee`，所以重派后不会再指向旧 worker（§2） |
 | `sessionId` / `dispatchedSessionId` | 组长会话 id（「发起对话」/「组长对话」都指向它；真正执行的 worker 会话 id 另记在 `assignee` / `workerSessionId`） |
 | `dispatchedSessionTitle` | 组长会话标题 |
 | `autoDispatch` | 持久化标记 `'lead-dispatch'`（§2）：**只有带这个标记的任务**才会被 `subagent/end` 自动置 `done`。任务回到 `todo`（人工 / 组长打回、组长归档重排）时清空——重新排队后由轮询投递、归组长审核，不再算「宿主自动任务」 |
@@ -374,7 +375,14 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 | 其它 / 缺省 `stopReason` 且任务已是 `done` | 不动（组长已审；worker 的失败不推翻结论），`leadAuto.skipped++` |
 | 任务 `archived` / `todo` | 不动（不改状态、不写结论），`leadAuto.skipped++` |
 | 任务没有 `autoDispatch === 'lead-dispatch'` 标记（= 轮询投递任务 / 人工任务，`notifiedAt` 非空） | **绝不自动置 `done`**：忽略（`reason='not-auto'` / `no-task`），组长审核后自己 `taskboard_update` |
-| 找不到任务 | 忽略（无关子 Agent） |
+| 找不到任务（且 `parentSessionId` 兜底不唯一 / 没有 parent） | 忽略（无关子 Agent） |
+
+**找不到任务时的兜底（v0.3.1）**：worker 的 `workerSessionId` 可能还没回填（当前 dsh 的 activation
+没有 id）。`subagent/end` 先按 `workerSessionId → assignee` 找（`findTaskByWorker` 优先真实字段、
+老 board 回退 `assignee`）；找不到且 `info.parentSessionId` 非空时，在该组长名下找
+「`autoDispatch='lead-dispatch'` + `doing` + `workerRunState='running'` + `workerSessionId` 为空」的卡，
+**只有恰好一条**时才认领（多于一条不猜，交给组长审核）。认领后照常按 `stopReason` 收尾；
+`workerSessionId` 缺则补本次 `id`。
 
 **失败处理（v0.2.4 起：闸门失败 = 派发失败）**
 
@@ -383,8 +391,15 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
   （worker 不启动）。`leadAuto.aborted++`、`leadAuto.lastError` 写原因；模型看到的错误是
   「派发已中止：没有看板卡片就不能启动 worker（§1.8）…请修复 board.json 写权限后重试，或先用
   `taskboard_add` 建卡、再把卡号写进 prompt（任务 id：t-N）重试」。
+- **`kind==='activation'` 就算 worker 已启动（v0.3.1）**：当前 dsh 的 `subagent` 成功结果
+  只有 `{kind:'activation', name}`，没有 `subagentId`。`tools/result` 必须按 activation 放行，
+  **不能**用「缺 subagentId」判定派发失败——否则闸门刚建的 `doing` 卡会被降级回 `todo`，轮询器
+  下一轮再派一次（同一任务两个 worker；2026-11-17 t-107 的真实事故）。`workerSessionId` 由
+  `backfillWorkerSessionId()` 从 `subagents.listDescendants(parentSessionId)` 按 `name` 异步回填
+  （同父级 name 唯一）；`subagent/end` 在 id 还没回填时按 `parentSessionId` + 唯一 running 自动卡
+  兜底认领（见「完成回写」）。
 - **预建卡片后 worker 没起来 / 无法确认已启动**（被其它策略拒绝 / `subagent` 启动失败 / 取消 /
-  `tools/post-execute` 返回 `block` / provider 返回形状变化）：`tools/result` 收到非 activation 结果
+  `tools/post-execute` 返回 `block` / provider 返回形状**不是 activation**）：`tools/result` 收到非 activation 结果
   → `releasePreparedDispatch` **绝不删除**卡片，而是降级为可见的待开始记录：`status='todo'`、
   `assignee` / `autoDispatch`（回到 todo 自动清空）/ `dispatchedSessionId` / `dispatchedSessionTitle`
   清空，`lastError='派发未启动：<原因摘要>'`，title / note / cwd / sessionId 保留并落盘；
@@ -565,7 +580,7 @@ DSH 的 Agent Teams（`team_task_create` / `team_task_get` / `team_task_list` / 
       "lastAnswer": "",                  // 用户最近一次回答（≤1000，留档）
       "answeredAt": "…ISO…" | null,      // 最近一次回答时间
       "assignee": "…",           // 子 Agent 的 label / 名字（组长写的自由文本，**不保证是会话 id**）
-      "workerSessionId": "…" | null, // v0.2.9：宿主独占的「执行会话 id」（worker 的 subagentId）；模型不可写
+      "workerSessionId": "…" | null, // v0.2.9：宿主独占的「执行会话 id」；有 subagentId 时直接写，否则按 name 从子 Agent 目录回填（v0.3.1）；模型不可写
       "workerRunState": "running" | "failed" | "ended" | null, // v0.2.9：执行状态，宿主独占
       "result": "…",             // 审核结论 / 子 Agent 汇报摘要
       "createdAt": "…ISO…",
@@ -626,7 +641,9 @@ Client 不拿它做增量渲染，只作快照字段透传；`reloadBoardIfStale
 
 **任务字段 `workerSessionId` / `workerRunState`（v0.2.9，宿主独占）**：`assignee` 是组长写的**自由文本**
 （label / subagent 名字都正常，实测有 `"assignee": "session-jump-bug"`），不能当作跳转目标。真正在跑的
-worker 会话 id 由宿主单独记在 `workerSessionId`（= `tools/result` 收到的 `result.value.subagentId`）；
+worker 会话 id 由宿主单独记在 `workerSessionId`：有 `result.value.subagentId` 时直接写；当前 dsh 的
+`subagent` 成功结果只有 `{kind:'activation', name}`，先写 `assignee=name`，`workerSessionId` 由
+`backfillWorkerSessionId()` 从 `subagents.listDescendants(parentSessionId)` 按 name 回填（同父级唯一）；
 `workerRunState` 描述这次执行最后怎么样：`'running'`（`tools/result` 写入）/ `'failed'`（`subagent/end`
 非 `completed`）/ `'ended'`（`completed`）/ `null`（还没派过，或老 board.json 缺字段，不做迁移）。
 写入规则（`lib/index.js`）：
@@ -634,10 +651,14 @@ worker 会话 id 由宿主单独记在 `workerSessionId`（= `tools/result` 收�
 | 时点 | `workerSessionId` | `workerRunState` |
 | --- | --- | --- |
 | 闸门建卡（worker 启动前） | `null`（未知） | `null` |
-| `tools/result` 的 `prepared` 分支 / 兜底建卡（worker 已启动） | **总是覆盖**为本次 `childId`（不看 `autoDispatch`、不看已有 `assignee`） | `'running'` |
+| `tools/result` 的 `prepared` 分支 / 兜底建卡（worker 已启动） | 有 `childId` 时**总是覆盖**；没有时置 `null`、等待按 name 回填（不看 `autoDispatch`、不看已有 `assignee`） | `'running'` |
 | `subagent/end` 且 `stopReason === 'completed'` | 保留（缺则补本次 `childId`） | `'ended'` |
 | `subagent/end` 且非 `completed`（`error` / `aborted` / 缺字段…） | 保留（缺则补） | `'failed'`（照旧写 `lastError`，**不清** `assignee`） |
 | `applyTaskUpdate` 的 `→todo` 迁移 / `requeueTasksOfLead`（组长归档重排） | `null` | `null` |
+
+`subagent/end` 找不到 worker 时（id 还没回填），按 `info.parentSessionId` 在该组长名下找唯一一条
+「`autoDispatch='lead-dispatch'` + `doing` + `workerRunState='running'` + `workerSessionId` 为空」的卡
+认领；多于一条不猜（§1.8 完成回写）。
 
 两个字段都是**宿主独占**：不在 `taskboard_update` 的参数白名单里（`additionalProperties:false` 的封闭
 契约，模型传了会在入参校验阶段被拒），`applyTaskUpdate` / `update-task` 的 patch 也不读这两个键
@@ -1084,16 +1105,18 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   新建失败（`commitBoard` 返回 `saved:false`）→ 回滚内存卡片 + `{kind:'deny'}`；worker 不会启动。
   同一 `exec` 对象重复进闸门直接复用第一次结果（PTC / 重试幂等）。
 - **观察挂钩**：`tools/result` 只负责把 `exec → 卡片` 句柄（`preparedDispatches`，WeakMap）里的卡片
-  补上 `assignee = subagentId`（`handleSubagentDispatch` 的 `prepared` 分支），并**总是**写
-  `workerSessionId = subagentId` + `workerRunState='running'`（v0.2.9 宿主独占字段，§2——模型写的
-  `assignee` 名字不影响它）；worker 没启动 /
-  **无法确认已启动**（非 activation / 错误 / 取消 / `tools/post-execute` block / 返回形状变化）→
-  `releasePreparedDispatch` **不删卡**，把**闸门预建**的卡片降级为 `todo` +
-  `lastError='派发未启动：<原因摘要>'`（清派发字段；复用来的轮询任务不动）。闸门没留下句柄时
-  （老宿主 / 单测直调）退回 0.2.3 的观察后补建路径兜底。
-- 命中条件收紧（§1.8）：`tools/result` 要求 `exec.name === 'subagent'`、`result.isError !== true`、
-  `result.value.kind === 'activation'` 且 `subagentId` 非空；`subagent/end` 只收「带
-  `autoDispatch === 'lead-dispatch'` 标记」的任务，轮询投递任务绝不被自动置 `done`。
+  补上本次 worker 的 `assignee`（`handleSubagentDispatch` 的 `prepared` 分支；有 `subagentId` 用它，
+  没有时用 activation 的 `name`），并**总是**写 `workerRunState='running'`；`workerSessionId` 有
+  `subagentId` 时直接写，没有时置 `null` 并交给 `backfillWorkerSessionId()` 从
+  `subagents.listDescendants(parentSessionId)` 按 name 回填（v0.3.1；v0.2.9 宿主独占字段，§2——模型写的
+  `assignee` 名字不影响它）。**`kind==='activation'` 即已启动**；只有非 activation / 错误 / 取消 /
+  `tools/post-execute` block / 返回形状不是 activation 才 `releasePreparedDispatch` **不删卡**，
+  把**闸门预建**的卡片降级为 `todo` + `lastError='派发未启动：<原因摘要>'`（清派发字段；复用来的
+  轮询任务不动）。闸门没留下句柄时（老宿主 / 单测直调）退回 0.2.3 的观察后补建路径兜底。
+- 命中条件（§1.8）：`tools/result` 要求 `exec.name === 'subagent'`、`result.isError !== true`、
+  `result.value.kind === 'activation'`（**不再要求 `subagentId` 非空**）；`subagent/end` 只收「带
+  `autoDispatch === 'lead-dispatch'` 标记」的任务，轮询投递任务绝不被自动置 `done`。id 还没回填时
+  `subagent/end` 按 `parentSessionId` + 唯一 running 自动卡兜底认领（§1.8 / §2）。
 - handler 抽成**可单测的导出函数**（`prepareLeadDispatch` / `releasePreparedDispatch` /
   `dispatchAbortSummary` / `handleSubagentDispatch` / `handleSubagentEnd`），单测直接调用，不需要起
   DSH 进程。`discardPreparedDispatch` 保留为 `releasePreparedDispatch` 的兼容别名（0.2.4 起不再删卡）。
@@ -1280,7 +1303,8 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
      「执行对话 · <尾8>」= `task.workerSessionId`（老 Host 回退 `assignee`；**两者都取不到真会话 id 时
      整块按钮不渲染**，不放必然报错的假按钮）、「组长对话 · <尾8>」= `task.dispatchedSessionId`（与
      worker / 发起会话相同则不重复显示）；都没有时显示「（这条任务还没有关联对话）」。宿主在
-     `tools/result` 时把 worker 的 `subagentId` 记进 `workerSessionId`（§1.8 / §2），所以「执行对话」
+     `tools/result` 时把 worker 的 `subagentId`（没有时按 activation 的 `name` 从子 Agent 目录回填）
+     记进 `workerSessionId`（§1.8 / §2），所以「执行对话」
      指向真正干活的子会话，不再用组长会话冒充、也不受组长写的 `assignee` 名字影响。
      点击**按候选链依次**调用客户端服务 `uiWorkspace.openSession(sessionId)`（官方导航 API，同步 void），
      第一个能打开的立即跳转：worker 子会话是子 Agent 会话，客户端此刻可能解析不到
@@ -1515,11 +1539,12 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
     （加粗、反引号、下划线、半角冒号、`任务ID`、列表符号 / 缩进、「看板任务：**任务 id：t-N**」事故原话，
     以及正文提及 / 同一行两个 id / 空 id 一律不认，t-78 → t-79 重复卡回归）。v0.2.0 的回归同样保留：
     **「组长把轮询任务的 assignee 设成 worker id，worker completed 结束后任务仍 doing、不写 result、
-    不 flush 回执」**、「`exec.name` / `value.kind` / 非空 `subagentId` 三条件缺一不命中」、
+    不 flush 回执」**、「`exec.name` / `value.kind === 'activation'` 缺一不命中；有 `subagentId` 写 id、
+    没有时用 `name` 占位并回填 / end 兜底」、
     「`stopReason` 缺省 / 未知一律不置 done（保持 doing + `lastError` 写 `unknown`）」、
     「`ctx.on` 的第三参都是 `{global:true}`」；in-flight 陈旧窗口与 `autoDispatch` 标记也有单测。
     真实设备上再加一条端到端：打开工作区组长会话 → 直接要求它派活 → 看板**在 worker 启动前**出现
-    `doing` 任务（`assignee` = worker 会话）→ worker 结束后变为 `done` + `result`，
+    `doing` 任务（`assignee` = worker 名字 / 会话 id，`workerSessionId` = 子会话 id）→ worker 结束后变为 `done` + `result`，
     `snapshot.leadAuto.created/completed` 递增；**同时确认轮询投递任务在 worker 结束后仍保持 `doing`**
     （等组长审核）。**标准 tool-call 与 PTC（`run_code`）各测一次**：两者都走 `tools/pre-execute` +
     `tools/result`，预期行为一致。另测失败分支：把 `board.json` 临时设为不可写 → `subagent` 调用被拒、
@@ -1575,7 +1600,7 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 | 工作区映射无限增长 | `workspaceLeads` 最多 32 条，超出按 key 顺序截断；非法条目在 `normalizeConfig` 丢弃 |
 | 用户把工作区组长会话误绑成主会话 | 回执仍会投递，但组长 persona 不面向用户、不会主动汇总；文档建议主会话用普通会话（不做硬校验，避免误伤） |
 | 手动在模式选择器里开的「任务看板 · 工作区组长（自动）」会话不会被自动接管 | 看板只认 `config.workspaceLeads`（懒创建 / `ensure-workspace-lead` 修复）；手动会话不写映射、不派任务，建议交给插件自动创建。后续版本可让懒创建优先复用同工作区空闲的该预设会话（v0.2.x 待办） |
-| §1.8 的闸门 / 挂钩依赖 dsh 的 `subagent` 工具名、`tools/pre-execute` 事件与输出形状（`value = {kind:'activation', subagentId}`）、`subagent/end` 事件字段 | **闸门是 fail-open 的**：只认 `exec.name === 'subagent'`；dsh 改了工具名 / 不再发 `tools/pre-execute` 时它不会拦截，派发退化成 0.2.3 的「观察后补建」（直聊派活可能再次漏卡），但不会误拦正常调用。`tools/result` 侧仍要求 `result.isError !== true` + `value.kind === 'activation'` + 非空 `subagentId`；**形状变了 / `post-execute` block / 取消时不删卡（fail-safe）**：只把闸门预建的卡降级为 `todo` 并写 `lastError='派发未启动：…'`——宁可留一张可见的待开始卡，也不误删 worker 可能正在用的卡；不会误建或误置 done。`subagent/end` 缺 `lastAssistantMessage` 时 `result` 留空、任务照样置 done；缺 `stopReason` 时按非 completed 处理（保持 doing）。升级 dsh 后跑 `node --test` 的闸门回归（`registerLeadDispatchGate` 注入假事件 + 断言 `{global:true}` 第三参 + deny 分支）与 §7 第 10 项真实链路 |
+| §1.8 的闸门 / 挂钩依赖 dsh 的 `subagent` 工具名、`tools/pre-execute` 事件与输出形状（v0.3.0 之前是 `{kind:'activation', subagentId}`；当前是 `{kind:'activation', name}`）、`subagent/end` 事件字段（含 `parentSessionId`） | **闸门是 fail-open 的**：只认 `exec.name === 'subagent'`；dsh 改了工具名 / 不再发 `tools/pre-execute` 时它不会拦截，派发退化成 0.2.3 的「观察后补建」（直聊派活可能再次漏卡），但不会误拦正常调用。**v0.3.1 起 `tools/result` 只要求 `result.isError !== true` + `value.kind === 'activation'`**：有 `subagentId` 直接写 `workerSessionId`，没有时用 `name` 占位并从 `subagents.listDescendants(parentSessionId)` 按 name 回填；**缺 id 不再判失败**（否则闸门卡被降级回 todo、轮询重复派发——t-107 事故）。只有非 activation / `post-execute` block / 取消才不删卡（fail-safe）：把闸门预建的卡降级为 `todo` 并写 `lastError='派发未启动：…'`。`subagent/end` 缺 `lastAssistantMessage` 时 `result` 留空、任务照样置 done；缺 `stopReason` 时按非 completed 处理（保持 doing）；id 未回填时按 `parentSessionId` + 唯一 running 自动卡兜底认领。升级 dsh 后跑 `node --test` 的闸门 / 回填回归（`registerLeadDispatchGate` + name-only activation + catalog 回填 + end 兜底）与 §7 第 10 项真实链路 |
 | 组长在直聊里「先 `taskboard_add` 再 `subagent`」会造成两条任务 | persona 已写明「直聊派活不需要手动 add」（§6）；如果 worker prompt 带「任务 id：t-N」或标题，闸门会复用那条卡片（不会多一条）；prompt 完全没提任务时才会各自建卡，属预期（用户可见、可删） |
 | Team 模式与 `team:policy` 的 wait 例外 | 组长不使用 `wait_agent`，与宿主 policy「root must wait」有意偏离，冲突时以 persona 为准（组长靠 worker 完成通知开新一轮；占住会话等待会让轮询对其它任务持续报「组长忙」，§1.10） |
 | 组长启用 PTC（v0.2.8） | `run_code` 是 Node 子进程，可绕开「只读组长」边界直接读写工作区文件（权限=会话沙箱）；**不推荐、自担风险**，仅靠 persona 用法限制与评审纪律兜底 |
@@ -2203,3 +2228,34 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   展开正文完整、组长派 worker / 审核链路照常（`docs/verification.md` §2.7，截图
   `.dev/e2e/shots/v030-trigger-*.png`）。
   `package.json` 0.2.9 → 0.3.0。升级后需**重启一次 dsh 进程**（Host 半改动）再刷新页面。
+
+- v0.3.1（修复「同一条任务被派了两次：子 Agent + 新建的组长窗口」）：根因是 **dsh 的 `subagent` 成功结果
+  形状变了**——v0.3.0 之前是 `{kind:'activation', subagentId}`，当前是 `{kind:'activation', name}`
+  （`dsh-tool-subagent` 的 output schema 只有 `kind` / `name`，childId 在父会话的 `subagent/catalog`
+  事件里）。v0.2.9 的 `tools/result` 仍要求 `subagentId` 非空，于是直聊派活时：
+  ① 闸门先建好 `doing` + `autoDispatch` 卡；② `tools/result` 收到 activation 但没 id → 误判
+  「派发未启动」→ `releasePreparedDispatch` 把卡降级 `todo`；③ 轮询只扫 `todo`，下一轮把同一条卡
+  投给该工作区懒创建的**新组长会话** → 新组长再派一个 worker。2026-11-17 的 t-107 就是实例：
+  `386cf0ce`（手动切到派单模式的会话）派了 `wharttest-base-w1`（8209c7f8），轮询新建 `ea1b96a2`
+  又派了 `wharttest-base-r1`（66fc96a3），两个 worker 同时写 `wharttest/`。
+  修法（Host 半 + 单测 + 文档）：
+  ① `tools/result` **按 `kind === 'activation'` 放行**，不再要求 `subagentId`；只有非 activation /
+    错误 / 取消 / `post-execute` block 才走 `releasePreparedDispatch` 降级（不删卡）。
+  ② `handleSubagentDispatch` 接受空 `childId` + `workerName`：prepared 卡保持 `doing`，`assignee`
+    先用 name 占位，`workerRunState='running'`，`workerSessionId` 置 null（清掉旧 worker）。
+  ③ 新增 `backfillWorkerSessionId()`：从 `subagents.listDescendants(parentSessionId)` 按 name 找
+     childId 回填 `workerSessionId`（同父级 name 唯一）；best-effort，失败只 `console.warn`，
+     **绝不**因此把卡回退 todo。
+  ④ `findTaskByWorker()` 改为**优先认 `workerSessionId`**、老 board 才回退 `assignee`（此前只认
+     assignee；name-only 激活时 assignee 是名字，end 找不到卡）。
+  ⑤ `subagent/end` 的 `info.parentSessionId` 兜底：id 还没回填时，在该组长名下找唯一一条
+    「`autoDispatch='lead-dispatch'` + `doing` + `workerRunState='running'` + `workerSessionId` 为空」
+    的卡认领；多于一条不猜。
+  测试：`test/host.test.mjs` **+2**（① 当前 dsh 的 name-only activation 保持 doing + catalog 回填 +
+  end 收尾；② 无 `subagents` 服务时 end 按 `parentSessionId` 唯一自动卡兜底），`node --test`
+  **291 pass / 0 fail**（v0.3.0 基线 289 → 291）。文档：§1.8 / §2 / §4.6 / §5.3 / §8 兼容性行 / §9 同步；
+  `lib/client.js` / `presets/taskboard.patch.yml` **未改**（字段口径不变，Client 仍优先读
+  `workerSessionId`）。`package.json` 0.3.0 → 0.3.1。升级后需**重启一次 dsh 进程**（Host 半改动）。
+  真实验证：重启后跑一条「组长会话直聊 → 派 worker」链路，确认看板卡保持 `doing`、只有一个 worker、
+  `workerSessionId` 在 worker 运行期间回填、结束后自动 `done`；t-107 这种**已经**重复的历史卡需要人工
+  停掉其中一个 worker 并把 `assignee` / `result` 对齐到保留的那个（代码只管以后不再发生）。
