@@ -135,4 +135,22 @@ node .dev\verify-rpc.mjs http://127.0.0.1:3099
 
 - 自动派发优先选「派单看板模式」的空闲会话，没有才退化到任意空闲会话；没有在线会话时不派发（页面顶部显示跳过原因）。
 - 看板是单机单文件（`$DSH_HOME/storages/dsh-taskboard/board.json`），未做跨进程锁；同一 `$DSH_HOME` 下同时跑两个 dsh 实例会共享同一块看板。
-- 轮询投递的消息以普通 user 消息进入会话（`source.kind='user'`），transcript 里会像用户发言；这是为了会话日志一定可解码。
+- 轮询投递的消息以 **user 角色**进入会话，但 `source.kind` 是插件自有的 `'dispatch-board'`（v0.3.0 起）：聊天页只显示一条可折叠的「收到执行请求」通知，不再伪装成用户发言；Trajectory 里仍能看到完整正文。会话格式 v4 接受未知 producer kind，重启后可正常恢复。
+
+## 2.7 v0.3.0 注入消息折叠显示（真实验证，2026-11-17）
+
+**目标**：看板派单 / 用户回复 / 完成回执的 followup 注入改用插件自有 `source.kind='dispatch-board'` 后，
+聊天页不再把它渲染成「用户发言」气泡，而是折叠成一条「收到执行请求」通知（DSH `dsh-client-ui-chat`
+的 `turn-trigger`），正文点开才看。
+
+**环境**：`dsh taskboard --port 3099` 旁路实例（taskboard profile，插件 link 本仓库）；`DSH_TASKBOARD_PATH`
+指向临时 board.json 隔离真实看板；Playwright（headless）操作页面。
+
+| # | 项目 | 结果 | 关键证据 |
+| --- | --- | --- | --- |
+| 1 | RPC `add-task`（`cwd` = 临时空目录）→ 轮询 5s 内派发到懒创建的工作区组长会话 | PASS | board `dispatchedSessionId=session-9697c9fb…` |
+| 2 | 会话日志里注入消息 `source={"kind":"dispatch-board"}`（450 字正文完整），不是 `'user'` | PASS | session.v4 日志；v4 解码只拒绝字面量 `'plugin'`（安装包源码核对） |
+| 3 | 组长会话聊天页显示**折叠的「收到执行请求」09:20**，不是用户气泡；点开显示「这条通知触发了本轮回复。」+ 完整派发正文 | PASS | `shots/v030-trigger-collapsed.png` / `shots/v030-trigger-expanded.png` |
+| 4 | 组长正常执行：`taskboard_update(doing)` → `subagent(taskboard-worker)` → worker 回报 → `taskboard_update(done,result)`；「子任务状态更新」通知照常显示 | PASS | 证明 source kind 改动不影响唤醒 / 派发 / 审核链路 |
+
+> 清理：停 3099 实例；删除临时 board.json、测试会话（组长 + worker）及投影缓存。真实看板与用户会话未受影响。

@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import {
   ARCHIVE_RETENTION_MS,
   ATTACHMENT_MEDIA_TYPES,
+  BOARD_MESSAGE_SOURCE_KIND,
   BoardError,
   DEFAULT_DISPATCH_MODE,
   DISPATCH_MODES,
@@ -387,7 +388,10 @@ test('createBoardUserMessage matches the UserMessage shape', () => {
   const message = createBoardUserMessage('hi')
   assert.equal(message.role, 'user')
   assert.equal(typeof message.id, 'string')
-  assert.equal(message.source.kind, 'user')
+  // v0.3.0：用插件自己的 source kind，不再冒充真人（'user'）。
+  assert.equal(BOARD_MESSAGE_SOURCE_KIND, 'dispatch-board')
+  assert.equal(message.source.kind, BOARD_MESSAGE_SOURCE_KIND)
+  assert.notEqual(message.source.kind, 'user')
   assert.deepEqual(message.content, [{ type: 'text', text: 'hi' }])
   assert.notEqual(createBoardUserMessage('hi').id, message.id)
 })

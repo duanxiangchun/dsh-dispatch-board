@@ -96,7 +96,9 @@ v0.2.0 默认链路（`dispatchMode='workspace-lead'`）：
    或在右侧栏看板 / 平台看板手动加。任务归属一个工作区（`task.cwd`）。
 2. Host 轮询器每 `pollIntervalMs` 扫 `todo`：按任务工作区解析 key，查 `config.workspaceLeads`
    复用该工作区的常驻组长；没有就懒创建（`sessionController.create({workspaceId?, cwd?, agentPreset:'taskboard-dispatch'})`）。
-   组长空闲 → 用 `agent.followup()` 推一条「【任务看板 · 待开始】…」的用户消息（`source.kind='user'`），
+   组长空闲 → 用 `agent.followup()` 推一条「【任务看板 · 待开始】…」的 user 角色消息（`source.kind='dispatch-board'`，
+   v0.3.0 起用插件自有 kind、不再用内建 `'user'`——DSH 客户端把它当注入而不是用户发言，
+   界面只折叠成一条「收到执行请求」通知，不再铺满对话窗口，§9），
    给任务打 `notifiedAt` 并**自动置 `doing`**。路由细节见 §1.5。
 3. 工作区组长收到后：`subagent` 派一个 `taskboard-worker` 子 Agent 后台执行（prompt 带任务 id / 标题 /
    备注（验收标准）/ 工作目录 / 回报模板），然后结束本轮，**不自己干活**。
@@ -172,7 +174,8 @@ v0.2.0 的默认派发方式。目标不是「某个会话」，而是**任务�
      `resolveAgent` 唤醒，**不会重复创建组长**。`ensure-workspace-lead` 遇到同样情况返回
      `LeadRef{live:false}`，**不算 `internal`**（`internal` 仅限 `sessionController` 不可用 /
      两次 `create` 都失败 / 连 `sessionId` 都没拿到）。
-6. **投递**：与旧模式相同，`agent.followup(createBoardUserMessage(buildDispatchText(task)))` + `sessions.flush`；
+6. **投递**：与旧模式相同，`agent.followup(createBoardUserMessage(buildDispatchText(task)))` + `sessions.flush`
+   （`createBoardUserMessage` 的 `source.kind='dispatch-board'`，v0.3.0 起不再冒充 `'user'`）；
    成功后任务自动置 `doing`（写 `startedAt`）、`notifiedAt` / `notificationCount++`、记录
    `dispatchedSessionId` / `dispatchedSessionTitle`、清 `lastError`、更新 `poll.lastDispatch*`；
    `followup` 失败 → `followup-failed`，任务保持 `todo`。
@@ -213,7 +216,8 @@ v0.2.0 的默认派发方式。目标不是「某个会话」，而是**任务�
   `agent.status === 'idle'`。主会话离线或忙 → 本轮不发、不主动唤醒，任务保持 `reportedAt=null`；
   主会话被归档 → 返回 `{sent:false, reason:'main-archived'}`，不投递、不记账；未绑定主会话 → 不发
   （用户可自己看板 / 问主会话）。`snapshot.leads.main.archived=true`，组长条显示「已归档」并提示换绑。
-- **投递**：合并成**一条** `agent.followup()` 用户消息（`source.kind='user'`），随后 `sessions.flush`。
+- **投递**：合并成**一条** `agent.followup()` user 角色消息（`source.kind='dispatch-board'`，v0.3.0 起；
+  客户端折叠为一条「收到执行请求」通知，不再像用户发言），随后 `sessions.flush`。
   文本以 `【任务看板 · 汇报】` 开头，逐条 `- <id> <title>：<result 压成单行后的前 200 字，空结论写「（无结论）」>`，
   结尾要求主会话「向用户汇总以上结论，不要重复执行任务」，并附
   `看板时间：<宿主本地时间 YYYY-MM-DD HH:mm:ss ±HH:MM>`（v0.2.6 起人读文案用带 UTC 偏移量的
@@ -433,7 +437,7 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 4. **用户回答** → RPC `answer-task {id, answer}`（§3.1）：
    宿主按 `task.dispatchedSessionId` → `task.askedBy` → `task.sessionId` 依次找目标会话（去重、
    跳过空值；已归档的候选跳过），复用 `agents.get` / `sessionController.resolveAgent`，
-   followup 一条「【任务看板 · 用户回复】…」；
+   followup 一条「【任务看板 · 用户回复】…」（user 角色，`source.kind='dispatch-board'`，§1.3）；
    `sessions.flush` **成功后才**清 `needsUser` / `question` / `questionOptions` / `askedAt` /
    `askedBy`，写 `lastAnswer` / `answeredAt` / `updatedAt`（`sessions` 服务缺失时与派发路径一致：
    只做 followup、不阻塞清标记）。
@@ -1561,7 +1565,7 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 | 用户环境没启用右侧栏（非 web-app 部署 / 关闭了 ui-sidebar-right） | 服务缺失时插件不崩：header 按钮点击只在 console 警告；body 注册由 slots.inject 等待 |
 | 创建任务的对话是历史会话（无 live agent），且被 UI 持有 writer 无法唤醒 | 任务留在待开始并显示 `creator-cold` 原因；用户在那边发条消息即可回派；手动「立即派发」是唯一逃生口 |
 | 第三方 bundle 声明 preset 的行为与官方是否一致（无官方先例） | 已在 0.2.2-rc.1 实测：两条声明行都出现在 `agentPresets.list()`，`broken` 为空；`dsh --dump-config` 可见两行 |
-| `agent.followup()` 的 UserMessage 手工构造被会话解码器拒绝（source.kind 未知） | 用 `{kind:'user'}` 构造，不发明新 kind；e2e 必须验证「重启后会话可恢复」 |
+| `agent.followup()` 的 user 角色消息手工构造被会话解码器拒绝（source.kind 未知） | v0.3.0 起用插件自有 kind `'dispatch-board'`：会话格式 v4 只要求 `source.kind` 是非空字符串（仅拒绝字面量 `'plugin'`，见 `dsh-session-format-v3-to-v4` 的 `source()` 与 JSONL worker 同名校验），未知 producer kind 原样保留。升级 dsh 后重跑 `node --test` 的 `createBoardUserMessage` 用例 + e2e 必须验证「重启后会话可恢复、触发通知正常折叠」 |
 | 轮询把用户手动对话打断 | 只在 idle 投递；每轮最多 1 条；冷却 + 上限 |
 | 多窗口/多会话重复派发 | 任务级 `notifiedAt` + 冷却 + `notificationCount` 上限；不做跨进程锁（单进程部署） |
 | 卡片按钮「点了没反应」（归档/删除/开始/完成全失效） | 0.1.0 修过一个真实 bug：双看板重构时局部数组变量 `actions` 遮蔽了 `bind.actions`，按钮回调里 `actions.updateTask` 全是 undefined，点击直接抛异常。UI 级回归必须**真点按钮**，且点完重新查询节点再点第二次 |
@@ -2176,3 +2180,26 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   附：真实 board.json 里那两张卡 `autoDispatch: null` 不是闸门建卡链丢的——它们是**轮询投递**的卡片
   （`notifiedAt` 非空），按 §2 设计轮询任务恒为 `null`；闸门建卡 / 兜底建卡两处仍照旧写
   `'lead-dispatch'`，只有回 `todo`（打回 / 归档重排）才清空。
+
+- v0.3.0（注入消息不再冒充用户发言；看板通知在聊天页折叠成一条「收到执行请求」通知）：此前派单 /
+  用户回复 / 完成回执三条 followup 注入都手工构造 `source.kind='user'`，DSH 客户端按真人发言把它
+  渲染成用户气泡——几 KB 的任务备注原样铺开，用户在工作区组长会话里看到「自己往窗口里发了一堆消息」。
+  本版 Host 新增 `BOARD_MESSAGE_SOURCE_KIND = 'dispatch-board'`（`lib/index.js`），
+  `createBoardUserMessage()` 改用它，三条注入路径（`deliverBoardTask` / `answerTask` /
+  `flushReceipts`）一并生效：
+  ① 客户端把 `source.kind !== 'user'` 的 user 角色消息归为「注入/触发」，唤醒本轮时只渲染一条可折叠的
+     「收到执行请求」通知（`dsh-client-ui-chat` 的 `turn-trigger`），正文点开才看到；不展开时聊天流里
+     不再出现大段用户消息，Trajectory 仍可查看完整原文。
+  ② 模型侧零变化：消息仍是 role `user`、内容不变，派单 / 派 worker / 审核 / 回执链路不变。
+  ③ 语义修正：DSH 要求插件、调度器等非人类生产方使用自己的 source（省略或写 `'user'` 会被当成真人
+     直接消息，goal 等人类权限判定据此放行）；会话格式 v4 只要求 `source.kind` 为非空字符串
+     （仅拒绝字面量 `'plugin'`），未知 producer kind 原样保留，老会话无需迁移、重启后可正常解码。
+  测试：`test/host.test.mjs` 的 `createBoardUserMessage` 用例改为断言 `'dispatch-board'`（且非
+  `'user'`）；`node --check lib\index.js` / `lib/client.js` + `node --test` 全量
+  **289 pass / 0 fail**（与 v0.2.9 基线一致，无新增用例）。文档：§1.3 / §1.5 / §1.6 / §1.9 / §8 同步，
+  `README.md` 轮询规则加一条，`docs/verification.md` / `docs/host-notes.md` 更新；
+  `lib/client.js`、`presets/taskboard.patch.yml` **未改**（persona 仍按 user 角色叙述，模型侧无感）。
+  真实验证：`dsh taskboard --port 3099` 旁路实例 + Playwright 已确认「收到执行请求」折叠行、
+  展开正文完整、组长派 worker / 审核链路照常（`docs/verification.md` §2.7，截图
+  `.dev/e2e/shots/v030-trigger-*.png`）。
+  `package.json` 0.2.9 → 0.3.0。升级后需**重启一次 dsh 进程**（Host 半改动）再刷新页面。

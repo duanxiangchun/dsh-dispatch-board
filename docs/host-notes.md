@@ -238,7 +238,7 @@ interface UserMessage extends MessageBase { role: 'user' }
 ```
 
 - `MessageId` 运行时就是字符串（brandString 无校验），`id: randomUUID()` 合法。
-- `source.kind:'user'` 是内建 `MessageSourceMap.user`（`message.d.ts:101-104`），`user/message` 是内建事件（`dsh-session/lib/types/known-event-types.js:80`）→ **一定能解码**。官方 `dsh-schedule` 用 `{kind:'schedule'}` 是靠 declare-module 扩展（纯 JS 做不了），我们用 `user` 最稳。
+- **2026-11 更正（v0.3.0）**：会话格式 v4 的 `user/message` 只要求 `source.kind` 是非空字符串（唯一拒绝的字面量是 `'plugin'`，见 `dsh-session-format-v3-to-v4` 的 `source()`、`dsh-session-persistence-jsonl` worker 的同名校验）——插件自有的 producer kind 可以正常解码，不必再借内建的 `{kind:'user'}`。本插件改用 `'dispatch-board'`：DSH 客户端对 `kind !== 'user'` 的 user 角色消息不再渲染成用户气泡，而是折叠成一条「收到执行请求」通知（`dsh-client-ui-chat` 的 `turn-trigger`），正文点开才看到；`source.kind:'user'` 反而等于冒充真人直接消息（goal 等工具会据此放行人类权限），语义不对。
 - 唯一要求：整条消息必须是 **lossless JSON**（无 undefined/BigInt/Date/Map/函数）——现状 `lib/index.js:476-483` 的构造满足。
 
 ### 3.5 完整投递路径（宿主无 Agent 上下文）——**你问的第 2 条，答案：正确，但补一步 flush**
@@ -247,7 +247,8 @@ interface UserMessage extends MessageBase { role: 'user' }
 import { randomUUID } from 'node:crypto'
 
 function createBoardUserMessage(text) {
-  return { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } }
+  // v0.3.0：用插件自有 source kind（非 'user'），界面折叠成「收到执行请求」通知。
+  return { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'dispatch-board' } }
 }
 
 async function deliverFollowup(ctx, sessionId, text) {
