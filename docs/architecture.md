@@ -100,11 +100,15 @@ README.md               Lead：安装 / 使用 / 排障
    v0.3.0 起用插件自有 kind、不再用内建 `'user'`——DSH 客户端把它当注入而不是用户发言，
    界面只折叠成一条「收到执行请求」通知，不再铺满对话窗口，§9），
    给任务打 `notifiedAt` 并**自动置 `doing`**。路由细节见 §1.5。
-3. 工作区组长收到后：`subagent` 派一个 `taskboard-worker` 子 Agent 后台执行（prompt 带任务 id / 标题 /
-   备注（验收标准）/ 工作目录 / 回报模板），然后结束本轮，**不自己干活**。
+3. 工作区组长收到后：**默认** `subagent` 派一个 `taskboard-worker` 子 Agent 后台执行（prompt 带任务 id /
+   标题 / 备注（验收标准）/ 工作目录 / 回报模板），然后结束本轮，**不自己干活**。
+   如果任务能拆成 ≥2 个**写域不相交**的独立片，按 §6 第 6c 条在同一轮 **fan-out 多个 worker**：
+   切片 worker 的 `description` 带父任务 id，**prompt 不出现父任务 id / 标题**（否则 lead-intent 会把父卡
+   认领走），父卡保持 `doing`，每片各拿一张宿主自动卡。
 4. 子 Agent 干完 → 运行时把完成通知送回组长 → 组长开新一轮审核（对工作区取证）：
-   - 通过：`taskboard_update status=done result=<Markdown 结论>`；
-   - 不通过：`send_message` 打回同一个 worker 重做（任务保持 `doing`），或回退 `todo` 重新排队。
+   - 单 worker：通过 `taskboard_update status=done result=<Markdown 结论>`；不通过 `send_message` 打回；
+   - fan-out 批次：先 `taskboard_list` 确认本批切片都完成，合并/验证后再把**父任务**置 `done`；
+     任何一片失败只打回该片，父任务保持 `doing`。
 5. 任务 `done` 且 `reportedAt=null` → Host 把一批未汇报的完成任务合并成一条
    「【任务看板 · 汇报】…」followup 投给**主会话**（要求主会话 live 且 idle），成功后在每条任务上写 `reportedAt`（§1.6）。
 6. 主会话收到回执 → 向用户汇总（不再执行任务本身）；主会话忙则等下一轮 / 下次 flush，不丢回执。
@@ -319,6 +323,12 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 - **接管组长（v0.3.2）**：闸门在卡片准备成功之后、`next()` 之前调用 `adoptWorkspaceLead()`；工作区
   没有组长映射 / 映射指向的组长已归档时，把当前 `taskboard-dispatch` 会话登记为该工作区组长
   （§1.5 第 11 条），避免轮询下一轮再新建一个组长窗口。接管失败只告警，不阻断派发。
+- **fan-out 切片卡（v0.3.3）**：组长对一个可拆任务 fan-out 时，**每片 worker 各建一张宿主自动卡**
+  （`source='agent'` + `autoDispatch='lead-dispatch'`），父卡保持 `doing`；切片卡 title 由 worker
+  `description` 决定（组长应带父任务 id），note 是切片 prompt（**不应含父任务 id / 标题**，否则
+  lead-intent 会把父卡认领走）。切片卡由 `subagent/end` 自动 done；父卡由组长合并/验证后
+  `taskboard_update done`。切片卡各自会触发完成回执，**父卡结论才是最终汇报**（中间回执噪声后续可
+  用 batchParent 字段抑制）。
 
 **闸门判定顺序（`prepareLeadDispatch`，worker 启动前）**
 
@@ -1450,8 +1460,9 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 - persona（`taskboard-dispatch`）必须写清「**工作区组长**」口径：
   1. 你是本工作区的常驻组长，只处理本工作区（当前工作目录）的任务；用户只和主会话对话，
      你不直接面对用户，也不做面向用户的汇报；
-  2. 收到「【任务看板 · 待开始】」→ 先 `taskboard_update` 置 `doing` → `subagent` 派 worker
+  2. 收到「【任务看板 · 待开始】」→ 先 `taskboard_update` 置 `doing` → **默认** `subagent` 派一个 worker
      （`taskboard-worker` 预设，后台；prompt 自包含任务 id / 标题 / 工作目录 / 验收标准 / 回报模板）→ 结束本轮；
+     可拆任务按 6c 在同一轮 fan-out 多个 worker；
   3. 子 Agent 回报 → **对工作区取证审核**（读文件、对照验收标准；要跑命令就派验证子 Agent，不看摘要）：
      通过则 `taskboard_update status=done result=<Markdown>`（插件会把完成回执汇总给主会话）；
      不通过则 `send_message` 打回同一个 worker，`doing` 不变；
@@ -1469,6 +1480,11 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
      「任务 id：t-N」写进 worker prompt 再重试，**不要绕过闸门**。轮询投递任务的 worker prompt 必须带
      「任务 id：t-N」与标题（persona 已要求），宿主据此复用原卡片而不是新建；组长收到投递后
      `taskboard_update {status:'doing'}` 也会记一条一次性派发意图，供 prompt 没写任务 id 的 worker 认领。
+  6c. v0.3.3 可拆任务的并行 fan-out：任务能拆成 ≥2 个**写域不相交**的独立片时，组长先出切片表，
+     在**同一轮**为每片各派一个 `subagent`（`description` 互不相同、带父任务 id）；切片 worker 的
+     **prompt 不得出现父任务 id / 标题**，也不得写行首「任务 id：t-N」/「看板任务：t-N」——宿主
+     lead-intent 是全文匹配，第一片会把父卡认领走；全部回报后（`taskboard_list` 核对）合并/验证，
+     再 `taskboard_update` 父任务 `done`。需要写文件合并就派 merge worker；写域重叠 / 不可拆时退回单 worker。
   7. v0.2.2（需要用户决策时）：**不要**把问题写进 `lastError`、也不要只在聊天里问。改用
      `taskboard_update {id, needsUser:true, question:"…", questionOptions?:["A","B"]}` 在任务上提一个
      具体问题（`question` ≤500 字、选项 ≤4 个 / 每个 ≤80 字），任务 `status` 保持原样；
@@ -1612,6 +1628,7 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 | 工作区映射无限增长 | `workspaceLeads` 最多 32 条，超出按 key 顺序截断；非法条目在 `normalizeConfig` 丢弃 |
 | 用户把工作区组长会话误绑成主会话 | 回执仍会投递，但组长 persona 不面向用户、不会主动汇总；文档建议主会话用普通会话（不做硬校验，避免误伤） |
 | 手动在模式选择器里开的「任务看板 · 工作区组长（自动）」会话不会被自动接管 | 看板只认 `config.workspaceLeads`（懒创建 / `ensure-workspace-lead` 修复）。**v0.3.2 起**：工作区没有组长、或映射的组长已归档时，该会话第一次派 worker（闸门通过）会被登记为组长（§1.5 第 11 条）；已有活组长不抢；只打开不派活不会接管。 |
+| 可拆任务 fan-out 的写域隔离只是 persona 约束，不是文件锁 | §6 第 6c 条要求切片 worker prompt 写死写域、同一文件/目录禁止并行；做不到就退回单 worker 或串行。切片自动卡各自会发完成回执，**父卡结论才是最终**；需要抑制中间回执时后续加 `batchParent` 字段。 |
 | §1.8 的闸门 / 挂钩依赖 dsh 的 `subagent` 工具名、`tools/pre-execute` 事件与输出形状（v0.3.0 之前是 `{kind:'activation', subagentId}`；当前是 `{kind:'activation', name}`）、`subagent/end` 事件字段（含 `parentSessionId`） | **闸门是 fail-open 的**：只认 `exec.name === 'subagent'`；dsh 改了工具名 / 不再发 `tools/pre-execute` 时它不会拦截，派发退化成 0.2.3 的「观察后补建」（直聊派活可能再次漏卡），但不会误拦正常调用。**v0.3.1 起 `tools/result` 只要求 `result.isError !== true` + `value.kind === 'activation'`**：有 `subagentId` 直接写 `workerSessionId`，没有时用 `name` 占位并从 `subagents.listDescendants(parentSessionId)` 按 name 回填；**缺 id 不再判失败**（否则闸门卡被降级回 todo、轮询重复派发——t-107 事故）。只有非 activation / `post-execute` block / 取消才不删卡（fail-safe）：把闸门预建的卡降级为 `todo` 并写 `lastError='派发未启动：…'`。`subagent/end` 缺 `lastAssistantMessage` 时 `result` 留空、任务照样置 done；缺 `stopReason` 时按非 completed 处理（保持 doing）；id 未回填时按 `parentSessionId` + 唯一 running 自动卡兜底认领。升级 dsh 后跑 `node --test` 的闸门 / 回填回归（`registerLeadDispatchGate` + name-only activation + catalog 回填 + end 兜底）与 §7 第 10 项真实链路 |
 | 组长在直聊里「先 `taskboard_add` 再 `subagent`」会造成两条任务 | persona 已写明「直聊派活不需要手动 add」（§6）；如果 worker prompt 带「任务 id：t-N」或标题，闸门会复用那条卡片（不会多一条）；prompt 完全没提任务时才会各自建卡，属预期（用户可见、可删） |
 | Team 模式与 `team:policy` 的 wait 例外 | 组长不使用 `wait_agent`，与宿主 policy「root must wait」有意偏离，冲突时以 persona 为准（组长靠 worker 完成通知开新一轮；占住会话等待会让轮询对其它任务持续报「组长忙」，§1.10） |
@@ -2294,3 +2311,28 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   真实验证：重启后在一个没有组长的测试工作区手动开「任务看板 · 工作区组长（自动）」会话 → 直聊派活
   → 看板卡保持 `doing`、组长条显示该会话、轮询不再新建组长窗口；归档旧组长后再派一次 → 映射替换、
   旧任务回到待开始、当前卡改绑到新组长。
+
+- v0.3.3（可拆任务的并行 fan-out：组长可以一次派多个 worker，最后合并）：
+  此前组长对一条任务默认只派一个 worker，任务再可拆也是串行；单 worker 的墙钟已经压不动。
+  本版把「先拆片、再并行、最后合并」写进组长 persona 与派发文本：
+  ① 收到任务后先判断是否可拆成 ≥2 个**写域不相交**的独立片；可拆则出切片表（片名 / 写域 /
+     验收标准 / 依赖），在**同一轮**为每片各派一个 `subagent`；不可拆 / 写域重叠则回到单 worker。
+  ② 切片 worker 的 `description` 互不相同并带父任务 id（例如「t-107 切片 A · 内核 Context」）；
+     **prompt 不得出现父任务 id / 标题**，也不得写行首「任务 id：t-N」/「看板任务：t-N」——
+     宿主 lead-intent 是全文匹配，第一片会被误认成父卡 worker。切片靠片名 / 写域 / 验收标准自包含。
+  ③ 父卡保持 `doing`；每片各拿一张宿主自动卡（`source='agent'` + `autoDispatch='lead-dispatch'`），
+     由 `subagent/end` 自动 done。收到切片完成通知先 `taskboard_list` 核对本批是否都完成；全部完成后
+     再做一次合并/验证：只读能收尾的自己复核；需要写文件集成 / 解冲突 / 跑全量测试就派 merge worker；
+     合并/测试通过后再 `taskboard_update` 父任务 done + result。任何一片失败只打回该片，父卡保持 doing。
+  ④ 并发 2–4 个，只并行最长路径上的片，切片别太碎（每片至少几分钟）；写域不相交是硬条件。
+  ⑤ 派发文本 `buildDispatchText()` 同步加了一句 fan-out 提示（可拆任务一次派多个、切片 prompt
+     不要出现父任务 id / 标题），轮询投递的组长也能看到。
+  测试：`test/host.test.mjs` **+1**（切片 `description` 带父 id、prompt 不含父 id/title 时，
+  lead-intent 不会把父卡认领走；另在 `buildDispatchText` 用例里断言 fan-out 提示），
+  `node --test` **296 pass / 0 fail**（v0.3.2 基线 295 → 296）。文档：§1.3 / §1.8 / §6 第 6c 条 /
+  §8 fan-out 风险行 / README 同步；`lib/client.js` **未改**；`presets/taskboard.patch.yml` 只改 persona。
+  `package.json` 0.3.2 → 0.3.3。升级后需**重启一次 dsh 进程**（persona + Host 派发文本都是启动期加载）。
+  已知边界：写域隔离只是 persona 约束（不是文件锁），切片自动卡会各自触发完成回执（父卡结论才是最终）；
+  没有硬性的 `dependsOn` / `batchParent` 字段。真实验证：重启后拿一个可拆任务，确认组长在同一轮
+  派 ≥2 个 worker、父卡保持 doing、切片各自 done、合并/验证后父卡 done；对比 1 vs 3 worker 的墙钟
+  与合并耗时，再决定并发上限。

@@ -370,6 +370,8 @@ test('buildDispatchText carries the task facts and instructions', () => {
   assert.match(text, /验收：测试通过/)
   assert.match(text, /C:\\work/)
   assert.match(text, /taskboard_update/)
+  assert.match(text, /fan-out/)
+  assert.match(text, /不要出现父任务 id/)
 })
 
 test('localStamp renders host-local wall clock with UTC offset', () => {
@@ -4434,6 +4436,52 @@ test('a dispatch-preset subagent (not a root) does not become the workspace lead
     await listeners['tools/pre-execute'](exec, async () => ({ kind: 'allow' }))
     assert.deepEqual(state.config.workspaceLeads, {}, '非 root 会话不接管工作区组长')
     assert.equal(state.tasks.length, 1, '卡片本身照常建')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a fan-out slice prompt that names the parent only in description gets its own card', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-fanout-intent-'))
+  try {
+    const now = Date.now()
+    const state = createEmptyBoard()
+    const { lead, ctx: baseCtx } = leadFixture()
+    const parent = addTask(state, { title: '父任务：内核重构' }, now)
+    parent.status = 'doing'
+    parent.notifiedAt = new Date(now).toISOString()
+    parent.dispatchedSessionId = lead.id
+
+    const listeners = {}
+    const registry = { archivedSessionIds: [] }
+    const gateCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'workspaceRegistry' ? registry : baseCtx.get(name)),
+    }
+    const rt = fakeRuntime(state, gateCtx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    assert.equal(registerLeadDispatchGate(gateCtx, rt), true)
+    assert.equal(noteLeadDispatchIntent(rt, lead, parent.id, now), true, '父卡置 doing 会记一条 lead intent')
+
+    const exec = {
+      name: 'subagent',
+      callId: 'call-slice-a',
+      agent: lead,
+      arguments: {
+        description: parent.id + ' 切片 A · 内核 Context',
+        prompt: '切片 A：只改 wharttest/kernel/context.py，验收标准：pytest 通过。不要扩大写域。',
+      },
+    }
+    assert.deepEqual(await listeners['tools/pre-execute'](exec, async () => ({ kind: 'allow' })), { kind: 'allow' })
+
+    assert.equal(state.tasks.length, 2, '父卡 + 切片卡各一条')
+    const slice = state.tasks.find((task) => task.title.includes('切片 A'))
+    assert.ok(slice, '切片拿到自己的卡')
+    assert.notEqual(slice.id, parent.id, '切片不能认领父卡')
+    assert.equal(slice.dispatchedSessionId, 'lead-1')
+    assert.equal(parent.status, 'doing', '父卡保持 doing，等合并')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
