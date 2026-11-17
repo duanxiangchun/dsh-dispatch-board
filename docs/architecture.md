@@ -202,6 +202,13 @@ v0.2.0 的默认派发方式。目标不是「某个会话」，而是**任务�
     换一个新组长。**绝不 unarchive**（尊重用户的归档动作）。`ensure-workspace-lead` 对归档映射做同样的
     修复替换；组长条对归档会话显示「已归档」并提供「创建组长」按钮（§5.5）。
 
+11. **派发会话接管（v0.3.2）**：工作区**没有组长映射**，或映射指向的组长会话**已归档**时，第一个在该
+    工作区派 worker 的 `taskboard-dispatch` 会话会被登记为该工作区组长（写 `config.workspaceLeads`）。
+    归档映射先删除、把它名下 `doing` 任务重排回 `todo`（正在派发的这张卡除外，并改绑到当前会话），
+    再写新映射。**已有未归档的组长映射时不抢**；只打开派单会话、不派 worker 不会自动接管。
+    触发点是 §1.8 的派发闸门（卡片准备成功后、worker 启动前），只认 root 会话（`agents.roots()`），
+    子 Agent 即使带 `taskboard-dispatch` 预设也不接管。
+
 ### 1.6 完成回执（主会话汇报）
 
 任务完成后由宿主主动把结论推给**主会话**（`config.mainSessionId`），主会话负责向用户汇总。
@@ -309,6 +316,9 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 - **不覆盖**：绕过 tools 管线、直接调用 `ctx.subagents.startActivation()` 的第三方插件；以及
   非 `spawn` 的 provider 若返回的 activation 没有 `name`：无法回填 `workerSessionId`
   （卡片仍保持 `doing`、不会重复派发，但自动收尾和「对话」链接可能缺失）。
+- **接管组长（v0.3.2）**：闸门在卡片准备成功之后、`next()` 之前调用 `adoptWorkspaceLead()`；工作区
+  没有组长映射 / 映射指向的组长已归档时，把当前 `taskboard-dispatch` 会话登记为该工作区组长
+  （§1.5 第 11 条），避免轮询下一轮再新建一个组长窗口。接管失败只告警，不阻断派发。
 
 **闸门判定顺序（`prepareLeadDispatch`，worker 启动前）**
 
@@ -1103,7 +1113,9 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   （只认待做 / 进行中且未挂真实 worker 的卡）→ 组长置 doing 的意图（prompt 必须真的提到该任务）→
   同参数预建卡片 → 新建 `doing` + `autoDispatch` 卡片并同步写盘。
   新建失败（`commitBoard` 返回 `saved:false`）→ 回滚内存卡片 + `{kind:'deny'}`；worker 不会启动。
-  同一 `exec` 对象重复进闸门直接复用第一次结果（PTC / 重试幂等）。
+  同一 `exec` 对象重复进闸门直接复用第一次结果（PTC / 重试幂等）。卡片准备成功后、`next()` 之前
+  调用 `adoptWorkspaceLead()`：工作区无组长 / 组长已归档时把当前会话登记为组长（§1.5 第 11 条）；
+  已有活组长不抢，接管失败只告警、不阻断派发。
 - **观察挂钩**：`tools/result` 只负责把 `exec → 卡片` 句柄（`preparedDispatches`，WeakMap）里的卡片
   补上本次 worker 的 `assignee`（`handleSubagentDispatch` 的 `prepared` 分支；有 `subagentId` 用它，
   没有时用 activation 的 `name`），并**总是**写 `workerRunState='running'`；`workerSessionId` 有
@@ -1599,7 +1611,7 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 | 主会话离线 / 忙时完成回执堆积 | done 任务保持 `reportedAt=null`；主会话 live 且 idle 后合并补投（≤10 条/批）；未绑定则不发，不丢任务状态 |
 | 工作区映射无限增长 | `workspaceLeads` 最多 32 条，超出按 key 顺序截断；非法条目在 `normalizeConfig` 丢弃 |
 | 用户把工作区组长会话误绑成主会话 | 回执仍会投递，但组长 persona 不面向用户、不会主动汇总；文档建议主会话用普通会话（不做硬校验，避免误伤） |
-| 手动在模式选择器里开的「任务看板 · 工作区组长（自动）」会话不会被自动接管 | 看板只认 `config.workspaceLeads`（懒创建 / `ensure-workspace-lead` 修复）；手动会话不写映射、不派任务，建议交给插件自动创建。后续版本可让懒创建优先复用同工作区空闲的该预设会话（v0.2.x 待办） |
+| 手动在模式选择器里开的「任务看板 · 工作区组长（自动）」会话不会被自动接管 | 看板只认 `config.workspaceLeads`（懒创建 / `ensure-workspace-lead` 修复）。**v0.3.2 起**：工作区没有组长、或映射的组长已归档时，该会话第一次派 worker（闸门通过）会被登记为组长（§1.5 第 11 条）；已有活组长不抢；只打开不派活不会接管。 |
 | §1.8 的闸门 / 挂钩依赖 dsh 的 `subagent` 工具名、`tools/pre-execute` 事件与输出形状（v0.3.0 之前是 `{kind:'activation', subagentId}`；当前是 `{kind:'activation', name}`）、`subagent/end` 事件字段（含 `parentSessionId`） | **闸门是 fail-open 的**：只认 `exec.name === 'subagent'`；dsh 改了工具名 / 不再发 `tools/pre-execute` 时它不会拦截，派发退化成 0.2.3 的「观察后补建」（直聊派活可能再次漏卡），但不会误拦正常调用。**v0.3.1 起 `tools/result` 只要求 `result.isError !== true` + `value.kind === 'activation'`**：有 `subagentId` 直接写 `workerSessionId`，没有时用 `name` 占位并从 `subagents.listDescendants(parentSessionId)` 按 name 回填；**缺 id 不再判失败**（否则闸门卡被降级回 todo、轮询重复派发——t-107 事故）。只有非 activation / `post-execute` block / 取消才不删卡（fail-safe）：把闸门预建的卡降级为 `todo` 并写 `lastError='派发未启动：…'`。`subagent/end` 缺 `lastAssistantMessage` 时 `result` 留空、任务照样置 done；缺 `stopReason` 时按非 completed 处理（保持 doing）；id 未回填时按 `parentSessionId` + 唯一 running 自动卡兜底认领。升级 dsh 后跑 `node --test` 的闸门 / 回填回归（`registerLeadDispatchGate` + name-only activation + catalog 回填 + end 兜底）与 §7 第 10 项真实链路 |
 | 组长在直聊里「先 `taskboard_add` 再 `subagent`」会造成两条任务 | persona 已写明「直聊派活不需要手动 add」（§6）；如果 worker prompt 带「任务 id：t-N」或标题，闸门会复用那条卡片（不会多一条）；prompt 完全没提任务时才会各自建卡，属预期（用户可见、可删） |
 | Team 模式与 `team:policy` 的 wait 例外 | 组长不使用 `wait_agent`，与宿主 policy「root must wait」有意偏离，冲突时以 persona 为准（组长靠 worker 完成通知开新一轮；占住会话等待会让轮询对其它任务持续报「组长忙」，§1.10） |
@@ -2259,3 +2271,26 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   真实验证：重启后跑一条「组长会话直聊 → 派 worker」链路，确认看板卡保持 `doing`、只有一个 worker、
   `workerSessionId` 在 worker 运行期间回填、结束后自动 `done`；t-107 这种**已经**重复的历史卡需要人工
   停掉其中一个 worker 并把 `assignee` / `result` 对齐到保留的那个（代码只管以后不再发生）。
+
+- v0.3.2（组长认定补漏：工作区没有组长 / 组长已归档时，第一个派 worker 的派单会话接管组长）：
+  此前 `config.workspaceLeads` 只由轮询懒创建 / `ensure-workspace-lead` 写；用户手动开的
+  `taskboard-dispatch` 会话首次直聊派活时不会被登记。于是「工作区没有组长」或「组长已归档」时，
+  轮询下一轮仍会新建一个组长窗口——同一个工作区出现两个组长，t-107 的双 worker 事故里也有这一跳。
+  修法（Host 半 + 单测 + 文档）：
+  ① 派发闸门在卡片准备成功之后、`next()` 之前调用新增的 `adoptWorkspaceLead()`（§1.5 第 11 条）：
+    工作区没有映射，或映射指向的组长会话已归档 → 把当前派单会话写进 `config.workspaceLeads`；
+    已有未归档的组长映射不抢。
+  ② 归档映射接管：先 `dropWorkspaceLeadMapping` + `requeueTasksOfLead(state, oldLead, now, taskId)`
+    把旧组长名下 `doing` 任务重排回 `todo`，**正在派发的这张卡除外**（`requeueTasksOfLead` 新增
+    `exceptTaskId` 参数），再写新映射；当前卡的 `dispatchedSessionId` / `dispatchedSessionTitle`
+    改绑到接管会话。
+  ③ 只认 root 会话（`agents.roots()`）：dispatch 预设的子 Agent 即使派活也不接管工作区。
+  ④ 接管是 best-effort：失败只 `console.warn`，不阻断派发；只打开派单会话、不派 worker 不会接管。
+  测试：`test/host.test.mjs` **+4**（无映射 → 首个派发者成为组长；归档映射 → 替换 + 旧任务重排 +
+  当前卡改绑；活组长 → 不抢；非 root 派单子 Agent → 不接管），`node --test` **295 pass / 0 fail**
+  （v0.3.1 基线 291 → 295）。文档：§1.5 / §1.8 / §4.6 / §8 手动会话风险行 / README 同步；
+  `lib/client.js` / `presets/taskboard.patch.yml` **未改**（纯 Host 行为）。
+  `package.json` 0.3.1 → 0.3.2。升级后需**重启一次 dsh 进程**。
+  真实验证：重启后在一个没有组长的测试工作区手动开「任务看板 · 工作区组长（自动）」会话 → 直聊派活
+  → 看板卡保持 `doing`、组长条显示该会话、轮询不再新建组长窗口；归档旧组长后再派一次 → 映射替换、
+  旧任务回到待开始、当前卡改绑到新组长。

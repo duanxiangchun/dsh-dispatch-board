@@ -4302,6 +4302,143 @@ test('subagent/end claims the only running auto card by parentSessionId when the
   }
 })
 
+test('a dispatch-preset session becomes the workspace lead when no lead is mapped', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-adopt-no-lead-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx: baseCtx } = leadFixture()
+    const listeners = {}
+    const registry = { archivedSessionIds: [] }
+    const gateCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'workspaceRegistry' ? registry : baseCtx.get(name)),
+    }
+    const rt = fakeRuntime(state, gateCtx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    assert.equal(registerLeadDispatchGate(gateCtx, rt), true)
+
+    const exec = { name: 'subagent', callId: 'call-adopt', agent: lead, arguments: { description: '接管空工作区', prompt: '干活' } }
+    const decision = await listeners['tools/pre-execute'](exec, async () => ({ kind: 'allow' }))
+    assert.equal(decision.kind, 'allow')
+    const key = workspaceKeyForCwd(gateCtx, 'C:\\work\\demo')
+    assert.notEqual(key, '')
+    assert.equal(state.config.workspaceLeads[key].sessionId, 'lead-1', '第一个派发者成为组长')
+    assert.equal(state.config.workspaceLeads[key].title, 'demo 组长')
+    assert.equal(state.config.workspaceLeads[key].cwd, 'C:\\work\\demo')
+    assert.equal(state.tasks.length, 1, '卡片照常创建')
+    assert.equal(state.tasks[0].dispatchedSessionId, 'lead-1')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a dispatch-preset session takes over an archived lead and requeues its doing tasks', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-adopt-archived-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx: baseCtx } = leadFixture()
+    const key = workspaceKeyForCwd(baseCtx, 'C:\\work\\demo')
+    state.config.workspaceLeads = {
+      [key]: { sessionId: 'old-lead', title: '旧组长', cwd: 'C:\\work\\demo', createdAt: new Date(NOW).toISOString() },
+    }
+    const oldTask = addTask(state, { title: '旧组长正在做的活' }, NOW)
+    oldTask.status = 'doing'
+    oldTask.dispatchedSessionId = 'old-lead'
+    oldTask.startedAt = new Date(NOW).toISOString()
+
+    const listeners = {}
+    const registry = { archivedSessionIds: ['old-lead'], list: () => [] }
+    const gateCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'workspaceRegistry' ? registry : baseCtx.get(name)),
+    }
+    const rt = fakeRuntime(state, gateCtx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    assert.equal(registerLeadDispatchGate(gateCtx, rt), true)
+
+    const exec = { name: 'subagent', callId: 'call-adopt-archived', agent: lead, arguments: { description: '接管归档组长', prompt: '干活' } }
+    assert.deepEqual(await listeners['tools/pre-execute'](exec, async () => ({ kind: 'allow' })), { kind: 'allow' })
+
+    assert.equal(state.config.workspaceLeads[key].sessionId, 'lead-1', '归档组长由当前派发会话替换')
+    assert.equal(oldTask.status, 'todo', '旧组长名下的 doing 任务重新排队')
+    assert.equal(oldTask.dispatchedSessionId, null)
+    assert.equal(oldTask.assignee, '')
+    assert.match(oldTask.lastError, /已归档/)
+    const newCard = state.tasks.find((task) => task.title === '接管归档组长')
+    assert.ok(newCard, '当前派发的卡片仍在')
+    assert.equal(newCard.status, 'doing')
+    assert.equal(newCard.dispatchedSessionId, 'lead-1')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a dispatch-preset session does not replace a live workspace lead', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-adopt-live-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx: baseCtx } = leadFixture()
+    const key = workspaceKeyForCwd(baseCtx, 'C:\\work\\demo')
+    state.config.workspaceLeads = {
+      [key]: { sessionId: 'other-lead', title: '别的组长', cwd: 'C:\\work\\demo', createdAt: new Date(NOW).toISOString() },
+    }
+    const listeners = {}
+    const registry = { archivedSessionIds: [], list: () => [] }
+    const gateCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'workspaceRegistry' ? registry : baseCtx.get(name)),
+    }
+    const rt = fakeRuntime(state, gateCtx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    assert.equal(registerLeadDispatchGate(gateCtx, rt), true)
+
+    const exec = { name: 'subagent', callId: 'call-adopt-live', agent: lead, arguments: { description: '不抢活组长', prompt: '干活' } }
+    await listeners['tools/pre-execute'](exec, async () => ({ kind: 'allow' }))
+    assert.equal(state.config.workspaceLeads[key].sessionId, 'other-lead', '已有活组长不抢')
+    assert.equal(state.config.workspaceLeads[key].title, '别的组长')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a dispatch-preset subagent (not a root) does not become the workspace lead', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-adopt-not-root-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx: baseCtx } = leadFixture()
+    const child = {
+      id: 'child-dispatch',
+      status: 'idle',
+      session: { id: 'child-dispatch', header: { cwd: 'C:\\work\\demo', title: '子派单会话', agentPreset: 'taskboard-dispatch' } },
+    }
+    const listeners = {}
+    const registry = { archivedSessionIds: [] }
+    const gateCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'workspaceRegistry' ? registry : baseCtx.get(name)),
+    }
+    const rt = fakeRuntime(state, gateCtx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    assert.equal(registerLeadDispatchGate(gateCtx, rt), true)
+
+    // baseCtx.get('agents').roots() 只含 lead；child 不在 roots 里。
+    const exec = { name: 'subagent', callId: 'call-adopt-child', agent: child, arguments: { description: '子会话派活', prompt: '干活' } }
+    await listeners['tools/pre-execute'](exec, async () => ({ kind: 'allow' }))
+    assert.deepEqual(state.config.workspaceLeads, {}, '非 root 会话不接管工作区组长')
+    assert.equal(state.tasks.length, 1, '卡片本身照常建')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('a non-activation tools/result keeps the gate card as a visible todo record (block / unknown shape)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-dispatch-gate-release-'))
   try {
