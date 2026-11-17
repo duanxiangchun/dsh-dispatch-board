@@ -16,7 +16,7 @@
       config:
         id: taskboard-dispatch
         name: 任务看板 · 工作区组长（自动）
-        description: 工作区常驻组长（由宿主按工作区自动创建/维护）：只处理本工作区的看板任务，收到投递后置 doing、派 worker 子 Agent 后台执行、对工作区取证审核，并把结论写回看板；不直接面对用户，通常不需要手动选择该模式。
+        description: 工作区常驻组长（由宿主自动维护）：接单、派 worker、审核并回写看板；通常无需手动选择。
         order: 40
         plugins:
           # 工作区组长口径。persona 行只改本预设的 scope，不影响其它模式。
@@ -219,7 +219,7 @@
       config:
         id: taskboard-worker
         name: 任务看板 · 执行者（自动派发）
-        description: 由「任务看板 · 工作区组长（自动）」派发的子 Agent 专用：完整执行工具（读写文件、跑命令、搜索、技能），只干被指派的那一件事，不继续往下派。
+        description: 工作区组长派发的 worker 专用：完整执行工具，只干被指派的一件事，不再往下派。
         order: 41
         plugins:
           - id: persona

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Task board + dispatcher mode",
-    "description": "Sidebar task board + workspace-lead dispatch (default): you only talk to the main session — tasks are handed to each workspace's resident lead, which dispatches workers, and the four-column board (todo / in progress / done / archived) summarizes progress and results. The main session receives completion receipts and reports back to you."
+    "description": "Task board + workspace-lead dispatch: talk to the main session; leads dispatch workers and the four-column board tracks progress and results."
   }
 }
