@@ -4295,3 +4295,35 @@ test('v0.4.0 前置依赖 UI：新建可填 dependsOn，详情浮层展示前置
   box = detailBox(next)
   assert.ok(textOf(box).includes('梳理看板数据模型'), '点击前置依赖条目应跳转到该前置任务的详情')
 })
+
+test('v0.5.0 Git Worktree UI：设置面板支持切换 Worktree 并发隔离开关，任务详情展示隔离工作树分支与路径', async () => {
+  const snapshot = makeSnapshot()
+  snapshot.tasks[3].worktreePath = 'C:\\dsh\\storages\\dsh-taskboard\\worktrees\\repo\\t-4'
+  snapshot.tasks[3].worktreeBranch = 'taskboard/t-4'
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  // 1) 打开「设置」面板，切换「Git Worktree 并发隔离」按钮 → 发送 set-config { worktreeIsolation: false }
+  const settingsBtn = buttons(tree).find((node) => textOf(node).trim() === '设置')
+  assert.ok(settingsBtn)
+  settingsBtn.props.onClick()
+  let next = await instance.run()
+  const panel = nodesWithClass(next, 'tb-settings')[0]
+  assert.ok(panel)
+  assert.ok(textOf(panel).includes('Git Worktree 并发隔离'))
+  const wtToggleBtn = buttons(panel).find((node) => textOf(node).includes('真并发隔离'))
+  assert.ok(wtToggleBtn, '默认应显示已启用（真并发隔离）按钮')
+  wtToggleBtn.props.onClick()
+  await settle()
+  const cfgCall = harness.rpcCalls.find(
+    (call) => call.endpoint === 'set-config' && Object.prototype.hasOwnProperty.call(call.payload, 'worktreeIsolation'),
+  )
+  assert.ok(cfgCall)
+  assert.deepEqual(Object.assign({}, cfgCall.payload), { worktreeIsolation: false })
+
+  // 2) 打开带 worktreePath 的任务详情 → 基本信息展示隔离工作树分支与路径
+  next = await openDetailByTitle(instance, next, '打通宿主 RPC')
+  const box = detailBox(next)
+  assert.ok(textOf(box).includes('隔离工作树'))
+  assert.ok(textOf(box).includes('taskboard/t-4'))
+})

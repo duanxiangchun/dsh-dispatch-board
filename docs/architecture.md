@@ -590,8 +590,10 @@ DSH 的 Agent Teams（`team_task_create` / `team_task_get` / `team_task_list` / 
       "ws-1": { "sessionId": "…", "title": "…", "cwd": "C:\\work\\demo", "createdAt": "…ISO…" }
     },
     "workspaceFilter": "",        // v0.2.3：看板「工作区」过滤选择（工作区路径；"" = 全部工作区，默认）
-    "workspaceDraft": ""          // v0.2.3：平台看板「新建行 → 任务所属工作区」选择
+    "workspaceDraft": "",         // v0.2.3：平台看板「新建行 → 任务所属工作区」选择
                                   // （工作区路径；"" = 未选择，提交保持禁用）
+    "archiveRetentionMinutes": 30,// v0.3.6：归档自动删除分钟数（0..10080；0 = 不自动删除）
+    "worktreeIsolation": true     // v0.5.0：Git Worktree 物理并发隔离（默认 true）
   },
   "tasks": [
     {
@@ -607,6 +609,11 @@ DSH 的 Agent Teams（`team_task_create` / `team_task_get` / `team_task_list` / 
       "reportedAt": "…ISO…" | null,      // v0.2.0：完成回执推给主会话的时间；null = 未推送
       "autoDispatch": "lead-dispatch" | null, // v0.2.0：宿主挂钩自动建的任务标记（§1.8）；null = 普通任务
       "parentTaskId": "t-1" | null,      // v0.3.5：所属父任务 id（fan-out 切片 / 合并 / 验证子卡）；顶层任务为 null
+      "dependsOn": ["t-0"],              // v0.4.0：前置依赖任务 id 列表（≤16 条；空为 []）
+      "worktreePath": "C:\\…" | null,    // v0.5.0：隔离 Git Worktree 目录路径（无隔离时为 null）
+      "worktreeBranch": "taskboard/t-1" | null, // v0.5.0：隔离临时分支名（无隔离时为 null）
+      "worktreeBaseCommit": "…" | null,  // v0.5.0：创建 Worktree 时的主仓 HEAD commit（宿主内部字段）
+      "worktreeLinks": ["node_modules"], // v0.5.0：自动挂载进 Worktree 的依赖 Junction 相对路径（宿主内部字段）
       "needsUser": false,                // v0.2.2：等待用户回复（不新增 status，§1.9）
       "question": "",                    // needsUser=true 时必填（≤500）
       "questionOptions": [],             // 可选选项（≤4 个，每个 ≤80）
@@ -798,7 +805,7 @@ Content-Type: application/json
 | `answer-task` | `{id, answer}` | `{task, sessionId}` | **v0.2.2**：回答 `needsUser` 问题（§1.9）。`answer` 非空 ≤1000；任务已归档 → `conflict`（「任务已归档，不能再回答」，不投递、不写回答）；目标会话按 `dispatchedSessionId` → `askedBy` → `sessionId` 依次尝试（跳过已归档 / 不在线的候选）；followup + `sessions.flush` 成功后清标记并写 `lastAnswer` / `answeredAt`；全部候选不可用 → `conflict`（错误信息列出尝试过的会话），失败**保留**标记与问题，任务 `lastError` 写原因 |
 | `delete-task` | `{id}` | `{deleted:true,id}` | 物理删除（仅限 UI 手动） |
 | `dispatch-now` | `{id}` | `{dispatched, sessionId, task}` | 立即投递一次（不等轮询、无视冷却）；路由按当前 `dispatchMode` |
-| `set-config` | `{pollEnabled?, pollIntervalMs?, dispatchMode?}` | `{config}` | 开关 / 间隔 / 派发去处（`workspace-lead` / `new` / `creator` / `auto`）；非法 `dispatchMode` 按 `normalizeConfig` 回落默认 `workspace-lead` |
+| `set-config` | `{pollEnabled?, pollIntervalMs?, dispatchMode?, archiveRetentionMinutes?, worktreeIsolation?}` | `{config}` | 开关 / 间隔 / 派发去处（`workspace-lead` / `new` / `creator` / `auto`）/ 归档保留分钟数（v0.3.6）/ Git Worktree 并发隔离开关（v0.5.0，默认 `true`）；非法 `dispatchMode` 按 `normalizeConfig` 回落默认 `workspace-lead` |
 | `archive-done` | `{}` | `{archived:n}` | 一键把全部 `done` 归档 |
 | `bind-main-session` | `{sessionId}` | `{main: MainSessionRef}` | **v0.2.0**：把会话绑定为主会话（完成回执收件人），持久化 `config.mainSessionId` / `mainSessionTitle` |
 | `clear-main-session` | `{}` | `{ok:true}` | **v0.2.0**：解除主会话绑定（幂等，未绑定也成功） |
@@ -1057,9 +1064,10 @@ ctx.effect(() => ctx.webServer.register({
 
 | 工具 | 参数 | 行为 |
 | --- | --- | --- |
-| `taskboard_list` | `{status?, parentTaskId?}` | 返回文本清单（id / 状态 / 父任务 / 标题 / 备注 / assignee / result / 待回答的问题）+ 结构化 `tasks[]`；v0.2.2 起 `tasks[]` 带 `needsUser` / `question` / `questionOptions`，v0.3.5 起带 `parentTaskId` 并支持按 `parentTaskId` 过滤某父卡名下的全部子卡 |
-| `taskboard_add` | `{title, note?, workspace?, parentTaskId?}` | 新建任务（`source='agent'`，`sessionId=exec.agent.session.id`）；`workspace` v0.2.0 新增，`parentTaskId` v0.3.5 可选关联父任务 |
-| `taskboard_update` | `{id, status?, result?, assignee?, note?, lastError?, needsUser?, question?, questionOptions?}` | 更新任务（三个模型工具执行前均调 `reloadBoardIfStale` 对齐磁盘状态）；`status` 非法迁移返回错误文本；`lastError` 供组长记录故障或阻塞原因（派发失败 / 缺工作目录 / worker 异常；不写向用户的提问）；**`assignee` 语义（v0.2.9）**：写子 Agent 的 label / 名字（自由文本）即可，**不要写会话 id**——会话 id 由宿主记在 `workerSessionId`（宿主独占、模型不可写、不进 `taskBrief`，§2）；v0.2.2 起 `needsUser:true` + `question` 用来「问用户」（§1.9），`needsUser:false` 取消提问，`askedBy` 取 `exec.agent.session.id`（工具不暴露该参数；RPC 层单独传 `askedBy` 也不生效，见 §2）；任务已归档且未同时改 `status` 时设置 `needsUser:true` / `question` → 工具报 `conflict`（不写盘，§1.9）；v0.2.4 起**组长**（`taskboard-dispatch`）把轮询投递任务置 `doing` 时，宿主额外记一条一次性「即将派 worker」意图（进程内，不落盘；派发闸门据此复用原卡片，§1.8） |
+| `taskboard_list` | `{status?, parentTaskId?}` | 返回文本清单（id / 状态 / 父任务 / 依赖 / 标题 / 备注 / assignee / worktreePath / result / 待回答的问题）+ 结构化 `tasks[]`；v0.2.2 起 `tasks[]` 带 `needsUser` / `question` / `questionOptions`，v0.3.5 起带 `parentTaskId` 并支持按 `parentTaskId` 过滤，v0.4.0 起带 `dependsOn`，v0.5.0 起带 `worktreePath` / `worktreeBranch` |
+| `taskboard_add` | `{title, note?, workspace?, parentTaskId?, dependsOn?}` | 新建任务（`source='agent'`，`sessionId=exec.agent.session.id`）；`workspace` v0.2.0 新增，`parentTaskId` v0.3.5 可选关联父任务，`dependsOn` v0.4.0 可选声明前置依赖 |
+| `taskboard_update` | `{id, status?, result?, assignee?, note?, lastError?, needsUser?, question?, questionOptions?, dependsOn?}` | 更新任务（模型工具执行前均调 `reloadBoardIfStale` 对齐磁盘状态）；`status` 非法迁移返回错误文本；`lastError` 供组长记录故障或阻塞原因（派发失败 / 缺工作目录 / worker 异常；不写向用户的提问）；**`assignee` 语义（v0.2.9）**：写子 Agent 的 label / 名字（自由文本）即可，**不要写会话 id**——会话 id 由宿主记在 `workerSessionId`（宿主独占、模型不可写、不进 `taskBrief`，§2）；v0.2.2 起 `needsUser:true` + `question` 用来「问用户」（§1.9），`needsUser:false` 取消提问，`askedBy` 取 `exec.agent.session.id`；任务已归档且未同时改 `status` 时设置 `needsUser:true` / `question` → 工具报 `conflict`（不写盘，§1.9）；v0.2.4 起**组长**（`taskboard-dispatch`）把轮询投递任务置 `doing` 时，宿主额外记一条一次性「即将派 worker」意图（进程内，不落盘；派发闸门据此复用原卡片，§1.8） |
+| `taskboard_merge_worktree` | `{id, cleanup?, discardOnly?}` | **v0.5.0**：将任务关联的隔离 Git Worktree（`task.worktreePath`）改动无损合入主工作区并清理 Worktree 目录与临时分支 `taskboard/<id>`。先卸载所有依赖 Junction 软链，将 Worktree 内未提交文件快照提交至临时分支后，以 `git diff --binary --full-index -U1 <base>..<wtHead>` + `git apply --check` 原子预检并 `git apply` 应用到主工作区（兼容主工作区含未暂存改动，且不污染主分支提交历史）；若存在冲突则主工作区保持原状不变并返回 `{merged:false, conflict:true, conflictFiles}`；传 `discardOnly:true` 则不合入改动、直接卸载软链并回收 Worktree 与临时分支 |
 
 **`taskboard_add.workspace`（v0.2.0，可选）**：工作区 id / 名称 / 绝对路径，用于主会话往任意工作区派任务。
 
@@ -1088,10 +1096,10 @@ ctx.effect(() => ctx.webServer.register({
 - v0.2.0 新增的任务字段 `reportedAt` 是 UI / 回执记账字段：出现在 `board.json`、`Snapshot.tasks`
   与返回完整任务的 UI RPC 响应（`add-task` / `update-task` / `dispatch-now` / `answer-task`
   的 `value.task`），**绝不进 `taskBrief` / 模型工具输出**。
-- v0.2.2 起 `taskBrief` 有 10 个已声明键，v0.3.5 起新增 `parentTaskId`（共 **11 个已声明键**）：
-  id / title / status / parentTaskId / note / assignee / result / updatedAt +
-  `needsUser` / `question` / `questionOptions`（`parentTaskId` 无父卡时为 `''`；flagged 任务必须在模型工具输出里可见，
-  组长才能确认自己在等什么；`askedBy` / `askedAt` / `lastAnswer` / `answeredAt` 仍只出现在
+- v0.2.2 起 `taskBrief` 有 10 个已声明键，v0.3.5 新增 `parentTaskId`，v0.4.0 新增 `dependsOn`，v0.5.0 新增 `worktreePath` / `worktreeBranch`（共 **14 个已声明键**）：
+  id / title / status / parentTaskId / dependsOn / note / assignee / result / updatedAt +
+  `needsUser` / `question` / `questionOptions` + `worktreePath` / `worktreeBranch`（`parentTaskId`、`worktreePath`、`worktreeBranch` 为空时返回 `''`；flagged 任务与隔离工作树路径必须在模型工具输出里可见，
+  组长才能确认自己在等什么以及是否需要调 `taskboard_merge_worktree`；`askedBy` / `askedAt` / `lastAnswer` / `answeredAt` / `worktreeBaseCommit` / `worktreeLinks` 仍只出现在
   `board.json` 与 `Snapshot.tasks`，不进工具输出）。
 
 ### 4.5 模式状态（预设声明 + 读回）
@@ -2418,3 +2426,12 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   ② **组长轻写模式与快慢分流（Fast-path vs Worker-path）**：`presets/taskboard.patch.yml` 为 `taskboard-dispatch` 开放 `write: true, edit: true`（继续不挂 `pwsh`/`bash` 终端）；组长对 ≤2 个文件且无需终端测试/构建的纯文档/配置/胶水小活直接 `edit/write` 当轮置 `done`（直聊小活先 `taskboard_add` 建卡留痕），需跑命令验证或大范围改代码的重活物理强制走 `subagent` worker。
   ③ **失联 `doing` 卡自动巡检自愈（`reconcileOrphanedDoingTasks`）**：启动期（`apply`）与轮询 `tick`（带 `ORPHAN_GRACE_MS = 60s` 启动宽限）巡检 `doing + workerRunState==='running'` 任务（启动期额外回收超时无 worker 的陈旧顶层 `doing` 卡）：发现执行会话已失联不存在时，**顶层任务自动回退 `todo` 重新排队接单**（保留原备注与结论），**内部切片子卡（`autoDispatch==='lead-dispatch' && parentTaskId` 非空）标 `workerRunState='failed'` + `lastError` 并在组长空闲时自动发恢复提醒交组长续做**。
   `package.json` 0.3.9 → 0.4.0。
+
+- v0.5.0（架构演进第二步：Git Worktree 物理隔离真并发 + 自动软链依赖 + `taskboard_merge_worktree` 三路合入）：
+  ① **Git Worktree 物理级并发隔离（`config.worktreeIsolation`，默认 `true`）**：在看板「设置」面板可随时开关。开启且目标工作区为拥有 `HEAD` 提交的 Git 仓库时：
+    - 派发闸门（`tools/pre-execute`）自动在 `$DSH_HOME/storages/dsh-taskboard/worktrees/<repoSlug>/<taskId>` 创建独立 Git Worktree 与临时分支 `taskboard/<taskId>`（记录 `worktreeBaseCommit`），并将主仓存在的 `node_modules` / `.venv` / `venv` 通过目录 Junction 自动软链进 Worktree（免重装依赖即可在隔离目录内直接跑单测与类型检查）；自动改写 `subagent` 的 `cwd` 参数并注入隔离工作树说明（合并验证 worker `assignee==='merging'` 及只读审查 worker 自动跳过隔离、直接在主工作区执行）。
+    - 同工作区无 `dependsOn` 依赖的多条顶层 `todo` 任务与同一父任务的多个并行切片均支持各自独占独立 Worktree **真并发执行**（单工作区最多 `MAX_CONCURRENT_WORKTREES = 4` 路并发 worker）；非 Git 目录或关闭开关时自动无感回退单目录串行保护。
+  ② **无损三路合入与自动回收（`taskboard_merge_worktree` 工具 + 自动收尾/清理）**：
+    - 新增第 4 个模型工具 `taskboard_merge_worktree {id, cleanup?, discardOnly?}`：先安全卸载 Junction 软链（绝不触碰主仓依赖文件），将 Worktree 内未提交改动快照提交至临时分支后，以 `git diff --binary --full-index -U1 <base>..<wtHead>` + `git apply --check` 原子预检并 `git apply` 无损合入主工作区（兼容主工作区含未暂存改动或前序切片改动，不污染主分支 commit 历史、不留冲突标记），成功后自动移除 Worktree 目录与临时分支；若遇真实代码冲突则主工作区毫发无损并返回 `conflict:true` 及冲突文件列表供合并 worker 处理。
+    - 直聊顶层自动卡在 `subagent/end (completed)` 时自动尝试三路合入并回收 Worktree；任务归档、回退 `todo`、删除或过期清理时自动兜底回收残留 Worktree 与临时分支。
+  `package.json` 0.4.0 → 0.5.0。

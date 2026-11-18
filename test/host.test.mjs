@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -26,6 +27,7 @@ import {
   MAX_WORKSPACE_FILTER_CHARS,
   STATUSES,
   TASK_LIST_OUTPUT_SCHEMA,
+  TASK_MERGE_WORKTREE_OUTPUT_SCHEMA,
   TASK_ONE_OUTPUT_SCHEMA,
   addTask,
   answerTask,
@@ -33,6 +35,7 @@ import {
   archivedSessionIdSet,
   archiveDoneTasks,
   assertNoteAttachments,
+  attachDispatchWorktree,
   attachmentRef,
   attachmentsDir,
   bindMainSession,
@@ -46,6 +49,8 @@ import {
   buildWorkspaceLeadRefs,
   canTransition,
   canReuseMentionedTask,
+  cleanupTaskWorktree,
+  clearGitRepoInfoCache,
   clearMainSession,
   commitBoard,
   countAttachmentRefs,
@@ -58,6 +63,7 @@ import {
   dispatchReferencedTaskId,
   dispatchTaskIdFromPrompt,
   endpointFromUrl,
+  ensureTaskWorktree,
   ensureWorkspaceLead,
   findDependencyCycle,
   findLeadInFlightTask,
@@ -81,6 +87,7 @@ import {
   loadBoardFromDisk,
   localStamp,
   looksLikeSessionId,
+  mergeAndCleanupTaskWorktree,
   normalizeBoard,
   normalizeConfig,
   normalizeConfig as normalizeConfigAlias,
@@ -105,6 +112,7 @@ import {
   putWorkspaceLead,
   registerTools,
   reloadBoardIfStale,
+  resolveGitRepoInfo,
   resolveSessionCwd,
   resolveSessionCwdViaQuery,
   resolveTargetAgent,
@@ -116,6 +124,7 @@ import {
   selectWorkspaceLead,
   setWorkspaceFilter,
   setWorkspaceDraft,
+  shouldSkipWorktreeForDispatch,
   sniffImageMime,
   subagentPromptText,
   taskBrief,
@@ -123,6 +132,7 @@ import {
   tick,
   truncateNote,
   unresolvedDependencies,
+  worktreesDir,
   workspaceIdForCwd,
   workspaceKeyForCwd,
   workspacePathForCwd,
@@ -1042,6 +1052,10 @@ test('taskBrief output stays inside the closed tool output schemas', () => {
     askedBy: 'session-lead',
     lastAnswer: '方案 A',
     answeredAt: new Date(NOW).toISOString(),
+    worktreePath: 'C:\\dsh\\storages\\dsh-taskboard\\worktrees\\demo\\t-42',
+    worktreeBranch: 'taskboard/t-42',
+    worktreeBaseCommit: '0123456789abcdef0123456789abcdef01234567',
+    worktreeLinks: ['node_modules'],
   }
 
   const brief = taskBrief(fullTask)
@@ -1061,6 +1075,8 @@ test('taskBrief output stays inside the closed tool output schemas', () => {
     'status',
     'title',
     'updatedAt',
+    'worktreeBranch',
+    'worktreePath',
   ])
   for (const key of Object.keys(brief)) {
     assert.ok(Object.prototype.hasOwnProperty.call(declared, key), 'taskBrief 返回了 schema 未声明的字段：' + key)
@@ -1070,6 +1086,8 @@ test('taskBrief output stays inside the closed tool output schemas', () => {
   assert.equal('askedBy' in brief, false, 'taskBrief 不得返回提问会话 askedBy')
   assert.equal('lastAnswer' in brief, false, 'taskBrief 不得返回回答留档 lastAnswer')
   assert.equal('answeredAt' in brief, false, 'taskBrief 不得返回回答时间 answeredAt')
+  assert.equal('worktreeBaseCommit' in brief, false, 'taskBrief 不得返回内部基线 worktreeBaseCommit')
+  assert.equal('worktreeLinks' in brief, false, 'taskBrief 不得返回内部软链数组 worktreeLinks')
   assert.equal(brief.needsUser, true)
   assert.equal(brief.question, '选哪个方案？')
   assert.deepEqual(brief.questionOptions, ['方案 A', '方案 B'])
@@ -7174,4 +7192,282 @@ test('v0.4.0 组长预设轻写模式：taskboard-dispatch 开放 write/edit，�
   assert.match(dispatchBlock, /edit:\s*true/, '组长预设应开放 edit: true')
   assert.doesNotMatch(dispatchBlock, /dsh-tool-pwsh|dsh-tool-bash/, '组长预设仍不挂载终端工具')
   assert.match(workerBlock, /dsh-tool-pwsh/, 'worker 预设保留终端工具')
+})
+
+/* ------------------------------------------------------------------ *
+ * v0.5.0：Git Worktree 物理隔离真并发 + 依赖 Junction 软链 + 原子合入工具
+ * ------------------------------------------------------------------ */
+
+function initTempGitRepo(repoDir) {
+  mkdirSync(join(repoDir, 'src'), { recursive: true })
+  mkdirSync(join(repoDir, 'node_modules', 'demo-dep'), { recursive: true })
+  writeFileSync(join(repoDir, 'node_modules', 'demo-dep', 'index.js'), 'export const dep = 42\n')
+  writeFileSync(join(repoDir, '.gitignore'), 'node_modules/\n')
+  writeFileSync(join(repoDir, 'src', 'a.js'), 'export const a = 1\n')
+  writeFileSync(join(repoDir, 'src', 'b.js'), 'export const b = 1\n')
+  writeFileSync(join(repoDir, 'src', 'shared.js'), 'line1\nline2\nline3\nline4\nline5\nline6\n')
+  execFileSync('git', ['-C', repoDir, 'init'], { stdio: 'ignore', windowsHide: true })
+  execFileSync('git', ['-C', repoDir, 'config', 'user.name', 'test'], { stdio: 'ignore', windowsHide: true })
+  execFileSync('git', ['-C', repoDir, 'config', 'user.email', 'test@local'], { stdio: 'ignore', windowsHide: true })
+  execFileSync('git', ['-C', repoDir, 'add', '.gitignore', 'src'], { stdio: 'ignore', windowsHide: true })
+  execFileSync('git', ['-C', repoDir, 'commit', '-m', 'initial commit'], { stdio: 'ignore', windowsHide: true })
+}
+
+test('v0.5.0 Git Worktree fan-out 隔离与合入：自动建 Worktree、软链 node_modules、无损合入脏主仓并清理分支', async () => {
+  clearGitRepoInfoCache()
+  const root = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v050-wt-'))
+  try {
+    const repoDir = join(root, 'repo')
+    const storageDir = join(root, 'storage')
+    mkdirSync(storageDir, { recursive: true })
+    initTempGitRepo(repoDir)
+    // 主仓同时存在用户未提交 WIP，验证合入不要求主仓干净且不破坏 WIP
+    writeFileSync(join(repoDir, 'wip-local.txt'), 'keep user uncommitted wip\n')
+
+    const repoInfo = resolveGitRepoInfo(repoDir, { fresh: true })
+    assert.ok(repoInfo && repoInfo.headCommit.length === 40, '应解析出 Git 仓库根与 HEAD commit')
+    assert.equal(worktreesDir(join(storageDir, 'board.json')), join(storageDir, 'worktrees'))
+
+    const now = Date.now()
+    const state = createEmptyBoard()
+    const parent = addTask(state, { title: '并发重构模块 A 与模块 B', cwd: repoDir }, now)
+    applyTaskUpdate(state, parent.id, { status: 'doing' }, now + 1)
+
+    const listeners = {}
+    const lead = {
+      id: 'lead-wt',
+      status: 'running',
+      session: { id: 'lead-wt', header: { cwd: repoDir, agentPreset: 'taskboard-dispatch' } },
+      followup: () => {},
+    }
+    const ctx = {
+      on: (event, fn) => {
+        listeners[event] = fn
+      },
+      get: (name) => {
+        if (name === 'agents') return { get: (id) => (id === 'lead-wt' ? lead : undefined), roots: () => [lead] }
+        return undefined
+      },
+    }
+    const rt = fakeRuntime(state, ctx, join(storageDir, 'board.json'))
+    registerLeadDispatchGate(ctx, rt)
+    registerLeadAutoHooks(ctx, rt)
+
+    const registered = []
+    registerTools({ tools: { register: (def) => registered.push(def) } }, rt)
+    const mergeTool = registered.find((tool) => tool.name === 'taskboard_merge_worktree')
+    assert.ok(mergeTool, '必须注册第 4 个模型工具 taskboard_merge_worktree')
+
+    // 同一轮并行派发两个切片子卡（t-2 与 t-3）
+    const execA = {
+      callId: 'c-wt-a',
+      name: 'subagent',
+      agent: lead,
+      arguments: { description: 't-1 切片 A · 模块 A', prompt: '父任务：t-1\n只修改 src/a.js 并新增 src/a-extra.js' },
+    }
+    const execB = {
+      callId: 'c-wt-b',
+      name: 'subagent',
+      agent: lead,
+      arguments: { description: 't-1 切片 B · 模块 B', prompt: '父任务：t-1\n只修改 src/b.js' },
+    }
+    assert.deepEqual(listeners['tools/pre-execute'](execA, () => ({ kind: 'allow' })), { kind: 'allow' })
+    assert.deepEqual(listeners['tools/pre-execute'](execB, () => ({ kind: 'allow' })), { kind: 'allow' })
+
+    const sliceA = taskById(rt.state, 't-2')
+    const sliceB = taskById(rt.state, 't-3')
+    assert.ok(sliceA && sliceB)
+    assert.ok(sliceA.worktreePath && sliceB.worktreePath && sliceA.worktreePath !== sliceB.worktreePath)
+    assert.equal(execA.arguments.cwd, sliceA.worktreePath, '闸门必须将 worker A 的 cwd 指向独立 Worktree')
+    assert.equal(execB.arguments.cwd, sliceB.worktreePath, '闸门必须将 worker B 的 cwd 指向独立 Worktree')
+    assert.match(execA.arguments.prompt, /\[隔离工作树已启用\]/)
+
+    // 验证依赖软链（node_modules 为 Junction 且可直接读取主仓依赖）
+    assert.equal(lstatSync(join(sliceA.worktreePath, 'node_modules')).isSymbolicLink(), true)
+    assert.equal(
+      readFileSync(join(sliceA.worktreePath, 'node_modules', 'demo-dep', 'index.js'), 'utf8'),
+      'export const dep = 42\n',
+    )
+
+    listeners['tools/result'](execA, { isError: false, value: { kind: 'activation', subagentId: 'worker-wt-a', name: 'wa' } })
+    listeners['tools/result'](execB, { isError: false, value: { kind: 'activation', subagentId: 'worker-wt-b', name: 'wb' } })
+
+    // 模拟两个 worker 并发在各自隔离工作树内写文件（互不可见、互不踩踏）
+    writeFileSync(join(sliceA.worktreePath, 'src', 'a.js'), 'export const a = 100\n')
+    writeFileSync(join(sliceA.worktreePath, 'src', 'a-extra.js'), 'export const extra = true\n')
+    writeFileSync(join(sliceA.worktreePath, 'src', 'shared.js'), 'SLICE_A_TOP\nline2\nline3\nline4\nline5\nline6\n')
+    writeFileSync(join(sliceB.worktreePath, 'src', 'b.js'), 'export const b = 200\n')
+    writeFileSync(join(sliceB.worktreePath, 'src', 'shared.js'), 'line1\nline2\nline3\nline4\nline5\nSLICE_B_BOTTOM\n')
+
+    await handleSubagentEnd(rt, {
+      id: 'worker-wt-a',
+      parentSessionId: 'lead-wt',
+      stopReason: 'completed',
+      lastAssistantMessage: [{ type: 'text', text: '切片 A 完成' }],
+    })
+    await handleSubagentEnd(rt, {
+      id: 'worker-wt-b',
+      parentSessionId: 'lead-wt',
+      stopReason: 'completed',
+      lastAssistantMessage: [{ type: 'text', text: '切片 B 完成' }],
+    })
+
+    // 切片子卡完成后保持 worktreePath 供组长审核与合入
+    assert.equal(sliceA.status, 'done')
+    assert.equal(sliceB.status, 'done')
+    assert.ok(sliceA.worktreePath && sliceB.worktreePath)
+
+    // 组长调用 taskboard_merge_worktree 依次合入两张切片子卡
+    const resA = await mergeTool.execute({ id: sliceA.id })
+    const resB = await mergeTool.execute({ id: sliceB.id })
+    assert.deepEqual(schemaProblems(resA, TASK_MERGE_WORKTREE_OUTPUT_SCHEMA), [])
+    assert.deepEqual(schemaProblems(resB, TASK_MERGE_WORKTREE_OUTPUT_SCHEMA), [])
+    assert.equal(resA.merged, true)
+    assert.equal(resB.merged, true)
+    assert.equal(resA.cleaned, true)
+    assert.equal(resB.cleaned, true)
+
+    // 验证主仓已同时获得两片改动（含同一文件首尾不重叠改动）、WIP 未丢、主仓 node_modules 完好无损、临时目录已删
+    assert.equal(readFileSync(join(repoDir, 'src', 'a.js'), 'utf8').replace(/\r\n/g, '\n'), 'export const a = 100\n')
+    assert.equal(readFileSync(join(repoDir, 'src', 'a-extra.js'), 'utf8').replace(/\r\n/g, '\n'), 'export const extra = true\n')
+    assert.equal(readFileSync(join(repoDir, 'src', 'b.js'), 'utf8').replace(/\r\n/g, '\n'), 'export const b = 200\n')
+    const mergedShared = readFileSync(join(repoDir, 'src', 'shared.js'), 'utf8')
+    assert.match(mergedShared, /SLICE_A_TOP/)
+    assert.match(mergedShared, /SLICE_B_BOTTOM/)
+    assert.equal(readFileSync(join(repoDir, 'wip-local.txt'), 'utf8'), 'keep user uncommitted wip\n')
+    assert.equal(
+      readFileSync(join(repoDir, 'node_modules', 'demo-dep', 'index.js'), 'utf8'),
+      'export const dep = 42\n',
+      '卸载 Junction 与清理 Worktree 绝不能删除主仓 node_modules 内的文件',
+    )
+    assert.equal(existsSync(resA.worktreePath || join(storageDir, 'worktrees-missing')), false)
+    assert.equal(sliceA.worktreePath, null)
+    assert.equal(sliceB.worktreePath, null)
+
+    // 父任务标 merging 后派出的「合并与全量验证」worker 自动跳过隔离，直接在主工作区执行
+    applyTaskUpdate(rt.state, parent.id, { assignee: 'merging' }, now + 50)
+    const execMergeVerify = {
+      callId: 'c-merge-verify',
+      name: 'subagent',
+      agent: lead,
+      arguments: { description: 't-1 合并与全量验证', prompt: '父任务：t-1\n跑全量单测验证' },
+    }
+    assert.deepEqual(listeners['tools/pre-execute'](execMergeVerify, () => ({ kind: 'allow' })), { kind: 'allow' })
+    assert.equal(execMergeVerify.arguments.cwd, undefined, '合并验证 worker 不重写到隔离 Worktree，留在主工作区跑全量测试')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('v0.5.0 同工作区顶层任务真并发与开关切换 + 直聊任务冲突安全兜底', async () => {
+  clearGitRepoInfoCache()
+  const root = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v050-conc-'))
+  try {
+    const repoDir = join(root, 'repo')
+    const storageDir = join(root, 'storage')
+    mkdirSync(storageDir, { recursive: true })
+    initTempGitRepo(repoDir)
+
+    const now = Date.now()
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({
+      dispatchMode: 'workspace-lead',
+      worktreeIsolation: true,
+      workspaceLeads: {
+        'w-git': { sessionId: 'lead-git', title: '组长', cwd: repoDir, createdAt: new Date(now).toISOString() },
+      },
+    })
+    const t1 = addTask(state, { title: '独立任务一 · 改 a.js', cwd: repoDir }, now)
+    const t2 = addTask(state, { title: '独立任务二 · 改 b.js', cwd: repoDir }, now + 1)
+
+    const delivered = []
+    const lead = {
+      id: 'lead-git',
+      status: 'idle',
+      session: { id: 'lead-git', header: { cwd: repoDir, agentPreset: 'taskboard-dispatch' } },
+      followup: (msg) => delivered.push(msg),
+    }
+    const ctx = {
+      get: (name) => {
+        if (name === 'agents') return { get: (id) => (id === 'lead-git' ? lead : undefined), roots: () => [lead] }
+        if (name === 'workspaceRegistry') return { list: () => [{ id: 'w-git', path: repoDir, title: 'repo' }] }
+        return undefined
+      },
+    }
+    const rt = fakeRuntime(state, ctx, join(storageDir, 'board.json'))
+
+    // 1) 第 1 次 tick 派发 t-1；组长为 t-1 挂载隔离 Worktree 并启动后台 worker 后回到 idle
+    const first = await tick(rt, {})
+    assert.equal(first.dispatched, true)
+    assert.equal(first.task.id, t1.id)
+    const exec1 = {
+      callId: 'c-top-1',
+      name: 'subagent',
+      agent: lead,
+      arguments: { description: '做任务一', prompt: '任务 id：t-1\n修改 src/a.js' },
+    }
+    const prep1 = prepareLeadDispatch(rt, { agent: lead, exec: exec1, args: exec1.arguments }, Date.now())
+    assert.equal(prep1.taskId, t1.id)
+    const iso1 = attachDispatchWorktree(rt, lead, t1.id, exec1)
+    assert.equal(iso1.isolated, true)
+    handleSubagentDispatch(rt, { agent: lead, childId: 'w-top-1', workerName: 'wt1', args: exec1.arguments, exec: exec1 }, Date.now())
+    assert.equal(taskById(rt.state, t1.id).workerRunState, 'running')
+
+    // 2) 当 worktreeIsolation=true 时，尽管 t-1 的后台 worker 仍在 running，因其拥有独立 Worktree，t-2 允许立即并发派发！
+    assert.equal(hasActiveWorkspaceExecution(rt.state, 'lead-git', repoDir, Date.now()), false)
+    const second = await tick(rt, {})
+    assert.equal(second.dispatched, true, '开启 Worktree 隔离后，同工作区无依赖顶层任务支持真并发派发')
+    assert.equal(second.task.id, t2.id)
+
+    // 3) 若用户在设置中关闭 worktreeIsolation=false，立即退回串行保护（阻塞新任务派发）
+    const t3 = addTask(rt.state, { title: '任务三', cwd: repoDir }, Date.now())
+    rt.state.config = normalizeConfig({ ...rt.state.config, worktreeIsolation: false })
+    assert.equal(hasActiveWorkspaceExecution(rt.state, 'lead-git', repoDir, Date.now()), true)
+    const thirdBlocked = await tick(rt, {})
+    assert.equal(thirdBlocked.dispatched, false)
+    assert.equal(thirdBlocked.reason, 'lead-worker-busy')
+    assert.equal(taskById(rt.state, t3.id).status, 'todo')
+
+    // 4) 直聊顶层自动卡冲突保护：主仓与 Worktree 改同一行时，subagent/end 不覆盖主仓、不误标 done、保留现场
+    rt.state.config = normalizeConfig({ ...rt.state.config, worktreeIsolation: true })
+    const execAuto = {
+      callId: 'c-auto-conflict',
+      name: 'subagent',
+      agent: lead,
+      arguments: { description: '直聊改 b.js', prompt: '修改 src/b.js' },
+    }
+    const prepAuto = prepareLeadDispatch(rt, { agent: lead, exec: execAuto, args: execAuto.arguments }, Date.now())
+    assert.equal(prepAuto.created, true)
+    const autoCard = taskById(rt.state, prepAuto.taskId)
+    attachDispatchWorktree(rt, lead, autoCard.id, execAuto)
+    handleSubagentDispatch(
+      rt,
+      { agent: lead, childId: 'w-auto-conf', workerName: 'wconf', args: execAuto.arguments, exec: execAuto },
+      Date.now(),
+    )
+
+    writeFileSync(join(repoDir, 'src', 'b.js'), 'export const b = "MAIN_CONFLICT"\n')
+    writeFileSync(join(autoCard.worktreePath, 'src', 'b.js'), 'export const b = "WT_CONFLICT"\n')
+
+    const endConflict = await handleSubagentEnd(rt, {
+      id: 'w-auto-conf',
+      parentSessionId: 'lead-git',
+      stopReason: 'completed',
+      lastAssistantMessage: [{ type: 'text', text: '已在隔离分支改完' }],
+    })
+    assert.equal(endConflict.updated, false)
+    assert.equal(endConflict.reason, 'worktree-conflict')
+    assert.equal(autoCard.status, 'doing', '合入冲突时顶层自动卡保持 doing，不误标 done')
+    assert.match(autoCard.lastError, /冲突/)
+    assert.equal(readFileSync(join(repoDir, 'src', 'b.js'), 'utf8'), 'export const b = "MAIN_CONFLICT"\n', '主仓文件毫发无损')
+    assert.ok(autoCard.worktreePath && existsSync(autoCard.worktreePath), '冲突时保留隔离工作树供排查合入')
+
+    // 手动解冲突后 discardOnly:true 回收临时工作树与分支
+    const discarded = mergeAndCleanupTaskWorktree(rt, autoCard.id, { discardOnly: true })
+    assert.equal(discarded.cleaned, true)
+    assert.equal(autoCard.worktreePath, null)
+    cleanupTaskWorktree(taskById(rt.state, t1.id), repoDir)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })

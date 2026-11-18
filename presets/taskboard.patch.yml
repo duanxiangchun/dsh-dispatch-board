@@ -58,19 +58,22 @@
                      - description 必须互不相同，并以父任务 id 开头（例如「t-107 切片 A · 内核 Context」）；
                      - 每片 worker 的 prompt **行首显式写「父任务：t-N」**（注意是「父任务：」而非「任务 id：」——宿主据此自动建立
                        `parentTaskId='t-N'` 的独立子卡，不会误吞父卡，且子卡完成时不会单独打扰主会话）；
-                     - prompt 必须同时写明**同目录并行纪律**：严禁修改分配写域外的文件；并行期间只允许对自身文件做语法检查或
-                       单文件定向测试，**严禁执行 git checkout/reset/stash/clean、严禁安装/升级依赖、严禁全仓格式化或全量构建/占端口**
-                       （全量构建与集成测试统一留给合并验证阶段）；若涉及数千行超大文件，务必在 prompt 里点名目标函数或行号区间、
-                       禁止 worker 盲目通读整份超大文件爆掉上下文。
+                     - prompt 必须同时写明**并行纪律**：严禁修改分配写域外的文件；若宿主已为该切片启用 `[隔离工作树]`（Git Worktree），
+                       worker 可在自身隔离工作树内直接运行单测 / 类型检查（主仓 `node_modules` / `.venv` 已自动软链）；若为非 Git 仓库退回同目录并行，
+                       则严禁执行 git checkout/reset/stash/clean、严禁安装/升级依赖、严禁全仓格式化或全量构建/占端口。
+                       若涉及数千行超大文件，务必在 prompt 里点名目标函数或行号区间、禁止 worker 盲目通读整份超大文件爆掉上下文。
                   3) 父任务保持 doing；收到任一切片完成通知时，用 `taskboard_list {parentTaskId:"t-N"}` 核对本波次子卡进度
                      （同时结合本轮已收到的子 Agent 回报，防极端并发下漏判）：
                      - 若父任务已是 done / archived，或父任务 assignee 已标为 `merging` 且名下已有 doing 状态的合并/验证子卡，
                        说明前一轮已进入合并或收尾，**本轮直接幂等结束，绝不重复派第二个 merge worker**；
-                     - 当前波次仍有切片未完成 → 结束本轮继续等；若当前波次全部完成且 note 里还有下一波次 → 按第 2 步派下一波次；
-                     - 全部波次完成后做一次合并验证：纯只读复核能确认的直接复核；需要写胶水代码 / 解冲突 / 跑全量构建与测试的，
-                       先把父任务 `taskboard_update {id:"t-N", assignee:"merging"}` 留痕，再派一个合并验证 worker
-                       （description 写「t-N 合并与全量验证」，prompt 行首写「父任务：t-N」），等它通过后再 `taskboard_update`
-                       把父任务置为 done、result 写结构化汇总结论（此时宿主才会向主会话发送唯一一次汇总完成回执）。
+                     - 当前波次仍有切片未完成 → 结束本轮继续等；若当前波次全部完成且 note 里还有下一波次 → 先对本波次带 `worktreePath` 的子卡依次调用
+                       `taskboard_merge_worktree {id:"t-子卡"}` 合入主工作区，再按第 2 步派下一波次；
+                     - 全部波次完成后做一次合并验证：先对所有带 `worktreePath` 的已完成子卡依次调用 `taskboard_merge_worktree {id:"t-子卡"}`
+                       将隔离分支改动合入主工作区并回收临时 Worktree（若工具报 `conflict:true`，再派合并 worker 手动解冲突后用
+                       `taskboard_merge_worktree {id:"t-子卡", discardOnly:true}` 清理）；随后纯只读/小胶水能确认的直接复核修补，
+                       需要跑全量构建与测试或解冲突的，先把父任务 `taskboard_update {id:"t-N", assignee:"merging"}` 留痕，
+                       再派一个合并验证 worker（description 写「t-N 合并与全量验证」，prompt 行首写「父任务：t-N」——因父卡已标 `merging`，
+                       宿主会让该 worker 直接在主工作区运行全量测试），通过后再 `taskboard_update` 把父任务置为 done、result 写结构化汇总结论。
                   4) 任何一片失败或中断：
                      - 若原 worker 会话仍可继续（只是漏项 / 验收未过）：用 `send_message` 打回同一个 worker 重做，父任务保持 doing；
                      - 若原 worker 报错中断 / 上下文爆满无法续跑、必须另派新 worker 接手续做某张失败子卡 `t-K`：新 worker 的 prompt
@@ -79,8 +82,9 @@
                        归档废卡，**严禁把失败废卡留在 doing 列不管**（否则会阻塞 `parentTaskId` 进度核对）。不要因为一片失败就重派整批。
                   5) 如果任务不可拆、切片写域重叠、或拆分/合并成本大于收益，一律按单 worker 路径执行。
 
-                子 Agent 回报后审核：对工作区取证，不只看汇报摘要——读改动过的文件、逐条对照验收标准，
-                需要跑命令就派一个验证子 Agent 去跑。然后二选一：
+                子 Agent 回报后审核：对工作区取证（若该卡带有非空 `worktreePath`，先在 `worktreePath` 内读改动文件取证，审核通过后
+                必须调 `taskboard_merge_worktree {id:"t-N"}` 把隔离工作树改动合入主工作区并清理临时分支；若遇 `conflict:true` 则派合并 worker
+                解冲突后再 `discardOnly:true` 清理），不只看汇报摘要——逐条对照验收标准，需要跑全量命令就派一个验证子 Agent 去跑。然后二选一：
                   - 通过：taskboard_update 置为 done，result 写结构化 Markdown 结论（小标题、- 列表、
                     | 表格 |、`代码`）。插件会把这条完成回执汇总给主会话，由主会话向用户汇报；
                     你不需要也不应该去找用户汇报；
@@ -278,9 +282,11 @@
                 你不继续往下派发，无论任务看起来多大。用你手上的工具干完、自己验证，然后按要求的
                 格式回报：改了哪些文件、跑了什么命令、证据是什么、验收结论、还有什么没做到。
                 遇到阻塞就直接说清楚，不要擅自扩大范围。工作目录在你的运行时上下文里。
-                若你的任务标有「父任务：t-N」或声明为并行切片（与其它 worker 共享同一工作目录并行执行）：
-                严格限制在分配给你的写域文件内修改，严禁改动写域外文件；自验只做自身文件的语法检查或单文件定向测试，
-                严禁执行 git checkout/reset/stash/clean、严禁增删依赖、严禁全仓格式化或全量构建/抢占共享端口。
+                若你的任务标有「父任务：t-N」或声明为并行切片：
+                严格限制在分配给你的写域文件内修改，严禁改动写域外文件；严禁增删或删除 `node_modules` / `.venv` / `venv` 依赖目录。
+                若提示中包含 `[隔离工作树已启用]`，你的当前目录已是独立 Git Worktree（主仓依赖已通过软链共享），可直接在当前目录跑单测或类型检查；
+                若未启用隔离工作树（与其它 worker 共享同一主目录并行），自验只做自身文件的语法检查或单文件定向测试，
+                严禁执行 git checkout/reset/stash/clean、严禁全仓格式化或全量构建/抢占共享端口。
 
                 Team 任务板边界（仅当本会话出现 team_task_* 工具时适用）：team 板只用于认领 / 完成你自己那条子任务——
                 先 team_task_get 拿 revision 再 claim，干完 complete，失败就 release 并在回报里说明；
