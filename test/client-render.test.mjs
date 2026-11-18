@@ -882,7 +882,7 @@ test('BoardTabTitle：优先用宿主 tab 标题，缺省/抛错时退回「任�
  * 用例：BoardTab —— 本工作区看板（右栏）
  * ══════════════════════════════════════════════════════════════ */
 
-test('BoardTab（窄栏）：只显示本工作区任务，.tb-lanes + 副标题带工作区名', async () => {
+test('BoardTab（窄栏）：只显示本工作区任务，.tb-lanes + 新建提示带工作区名', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
   const BoardTab = harness.componentOf('sidebar.right.pane.tab')
   const { tree, instance } = await renderNarrow(BoardTab, { sessionId: SESSION_A })
@@ -892,8 +892,9 @@ test('BoardTab（窄栏）：只显示本工作区任务，.tb-lanes + 副标题
   assert.equal(nodesWithClass(tree, 'tb-lanes').length, 1, 'narrow uses .tb-lanes')
   assert.equal(nodesWithClass(tree, 'tb-board').length, 0, 'narrow must not render the four-column board')
 
-  // 副标题带工作区名（workspaces 里按 path 匹配 title）
-  assert.ok(includesText(tree, '工作区 A'), 'subtitle must name the current workspace')
+  // v0.3.8：顶部不再渲染轮询状态副标题，新建提示仍带工作区名
+  assert.ok(!includesText(tree, '上次检查'), 'header polling status subtitle is removed')
+  assert.ok(includesText(tree, '（工作区：a）'), 'composer hint must name the current workspace')
   assert.equal(nodesWithClass(tree, 'tb-notice').length, 0, 'known workspace must not show the unknown notice')
 
   const columns = nodesWithClass(tree, 'tb-col')
@@ -967,15 +968,13 @@ test('BoardTab（窄栏）：只显示本工作区任务，.tb-lanes + 副标题
   assert.equal(instance.cleanups.length, 2)
 })
 
-test('BoardTab（窄栏）：轮询状态与派发 skip 原因照常渲染', async () => {
+test('BoardTab（窄栏）：顶部不再渲染轮询状态副标题，新建提示照常显示当前工作区', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
   const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
 
-  assert.ok(includesText(tree, '每 15s 轮询'))
-  assert.ok(includesText(tree, '目标会话正在运行，稍后自动重试'))
-  assert.ok(includesText(tree, '上次派发'))
-  assert.ok(includesText(tree, '主会话'), 'last dispatch prefers the session title')
-  assert.ok(includesText(tree, '工作区 A'))
+  assert.ok(!includesText(tree, '每 15s 轮询'))
+  assert.ok(!includesText(tree, '上次检查'))
+  assert.ok(includesText(tree, '（工作区：a）'))
 })
 
 test('卡片精简（t-33）：只渲染标题 + 操作按钮，等高样式类/CSS 齐备，行内编辑不改高度', async () => {
@@ -1311,7 +1310,7 @@ test('PlatformBoard：默认显示全部工作区任务，可按工作区过滤�
   assert.ok(includesText(filteredA, '打通宿主 RPC'))
   assert.ok(!includesText(filteredA, '实现轮询自动派发'))
   assert.ok(includesText(filteredA, '共 2 条'), 'toolbar count follows the filter')
-  assert.ok(includesText(filteredA, '共 5 条'), 'header still shows the total')
+  assert.ok(!includesText(filteredA, '上次检查'), 'header polling status subtitle is removed')
 
   // 过滤只影响显示（不多拉 snapshot），但选择会立即持久化（v0.2.3）
   assert.equal(countCalls(harness, 'snapshot'), 1)
@@ -1796,7 +1795,7 @@ test('BoardTab：snapshot 为空对象时降级渲染（四列空态，不抛异
   ]) {
     assert.ok(includesText(tree, empty), 'missing empty state: ' + empty)
   }
-  assert.ok(includesText(tree, '每 15s 轮询'))
+  assert.ok(!includesText(tree, '上次检查'))
 })
 
 /* ══════════════════════════════════════════════════════════════
@@ -3264,9 +3263,23 @@ test('组长条：workspace-lead 三个新 skip reason 有中文映射', async (
     ['lead-no-workspace', '无法解析任务的工作区：请从目标工作区的会话里重新加这条任务'],
   ]
   for (const [reason, text] of cases) {
-    const harness = createHarness({ snapshot: makeSnapshot({ poll: Object.assign(pollWithDispatch(), { lastSkipReason: reason }) }) })
-    const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
-    assert.ok(includesText(tree, text), 'missing skip text for ' + reason)
+    const snap = makeSnapshot({ poll: Object.assign(pollWithDispatch(), { lastSkipReason: reason }) })
+    const harness = createHarness({
+      snapshot: snap,
+      rpc(_channel, endpoint) {
+        if (endpoint === 'dispatch-now') {
+          return Promise.resolve({ ok: true, value: { dispatched: false, reason } })
+        }
+        return Promise.resolve({ ok: true, value: snap })
+      },
+    })
+    const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+    const dispatchBtn = buttons(tree).find((node) => textOf(node).trim() === '立即派发')
+    assert.ok(dispatchBtn)
+    dispatchBtn.props.onClick()
+    await settle()
+    const after = await instance.run()
+    assert.ok(includesText(after, text), 'missing skip text for ' + reason)
   }
 })
 
