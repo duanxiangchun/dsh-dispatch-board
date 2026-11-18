@@ -6750,3 +6750,52 @@ test('v0.3.5 requeueTasksOfLead：组长归档失效时直接归档内部自动�
   assert.equal(parent.status, 'todo', '父任务回到待开始交给新组长')
   assert.equal(sub.status, 'archived', '旧组长派出的半截自动子卡直接归档，防止被轮询器当成独立 todo 再派一遍')
 })
+
+/* ------------------------------------------------------------------ *
+ * v0.3.6：归档任务自动删除分钟数可配置（config.archiveRetentionMinutes）
+ * ------------------------------------------------------------------ */
+
+test('v0.3.6 archiveRetentionMinutes：normalizeConfig 校验、0=不自动删除、set-config 更新后立即清理到期归档', async () => {
+  assert.equal(normalizeConfig({}).archiveRetentionMinutes, 30, '默认 30 分钟')
+  assert.equal(normalizeConfig({ archiveRetentionMinutes: 0 }).archiveRetentionMinutes, 0, '0 = 不自动删除')
+  assert.equal(normalizeConfig({ archiveRetentionMinutes: 5 }).archiveRetentionMinutes, 5)
+  assert.equal(normalizeConfig({ archiveRetentionMinutes: 1440 }).archiveRetentionMinutes, 1440)
+  assert.equal(normalizeConfig({ archiveRetentionMinutes: -1 }).archiveRetentionMinutes, 30, '负数回退默认 30')
+  assert.equal(normalizeConfig({ archiveRetentionMinutes: 20000 }).archiveRetentionMinutes, 30, '超过 10080 回退默认 30')
+  assert.equal(normalizeConfig({ archiveRetentionMinutes: 'abc' }).archiveRetentionMinutes, 30)
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v036-retention-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const state = createEmptyBoard()
+    const now = Date.now()
+    const t1 = addTask(state, { title: '归档 10 分钟的任务' }, now - 10 * 60 * 1000)
+    t1.status = 'archived'
+    t1.archivedAt = new Date(now - 10 * 60 * 1000).toISOString()
+
+    // 1) archiveRetentionMinutes = 0（不自动删除）时，即使归档了很久也不删
+    state.config = normalizeConfig({ archiveRetentionMinutes: 0 })
+    assert.equal(pruneArchivedTasks(state, now + 999 * 60 * 1000).removed, 0, '0 分钟配置下永不自动删除归档任务')
+    assert.equal(state.tasks.length, 1)
+
+    // 2) 通过 set-config 把保留时间设为 5 分钟：t1（已归档 10 分钟）在 set-config 时立即被清理并落盘
+    const rt = fakeRuntime(state, { get: () => undefined }, filePath)
+    const envelope = JSON.stringify({
+      type: 'client-request',
+      rpcId: 'cfg-1',
+      method: 'set-config',
+      payload: { archiveRetentionMinutes: 5 },
+    })
+    const req = fakeHttpRequestWithBody({ url: '/taskboard/set-config' }, envelope)
+    const res = fakeHttpResponse()
+    const pending = handleHttp(rt, req, res)
+    req.send()
+    await pending
+    const body = JSON.parse(res.body)
+    assert.equal(body.result.ok, true)
+    assert.equal(body.result.value.config.archiveRetentionMinutes, 5)
+    assert.equal(rt.state.tasks.length, 0, '调短保留分钟数后立即清理已过期的归档任务')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

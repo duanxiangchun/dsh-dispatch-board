@@ -73,19 +73,20 @@ README.md               Lead：安装 / 使用 / 排障
 它**不改变** `status`（仍为 `todo` / `doing`），但会让轮询跳过该任务，并在看板的「待你处理」区显示；
 用户回答后宿主把回答 followup 给组长会话并清掉标记，任务继续。
 
-**归档生命周期（30 分钟保留期）**：`archived` 任务在归档满 **30 分钟**后由宿主自动从看板删除
-（从 `board.json` 的 `tasks[]` 移除），用户不必手动点「删除」。判定是纯函数
-`pruneArchivedTasks(state, now, ARCHIVE_RETENTION_MS)`（`ARCHIVE_RETENTION_MS = 30 * 60 * 1000`，导出便于单测）：
+**归档生命周期（可配置保留期，默认 30 分钟；v0.3.6 起可在看板「设置」中配置）**：`archived` 任务在归档满保留期
+（`config.archiveRetentionMinutes`，默认 **30 分钟**，取值范围 `0..10080` 分钟；设为 `0` 表示**不自动删除**）
+后由宿主自动从看板删除（从 `board.json` 的 `tasks[]` 移除），用户不必手动点「删除」。判定是纯函数
+`pruneArchivedTasks(state, now, retentionMs)`（`ARCHIVE_RETENTION_MS = 30 * 60 * 1000`，省略第 3 参时优先读 `state.config.archiveRetentionMinutes`）：
 
-1. 只处理 `status === 'archived'` 的任务；`todo` / `doing` / `done` 一律不动。
+1. 只处理 `status === 'archived'` 的任务；`todo` / `doing` / `done` 一律不动；当保留期设为 `0` 分钟时直接跳过（不自动删除）。
 2. 归档时间优先 `archivedAt`，缺失 / 不可解析时回退 `updatedAt` → `createdAt`；三个字段都解析不出来
    则**保守保留**（宁可留一条，也不误删时间坏掉的任务）。
-3. `now - 归档时间 >= 30 分钟` 即删除（满 30 分钟，边界即删）。
+3. `now - 归档时间 >= 保留期` 即删除（边界即删）。
 4. 删除后 `revision` +1（走 `commitBoard` 落盘）；`nextId` **不回退**——已删除任务的 id 不复用，
    避免旧引用指到新任务上。
 5. 清理时机：每次 tick 在 `pollEnabled` 判断**之前**（暂停轮询时照常清理，§1.4），
-   以及插件 `apply()` 启动时清理一次（宿主停机期间到期的归档不必等第一个 tick）。
-   没有任务过期时不写盘、不改 `revision`。
+   插件 `apply()` 启动时清理一次（宿主停机期间到期的归档不必等第一个 tick），以及 `set-config`
+   更新配置时立即清理一次。没有任务过期时不写盘、不改 `revision`。
 6. 删除是**物理删除**：之后按该 id 调 `update-task` / 模型工具会得到 `not-found`（任务已不在看板上）。
 
 ### 1.3 派单闭环（本插件存在的理由）
@@ -649,6 +650,7 @@ Client 不拿它做增量渲染，只作快照字段透传；`reloadBoardIfStale
     对象键顺序**末尾的旧条目**（新写入的映射必须保留）。不能反过来把新映射截掉，否则下一次
     `normalizeConfig` 会丢掉它、tick 每轮重复创建组长。
 - 旧字段（`pollEnabled` / `pollIntervalMs` / `maxNotifications`）行为不变。
+- `archiveRetentionMinutes`（v0.3.6）：归档任务自动删除保留分钟数，整数 `0..10080`（默认 `30`；`0` = 不自动删除；非法 / 超界值回退 `30`）。
 - `workspaceFilter`（v0.2.3）：平台看板「工作区」过滤选择的持久化值，`''` = 全部工作区（默认）。
   只接受 trim 后非空、长度 ≤ **1024** 的字符串；非字符串 / 全空白 / 超长一律归一化为 `''`，**不抛错**
   （UI 偏好坏值只回退默认，不该让看板白屏）。写入走 `set-workspace-filter`（§3.1）；是否仍指向现存
@@ -2387,3 +2389,9 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
     统一直聊 fan-out 先建总父卡再派切片的落账闭环。
   ⑤ **看板 UI 父子联动**：子卡带虚线左缘次级卡片样式，详情浮层头部支持一键跳回父任务，父任务详情展示子任务完成进度与跳转列表。
   `package.json` 0.3.4 → 0.3.5。
+
+- v0.3.6（新增看板「设置」按钮与面板 + 归档自动删除分钟数可配置化）：
+  ① **Host 配置与清理逻辑**：`config` 新增 `archiveRetentionMinutes`（默认 `30` 分钟，范围 `0..10080` 分钟，`0` = 不自动删除）；
+    `pruneArchivedTasks(state, now, retentionMs)` 默认读取 `state.config.archiveRetentionMinutes`，`set-config` 更新该值时立即执行一次过期归档清理并落盘。
+  ② **Client 设置按钮与面板**：右栏看板（`BoardTab`）与左栏平台看板（`PlatformBoard`）顶部操作栏新增「设置」按钮，点击展开设置面板，支持一键选择常用保留期（不自动删除 / 5 / 15 / 30 / 60 / 120 / 360 / 1440 分钟）或输入自定义分钟数保存。
+  `package.json` 0.3.5 → 0.3.6。

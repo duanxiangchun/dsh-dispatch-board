@@ -4189,3 +4189,45 @@ test('v0.3.5 父子卡联动：子卡带 data-subtask=true，父卡详情展示�
   box = detailBox(next)
   assert.ok(textOf(box).includes('拆分子任务（1/2 已完成）'), '点击父任务徽标应跳回父卡详情')
 })
+
+test('v0.3.6 设置按钮与面板：点击「设置」展开归档保留分钟数配置，支持快捷预设与自定义分钟保存', async () => {
+  const snapshot = makeSnapshot()
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  // 默认收起设置面板
+  assert.equal(nodesWithClass(tree, 'tb-settings').length, 0, '初始渲染不展开设置面板')
+  const settingsBtn = buttons(tree).find((node) => textOf(node).trim() === '设置')
+  assert.ok(settingsBtn, '顶部栏必须渲染「设置」按钮')
+
+  // 点击「设置」展开面板
+  settingsBtn.props.onClick()
+  let next = await instance.run()
+  const panel = nodesWithClass(next, 'tb-settings')[0]
+  assert.ok(panel, '点击设置按钮后应展开 .tb-settings 面板')
+  assert.ok(textOf(panel).includes('归档任务自动删除时间'))
+  assert.ok(textOf(panel).includes('当前：30 分钟后自动删除'))
+
+  // 1) 点击快捷预设「60 分钟」直接发送 set-config { archiveRetentionMinutes: 60 }
+  const preset60 = buttons(panel).find((node) => textOf(node).trim() === '60 分钟')
+  assert.ok(preset60, '设置面板应提供 60 分钟快捷预设按钮')
+  preset60.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  const setConfigCalls = harness.rpcCalls.filter((call) => call.endpoint === 'set-config')
+  assert.equal(setConfigCalls.length, 1)
+  assert.deepEqual(Object.assign({}, setConfigCalls[0].payload), { archiveRetentionMinutes: 60 })
+
+  // 2) 自定义输入分钟数（例如 45）并点「保存设置」
+  next = await instance.run()
+  const customInput = nodesWithClass(next, 'tb-settings-input')[0]
+  assert.ok(customInput, '设置面板应提供自定义分钟数输入框')
+  customInput.props.onChange({ target: { value: '45' } })
+  next = await instance.run()
+  const saveBtn = buttons(nodesWithClass(next, 'tb-settings')[0]).find((node) => textOf(node).trim() === '保存设置')
+  assert.ok(saveBtn)
+  saveBtn.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  const allConfigCalls = harness.rpcCalls.filter((call) => call.endpoint === 'set-config')
+  assert.equal(allConfigCalls.length, 2)
+  assert.deepEqual(Object.assign({}, allConfigCalls[1].payload), { archiveRetentionMinutes: 45 })
+})
