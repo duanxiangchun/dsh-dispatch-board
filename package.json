@@ -1,6 +1,6 @@
 {
   "name": "dsh-dispatch-board",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "DeepSeek Harness 插件：派单看板 + 工作区组长模式。组长派 worker 执行，看板四列跟踪进度与结论。A dispatch board and workspace-lead mode for DeepSeek Harness.",
   "type": "module",
   "main": "lib/index.js",

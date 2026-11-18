@@ -2435,3 +2435,11 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
     - 新增第 4 个模型工具 `taskboard_merge_worktree {id, cleanup?, discardOnly?}`：先安全卸载 Junction 软链（绝不触碰主仓依赖文件），将 Worktree 内未提交改动快照提交至临时分支后，以 `git diff --binary --full-index -U1 <base>..<wtHead>` + `git apply --check` 原子预检并 `git apply` 无损合入主工作区（兼容主工作区含未暂存改动或前序切片改动，不污染主分支 commit 历史、不留冲突标记），成功后自动移除 Worktree 目录与临时分支；若遇真实代码冲突则主工作区毫发无损并返回 `conflict:true` 及冲突文件列表供合并 worker 处理。
     - 直聊顶层自动卡在 `subagent/end (completed)` 时自动尝试三路合入并回收 Worktree；任务归档、回退 `todo`、删除或过期清理时自动兜底回收残留 Worktree 与临时分支。
   `package.json` 0.4.0 → 0.5.0。
+
+- v0.5.1（优化组长与 Worker 沟通汇报风格：去八股表格与内部黑话，强制极简“说人话”）：
+  ① **组长对话与看板 `result` 去八股化（`presets/taskboard.patch.yml` + `lib/index.js` `buildDispatchText` / `buildReceiptText`）**：
+    - 移除旧提示词中诱发模型画大表格与自证邀功的表述（如“一段大白话在详情里很难读”“强制小标题 + `| 表格 |`”“用户不看你对话”）；
+    - 新增「沟通与汇报铁律」：**中间派单与切片过渡轮次对话限 1～2 句自然人话**（只说哪块已完成、下一步干什么，禁画表格、禁列行数）；读文件核验静默完成，**严禁输出「我已做的取证」等自证流水账及 `W1/W2/assignee=merging/worktreePath` 等内部调度黑话**；
+    - 看板 `result` 统一改为 **「第 1 行一句话人话结论 + 3～5 条精炼要点」**（非必要不画表格，确保主会话回执前 200 字截取直接是清晰人话）。
+  ② **Worker 回报限流减重**：`taskboard-worker` 回报限制在 5～10 行内（首行结果与测试通过数 + 改动文件与退出码），禁止贴整屏 PASS 日志与长篇推导，大幅降低多轮上下文 Token 消耗。
+  `package.json` 0.5.0 → 0.5.1。

@@ -7471,3 +7471,17 @@ test('v0.5.0 同工作区顶层任务真并发与开关切换 + 直聊任务冲�
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('v0.5.1 组长与 Worker 汇报风格约束：去除强制表格与八股文案，强制结论先行说人话且禁贴日志流水', () => {
+  const patchText = readFileSync(new URL('../presets/taskboard.patch.yml', import.meta.url), 'utf8')
+  assert.match(patchText, /沟通与汇报铁律/)
+  assert.match(patchText, /第 1 行必须是一句话人话结论/)
+  assert.match(patchText, /极简精炼回报（控制在 5～10 行以内）/)
+  assert.doesNotMatch(patchText, /不只看汇报摘要/)
+
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '测试派单文案', cwd: 'C:\\work\\a' }, NOW)
+  const dispatchMsg = buildDispatchText(task, NOW)
+  assert.match(dispatchMsg, /必须简短说人话/)
+  assert.doesNotMatch(dispatchMsg, /一段大白话在详情里很难读/)
+})
