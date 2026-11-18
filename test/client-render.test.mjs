@@ -4098,3 +4098,36 @@ test('待你处理：header 角标与右栏看板同一过滤（本会话创建�
   const todoBadge = nodesWithClass(header, 'tb-badge').filter((node) => !hasClass(node, 'tb-badge-needs'))
   assert.equal(todoBadge.length, 0, '别的工作区的 todo 不计入本会话 header 角标')
 })
+
+test('全部派发：待开始列有多条任务时依次派发全部 todo 任务；右栏仅含 needsUser 任务时组长条仍显示该工作区', async () => {
+  // 1) 平台看板：待开始列有 t-1 和 t-2 两条任务，点击「全部派发」依次调用两次 dispatch-now
+  const dispatchedIds = []
+  const snapshot = makeSnapshot()
+  const harness = createHarness({
+    snapshot,
+    rpc: (_channel, endpoint, payload) => {
+      if (endpoint === 'dispatch-now') {
+        dispatchedIds.push(payload.id)
+        return Promise.resolve({ ok: true, value: { dispatched: true, sessionId: SESSION_A } })
+      }
+      return Promise.resolve({ ok: true, value: snapshot })
+    },
+  })
+  const PlatformBoard = harness.componentOf('main')
+  const { tree } = await renderComponent(PlatformBoard, {})
+  const dispatchAllBtn = buttons(tree).find((node) => textOf(node).trim() === '全部派发')
+  assert.ok(dispatchAllBtn, '待开始列非空时必须渲染「全部派发」按钮')
+  dispatchAllBtn.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(dispatchedIds, ['t-1', 't-2'], '点击「全部派发」应依次派发列中所有 todo 任务')
+
+  // 2) 右栏看板：工作区 A 只有一条 needsUser=true 的任务时，组长条仍能识别工作区 A 并提供「创建组长」
+  const onlyNeedsSnapshot = makeSnapshot({
+    tasks: [needsTask({ id: 't-only-needs', cwd: WS_A })],
+    leads: { main: null, workspaces: [] },
+  })
+  const rightHarness = createHarness({ snapshot: onlyNeedsSnapshot, sessionCwd: WS_A })
+  const rightRendered = await renderNarrow(rightHarness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  assert.ok(buttonTexts(rightRendered.tree).includes('创建组长'), '仅含待你处理任务的工作区仍应显示组长条操作')
+})

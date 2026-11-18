@@ -6410,3 +6410,182 @@ test('handleHttp：set-workspace-draft 端点写盘，重启后读回 + snapshot
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+/* ------------------------------------------------------------------ *
+ * 审计回归测试：派发闸门 / fan-out 结算 / 模型工具同步与 lastError
+ * ------------------------------------------------------------------ */
+
+test('canReuseMentionedTask：worker 仍在 running（assignee 为名字、尚未回填或已回填 workerSessionId）时不可被验证子 Agent 复用', () => {
+  const state = createEmptyBoard()
+  const task = deliveredPolledTask(state, NOW, { title: '实现主功能' })
+  // v0.3.1+：tools/result 只拿到 workerName，写成 assignee + workerRunState='running'
+  task.assignee = 'worker-impl'
+  task.workerRunState = 'running'
+  assert.equal(canReuseMentionedTask(task), false, 'worker 仍在跑时不得被验证子 Agent 抢占复用')
+
+  // worker 异常结束（failed）后组长重派新 worker → 允许复用原卡
+  task.workerRunState = 'failed'
+  task.workerSessionId = 'e2e5e228-10bc-4685-91a6-082f1ef29c8b'
+  assert.equal(canReuseMentionedTask(task), true, 'worker 已 failed 时重派允许复用原卡')
+})
+
+test('fan-out 切片：description 带 t-N、prompt 不带 t-N 且含短父任务标题时，不会通过 lead-intent 误占父卡', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-fanout-short-title-'))
+  try {
+    const state = createEmptyBoard()
+    // 父任务标题恰好 >= 4 字（但 < 6 字，走 lead-intent + dispatchMentionsTask 分支）
+    const parent = deliveredPolledTask(state, NOW, { title: '看板过滤' })
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+
+    // 组长先把父卡置 doing（记录了 leadDispatchIntents）
+    noteLeadDispatchIntent(rt, lead, parent.id, NOW + 100)
+
+    // 紧接着组长按 v0.3.3 并发 fan-out 派两个切片：t-1 只写在 description，prompt 碰巧提到「看板过滤」
+    const slice1Args = {
+      description: 't-1 切片 1：Host 端看板过滤',
+      prompt: '请只修改 lib/index.js 里的看板过滤逻辑，与切片 2 互不重叠',
+    }
+    const exec1 = { callId: 'call-slice-1', name: 'subagent', agent: lead, arguments: slice1Args }
+    const out1 = prepareLeadDispatch(rt, { agent: lead, exec: exec1, args: slice1Args }, NOW + 200)
+
+    assert.equal(out1.ok, true)
+    assert.equal(out1.created, true, '切片 1 必须新建独立自动卡，不能把父卡 t-1 吞掉')
+    assert.equal(out1.taskId, 't-2')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('handleSubagentEnd & backfillWorkerSessionId：并发 fan-out 未回填时按 workerName 精确结算，复用名字取最新未绑定 child', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-fanout-end-'))
+  try {
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({ mainSessionId: null })
+    const descendants = [
+      { id: 'child-old', parentId: 'lead-1', kind: 'child', name: 'slice-a' },
+      { id: 'child-new-a', parentId: 'lead-1', kind: 'child', name: 'slice-a' },
+      { id: 'child-new-b', parentId: 'lead-1', kind: 'child', name: 'slice-b' },
+    ]
+    const base = leadFixture()
+    const lead = base.lead
+    const listeners = {}
+    const ctx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) =>
+        name === 'subagents'
+          ? { listDescendants: async () => descendants }
+          : base.ctx.get(name),
+    }
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    rt.leadAuto = createLeadAutoState()
+    registerLeadAutoHooks(ctx, rt)
+
+    // 历史已完成卡片占用了 child-old
+    const oldTask = addTask(state, { title: '旧切片', sessionId: 'lead-1', cwd: 'C:\\work' }, NOW - 5000)
+    oldTask.status = 'done'
+    oldTask.workerSessionId = 'child-old'
+
+    // 两条并发 fan-out 自动卡，尚未完成 workerSessionId 异步回填（workerSessionId === null）
+    const cardA = addTask(
+      state,
+      {
+        title: 't-1 切片 A',
+        sessionId: 'lead-1',
+        cwd: 'C:\\work',
+        autoDispatch: LEAD_AUTO_MARK,
+      },
+      NOW,
+    )
+    Object.assign(cardA, {
+      status: 'doing',
+      assignee: 'slice-a',
+      dispatchedSessionId: 'lead-1',
+      autoDispatch: LEAD_AUTO_MARK,
+      workerRunState: 'running',
+    })
+    const cardB = addTask(
+      state,
+      {
+        title: 't-1 切片 B',
+        sessionId: 'lead-1',
+        cwd: 'C:\\work',
+      },
+      NOW + 10,
+    )
+    Object.assign(cardB, {
+      status: 'doing',
+      assignee: 'slice-b',
+      dispatchedSessionId: 'lead-1',
+      autoDispatch: LEAD_AUTO_MARK,
+      workerRunState: 'running',
+    })
+    commitBoard(state, rt.filePath)
+
+    // 1) child-new-b 先结束（此时两条卡的 workerSessionId 都还是 null，candidates.length === 2）：
+    //    handleSubagentEnd 通过 listDescendants 反查 child-new-b -> slice-b，精确结算 cardB
+    const endB = await handleSubagentEnd(
+      rt,
+      {
+        id: 'child-new-b',
+        parentSessionId: 'lead-1',
+        stopReason: 'completed',
+        lastAssistantMessage: [{ type: 'text', text: '切片 B 完成' }],
+      },
+      NOW + 100,
+    )
+    assert.equal(endB.updated, true, '并发 fan-out 下未回填 workerSessionId 的切片 B 也必须被精确结算')
+    assert.equal(endB.taskId, cardB.id)
+    assert.equal(taskById(rt.state, cardB.id).status, 'done')
+    assert.equal(taskById(rt.state, cardA.id).status, 'doing', '切片 A 仍在跑，不受影响')
+
+    // 2) slice-a 走闸门 + tools/result 触发异步回填：同名有 child-old（已被 oldTask 绑定）与 child-new-a（未绑定），应选 child-new-a
+    const execA = { callId: 'call-a', name: 'subagent', agent: lead, arguments: { description: 't-1 切片 A2', prompt: '切片 A2' } }
+    const prepA = prepareLeadDispatch(rt, { agent: lead, exec: execA, args: execA.arguments }, NOW + 200)
+    listeners['tools/result'](execA, { isError: false, value: { kind: 'activation', name: 'slice-a' } })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(taskById(rt.state, prepA.taskId).workerSessionId, 'child-new-a', '同名 worker 回填应跳过已绑定的旧 childId')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('taskboard_update 支持写入与清空 lastError，且模型工具执行前自动 reloadBoardIfStale', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-tool-lasterror-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const state = createEmptyBoard()
+    addTask(state, { title: '待处理任务', cwd: 'C:\\work' }, NOW)
+    commitBoard(state, filePath)
+    const { ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, filePath)
+    const registered = []
+    registerTools({ tools: { register: (definition) => registered.push(definition) } }, rt)
+    const listTool = registered.find((tool) => tool.name === 'taskboard_list')
+    const updateTool = registered.find((tool) => tool.name === 'taskboard_update')
+
+    assert.ok(updateTool.parameters.properties.lastError, 'taskboard_update schema 必须开放 lastError')
+
+    // 写入故障原因（落到任务与磁盘上，且不破坏封闭 output.schema）
+    await updateTool.execute({ id: 't-1', lastError: '派发失败：缺少工作目录' })
+    assert.equal(taskById(rt.state, 't-1').lastError, '派发失败：缺少工作目录')
+
+    // 传空串清空故障原因
+    await updateTool.execute({ id: 't-1', lastError: '' })
+    assert.equal(taskById(rt.state, 't-1').lastError, '')
+
+    // 外部改盘（revision 变大并新增 t-2）后，taskboard_list 先 reloadBoardIfStale 读到最新任务
+    const disk = JSON.parse(readFileSync(filePath, 'utf8'))
+    disk.revision += 3
+    disk.tasks.push({ id: 't-2', title: '外部进程新增的任务', status: 'todo' })
+    writeFileSync(filePath, JSON.stringify(disk, null, 2), 'utf8')
+
+    const listed = await listTool.execute({})
+    assert.equal(listed.count, 2, 'taskboard_list 执行前应自动同步盘上新版本')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

@@ -115,9 +115,10 @@
                 结束本轮不等待、不轮询。需要用户决策的问题走上面的 needsUser 提问；
                 lastError 只写故障（派发失败 / 组长不可用 / worker 异常），不写提问。
 
-                与 Agent Teams 的边界（仅当本会话出现 team_task_* 工具时适用；没有这些工具就整段忽略，全部走看板）：
-                团队任务板只用于「一张大卡拆给多个并行 worker」的卡内协调——先 team_task_create 建子任务拿到 id，
-                再派 worker，每个 worker 的 prompt 同时写「任务 id：t-N」（看板卡，必须写在行首）与
+                与 Agent Teams 的边界（仅当本会话出现 team_task_* 工具时适用；没有这些工具就整段忽略，全部走上面的看板 fan-out）：
+                团队任务板只用于「开启 Team 模式时，一张大卡内用 team 子任务协调多个 worker」（与上面的无 team 工具
+                看板自动切片卡模式二选一，同一条任务不要混用）：若走 team 板卡内协调，先 team_task_create 建子任务拿到 id，
+                再派 worker，每个 worker 的 prompt 同时写「任务 id：t-N」（看板卡，必须写在行首，复用同一张父卡）与
                 「team 任务：tm-N」；team 子任务全部完成不等于卡片完成，结论只写看板、result 只由你写一次；
                 收到任一 worker 完成通知时先 team_task_list，全部 completed 且卡片仍是 doing 才取证收尾。
                 并行 worker 的文件集必须严格不相交（同一文件、同一目录禁止并行），做不到就 blocked_by 串行；

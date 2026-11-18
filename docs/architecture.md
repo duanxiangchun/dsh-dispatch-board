@@ -344,16 +344,19 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
    `- **任务 id：t-78**` 都能认出 `t-78`。**严格性不放宽**：标签必须在行首（去掉列表符号后）；同一行写出
    两个任务 id（`任务 id：t-3 或 t-4`）= 归属不明 → **不认领**；正文段落里顺带提到的 t-N
    （「上次那个 t-3」「见 t-7」）依旧不算。
-3b. prompt 以「看板任务：t-N」/「看板任务 \`t-N\`」形式引用卡片，且那张卡是 `todo` / `doing` 且
-   **还没挂真实 worker 会话 id**（UUID / `session-…`；自由文本 `taskboard-worker` 不算）→ **复用**
+3b. prompt 以「看板任务：t-N」/「看板任务 \`t-N\`」形式引用卡片，且那张卡是 `todo` / `doing`、
+   **当前没有 running 状态的 worker**（`workerRunState !== 'running'`）且**还没挂真实 worker 会话 id**
+   （UUID / `session-…`；自由文本 `taskboard-worker` 不算）→ **复用**
    （组长直聊时先手动建卡、prompt 这么写：实测 t-70 的 worker prompt 就是「看板任务：**t-70…**」）。
    同样容忍 markdown 形态：`**看板任务：t-N**`、`` 看板任务：`t-N` ``、半角冒号，以及中间夹着 `任务 id：`
    标签的「看板任务：**任务 id：t-78**『标题』」（t-78 事故原话——行首是正文，行首规则不认，
    旧正则也不认中间夹的标签）。
-   已挂 worker 的卡不被引用认领——验证子 Agent / 第二个 worker 会拿到自己的卡片，原 worker 的
-   `assignee` 不被覆盖。
-4. 有意图、且这次 prompt 真的提到意图任务（任务 id 或标题出现在 prompt 里）→ **复用**该卡片。
-5. 同一组长、同 title + note、`autoDispatch` 且还没挂 worker、创建时间在
+   已挂 running worker（含 v0.3.1 起 `assignee` 为 worker 名字、`workerRunState==='running'` 的卡）或真实会话 id 的卡不被引用认领——验证子 Agent / 第二个 worker 会拿到自己的卡片，原 worker 的
+   `assignee` / `workerSessionId` 不被覆盖。
+4. 有意图（任务 `doing`、未挂 running worker 且 `needsUser !== true`）、且这次 prompt 真的提到意图任务
+   （任务 id 出现在 prompt 里；或 `description` 未单独声明父任务 id 且标题出现在 prompt 里——若 `description`
+   带了父任务 id 而 prompt 没带，属于 v0.3.3 fan-out 切片，不按标题子串误认父卡）→ **复用**该卡片。
+5. 同一组长、同 title + note、`autoDispatch` 且还没挂 worker（`assignee === ''` 且 `workerRunState === null`）、创建时间在
    `LEAD_DISPATCH_DEDUPE_MS`（2 分钟）内的卡片 → **复用**（同一次派发被重复调用不重复建卡）。
 6. 以上都没命中 → **新建**一条 `doing` + `autoDispatch` 卡片并 `commitBoard` 同步写盘。
 7. 同一个 `exec` 对象第二次进闸门（PTC 嵌套 / 重试）→ 直接返回第一次结果，不再建卡。
@@ -399,10 +402,13 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 
 **找不到任务时的兜底（v0.3.1）**：worker 的 `workerSessionId` 可能还没回填（当前 dsh 的 activation
 没有 id）。`subagent/end` 先按 `workerSessionId → assignee` 找（`findTaskByWorker` 优先真实字段、
-老 board 回退 `assignee`）；找不到且 `info.parentSessionId` 非空时，在该组长名下找
-「`autoDispatch='lead-dispatch'` + `doing` + `workerRunState='running'` + `workerSessionId` 为空」的卡，
-**只有恰好一条**时才认领（多于一条不猜，交给组长审核）。认领后照常按 `stopReason` 收尾；
-`workerSessionId` 缺则补本次 `id`。
+老 board 回退 `assignee`）；找不到时，先在「`autoDispatch='lead-dispatch'` + `doing` +
+`workerRunState='running'` + `workerSessionId` 为空」（有 `info.parentSessionId` 时限定该父会话）的候选卡里，
+尝试用 `info.name`（或从 `subagents.listDescendants(parentSessionId)` 反查本次 `id` 对应的 `name`）匹配
+`candidate.assignee`（v0.3.3 fan-out 多切片并发时据此精确认领对应切片卡）；仍无法区分且
+`info.parentSessionId` 非空时，**只有恰好一条**候选才认领（多于一条不猜，交给组长审核）。
+`backfillWorkerSessionId()` 从 `listDescendants` 按 `name` 回填时逆序优先最新且未被其它卡片占用的子会话。
+认领后照常按 `stopReason` 收尾；`workerSessionId` 缺则补本次 `id`。
 
 **失败处理（v0.2.4 起：闸门失败 = 派发失败）**
 
@@ -1043,7 +1049,7 @@ ctx.effect(() => ctx.webServer.register({
 | --- | --- | --- |
 | `taskboard_list` | `{status?}` | 返回文本清单（id / 状态 / 标题 / 备注 / assignee / result / 待回答的问题）+ 结构化 `tasks[]`；v0.2.2 起 `tasks[]` 额外带 `needsUser` / `question` / `questionOptions` |
 | `taskboard_add` | `{title, note?, workspace?}` | 新建任务（`source='agent'`，`sessionId=exec.agent.session.id`）；`workspace` v0.2.0 新增，见下 |
-| `taskboard_update` | `{id, status?, result?, assignee?, note?, needsUser?, question?, questionOptions?}` | 更新任务；`status` 非法迁移返回错误文本；**`assignee` 语义（v0.2.9）**：写子 Agent 的 label / 名字（自由文本）即可，**不要写会话 id**——会话 id 由宿主记在 `workerSessionId`（宿主独占、模型不可写、不进 `taskBrief`，§2）；v0.2.2 起 `needsUser:true` + `question` 用来「问用户」（§1.9），`needsUser:false` 取消提问，`askedBy` 取 `exec.agent.session.id`（工具不暴露该参数；RPC 层单独传 `askedBy` 也不生效，见 §2）；任务已归档且未同时改 `status` 时设置 `needsUser:true` / `question` → 工具报 `conflict`（不写盘，§1.9）；v0.2.4 起**组长**（`taskboard-dispatch`）把轮询投递任务置 `doing` 时，宿主额外记一条一次性「即将派 worker」意图（进程内，不落盘；派发闸门据此复用原卡片，§1.8） |
+| `taskboard_update` | `{id, status?, result?, assignee?, note?, lastError?, needsUser?, question?, questionOptions?}` | 更新任务（三个模型工具执行前均调 `reloadBoardIfStale` 对齐磁盘状态）；`status` 非法迁移返回错误文本；`lastError` 供组长记录故障或阻塞原因（派发失败 / 缺工作目录 / worker 异常；不写向用户的提问）；**`assignee` 语义（v0.2.9）**：写子 Agent 的 label / 名字（自由文本）即可，**不要写会话 id**——会话 id 由宿主记在 `workerSessionId`（宿主独占、模型不可写、不进 `taskBrief`，§2）；v0.2.2 起 `needsUser:true` + `question` 用来「问用户」（§1.9），`needsUser:false` 取消提问，`askedBy` 取 `exec.agent.session.id`（工具不暴露该参数；RPC 层单独传 `askedBy` 也不生效，见 §2）；任务已归档且未同时改 `status` 时设置 `needsUser:true` / `question` → 工具报 `conflict`（不写盘，§1.9）；v0.2.4 起**组长**（`taskboard-dispatch`）把轮询投递任务置 `doing` 时，宿主额外记一条一次性「即将派 worker」意图（进程内，不落盘；派发闸门据此复用原卡片，§1.8） |
 
 **`taskboard_add.workspace`（v0.2.0，可选）**：工作区 id / 名称 / 绝对路径，用于主会话往任意工作区派任务。
 
