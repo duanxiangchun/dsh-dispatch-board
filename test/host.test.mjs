@@ -59,6 +59,7 @@ import {
   dispatchTaskIdFromPrompt,
   endpointFromUrl,
   ensureWorkspaceLead,
+  findDependencyCycle,
   findLeadInFlightTask,
   findPendingDispatchCard,
   findTask,
@@ -83,6 +84,7 @@ import {
   normalizeBoard,
   normalizeConfig,
   normalizeConfig as normalizeConfigAlias,
+  normalizeDependsOn,
   normalizeLeadAuto,
   normalizePathForCompare,
   normalizeQuestionOptions,
@@ -92,6 +94,7 @@ import {
   notifyCooldownMs,
   listWorkspaces,
   readAttachment,
+  reconcileOrphanedDoingTasks,
   registerLeadAutoHooks,
   registerLeadDispatchGate,
   releasePreparedDispatch,
@@ -119,6 +122,7 @@ import {
   taskById,
   tick,
   truncateNote,
+  unresolvedDependencies,
   workspaceIdForCwd,
   workspaceKeyForCwd,
   workspacePathForCwd,
@@ -1046,6 +1050,7 @@ test('taskBrief output stays inside the closed tool output schemas', () => {
   // 键集合 ⊆ schema 声明的 properties；旧代码会在这里挂（dispatchedSessionId 未声明）
   assert.deepEqual(Object.keys(brief).sort(), [
     'assignee',
+    'dependsOn',
     'id',
     'needsUser',
     'note',
@@ -7013,4 +7018,160 @@ test('v0.3.9 失败切片子卡续做接管：prompt 同时带「任务 id：t-�
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+/* ------------------------------------------------------------------ *
+ * v0.4.0：dependsOn 显式任务依赖 + 组长轻写配置 + 失联 doing 自动巡检自愈
+ * ------------------------------------------------------------------ */
+
+test('v0.4.0 dependsOn：前置阻塞派发（含 needsUser 期间不抢跑）、环检测拒绝、归档淘汰后自动放行', async () => {
+  assert.deepEqual(normalizeDependsOn('t-2, T-3；t-2 t-1', 't-1'), ['t-2', 't-3'])
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v040-depends-'))
+  try {
+    const now = Date.now()
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({
+      dispatchMode: 'workspace-lead',
+      workspaceLeads: {
+        'w-a': { sessionId: 'lead-a', title: '', cwd: 'C:\\work\\a', createdAt: new Date(now).toISOString() },
+      },
+    })
+    const t1 = addTask(state, { title: '前置拆仓迁移', cwd: 'C:\\work\\a' }, now)
+    const t2 = addTask(state, { title: '迁移后改代码', cwd: 'C:\\work\\a', dependsOn: [t1.id] }, now + 1)
+    assert.deepEqual(t2.dependsOn, ['t-1'])
+
+    // 1) 不存在的前置 id / 自环 / 传递环一律报错且不污染状态
+    assert.throws(
+      () => addTask(state, { title: '手误依赖', dependsOn: ['t-999'] }, now + 2),
+      (err) => err.code === 'bad-request' && /前置依赖任务不存在/.test(err.message),
+    )
+    assert.throws(
+      () => applyTaskUpdate(state, t1.id, { dependsOn: [t1.id] }, now + 2),
+      (err) => err.code === 'conflict' && /不能依赖自身/.test(err.message),
+    )
+    assert.throws(
+      () => applyTaskUpdate(state, t1.id, { dependsOn: [t2.id] }, now + 2),
+      (err) => err.code === 'conflict' && /循环引用/.test(err.message),
+    )
+    assert.ok(findDependencyCycle(state, 't-1', ['t-2']))
+
+    // 2) 即使前置任务 t1 处于 needsUser 等待拍板（工作区无 running worker），后置任务 t2 也绝不提前抢跑
+    applyTaskUpdate(state, t1.id, { status: 'doing', needsUser: true, question: '现在迁移吗？' }, now + 3)
+    assert.deepEqual(unresolvedDependencies(state, t2), ['t-1'])
+    assert.deepEqual(selectDispatchCandidates(state, now + 4), [], '前置未完成时后置任务不进候选队列')
+
+    const delivered = []
+    const leadA = {
+      id: 'lead-a',
+      status: 'idle',
+      session: { id: 'lead-a', header: { cwd: 'C:\\work\\a' } },
+      followup: (msg) => delivered.push(msg),
+    }
+    const ctx = {
+      get: (name) =>
+        name === 'agents'
+          ? { get: (id) => (id === 'lead-a' ? leadA : undefined), roots: () => [leadA] }
+          : name === 'workspaceRegistry'
+            ? { list: () => [{ id: 'w-a', path: 'C:\\work\\a', title: 'a' }] }
+            : undefined,
+    }
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+
+    // 手动「立即派发」被前置依赖阻塞的任务 → conflict
+    await assert.rejects(
+      () => tick(rt, { taskId: t2.id, force: true }),
+      (err) => err.code === 'conflict' && /前置任务尚未完成/.test(err.message),
+    )
+
+    // 3) 前置 t1 完成后（甚至归档并被 pruneArchivedTasks 删除后），t2 自动解锁派发
+    applyTaskUpdate(state, t1.id, { needsUser: false, status: 'done', result: '迁移完成' }, now + 10)
+    applyTaskUpdate(state, t1.id, { status: 'archived' }, now + 11)
+    t1.archivedAt = new Date(now - 60 * 60 * 1000).toISOString()
+    pruneArchivedTasks(state, now + 12)
+    assert.equal(taskById(state, 't-1'), null, '前置归档满保留期已被淘汰')
+    assert.deepEqual(unresolvedDependencies(state, t2), [], '已淘汰的历史归档前置视为已满足，不死锁后置任务')
+
+    const dispatched = await tick(rt, {})
+    assert.equal(dispatched.dispatched, true)
+    assert.equal(dispatched.task.id, t2.id)
+    assert.match(delivered[0].content[0].text, /前置依赖（已满足）：t-1/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('v0.4.0 reconcileOrphanedDoingTasks：启动与轮询巡检自愈失联 doing 卡（顶层回退 todo，切片子卡标 failed 并通知组长）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v040-orphan-'))
+  try {
+    const now = Date.now()
+    const state = createEmptyBoard()
+    const topLost = addTask(state, { title: '重启掉线的顶层任务', note: '已有进展记录', cwd: 'C:\\work\\a' }, now - 120_000)
+    topLost.status = 'doing'
+    topLost.workerSessionId = 'dead-worker-1'
+    topLost.workerRunState = 'running'
+    topLost.updatedAt = new Date(now - 120_000).toISOString()
+
+    const parent = addTask(state, { title: '拆片父卡', cwd: 'C:\\work\\a' }, now - 120_000)
+    parent.status = 'doing'
+    parent.dispatchedSessionId = 'lead-a'
+    parent.updatedAt = new Date(now - 120_000).toISOString()
+
+    const sliceLost = addTask(
+      state,
+      { title: '掉线的切片子卡', cwd: 'C:\\work\\a', source: 'agent', parentTaskId: parent.id },
+      now - 120_000,
+    )
+    sliceLost.status = 'doing'
+    sliceLost.autoDispatch = LEAD_AUTO_MARK
+    sliceLost.dispatchedSessionId = 'lead-a'
+    sliceLost.sessionId = 'lead-a'
+    sliceLost.workerSessionId = 'dead-slice-worker'
+    sliceLost.workerRunState = 'running'
+    sliceLost.updatedAt = new Date(now - 120_000).toISOString()
+
+    const alerts = []
+    const leadA = {
+      id: 'lead-a',
+      status: 'idle',
+      session: { id: 'lead-a', header: { cwd: 'C:\\work\\a' } },
+      followup: (msg) => alerts.push(msg),
+    }
+    const ctx = {
+      get: (name) => {
+        if (name === 'agents') return { get: (id) => (id === 'lead-a' ? leadA : undefined), roots: () => [leadA] }
+        if (name === 'subagents') return { listDescendants: async () => [] }
+        return undefined
+      },
+    }
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+
+    // 运行期巡检（超过 60s 宽限且 subagents 目录确认子会话已不存在）
+    const res = await reconcileOrphanedDoingTasks(rt, { startup: false, now })
+    assert.equal(res.requeued, 1, '顶层失联任务自动回退待开始')
+    assert.equal(res.markedFailed, 1, '内部切片子卡标 failed 保留给组长')
+    assert.equal(topLost.status, 'todo')
+    assert.equal(topLost.note, '已有进展记录', '回退不丢原有备注')
+    assert.equal(topLost.workerRunState, null)
+    assert.match(topLost.lastError, /已自动回退待开始/)
+
+    assert.equal(sliceLost.status, 'doing')
+    assert.equal(sliceLost.workerRunState, 'failed')
+    assert.match(sliceLost.lastError, /执行会话已失联/)
+    assert.equal(alerts.length, 1, '组长空闲时自动收到失联子卡恢复提醒')
+    assert.match(alerts[0].content[0].text, /【任务看板 · 异常恢复】/)
+    assert.match(alerts[0].content[0].text, new RegExp(sliceLost.id))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('v0.4.0 组长预设轻写模式：taskboard-dispatch 开放 write/edit，且仍不挂载终端工具', () => {
+  const patchText = readFileSync(new URL('../presets/taskboard.patch.yml', import.meta.url), 'utf8')
+  const [dispatchBlock, workerBlock] = patchText.split('id: preset-taskboard-worker')
+  assert.ok(dispatchBlock && workerBlock)
+  assert.match(dispatchBlock, /write:\s*true/, '组长预设应开放 write: true')
+  assert.match(dispatchBlock, /edit:\s*true/, '组长预设应开放 edit: true')
+  assert.doesNotMatch(dispatchBlock, /dsh-tool-pwsh|dsh-tool-bash/, '组长预设仍不挂载终端工具')
+  assert.match(workerBlock, /dsh-tool-pwsh/, 'worker 预设保留终端工具')
 })

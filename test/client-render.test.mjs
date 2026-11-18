@@ -4254,3 +4254,44 @@ test('v0.3.6 设置按钮与面板：点击「设置」展开归档保留分钟�
   assert.equal(allConfigCalls.length, 2)
   assert.deepEqual(Object.assign({}, allConfigCalls[1].payload), { archiveRetentionMinutes: 45 })
 })
+
+test('v0.4.0 前置依赖 UI：新建可填 dependsOn，详情浮层展示前置依赖进度并支持点击跳转前置任务', async () => {
+  const snapshot = makeSnapshot()
+  snapshot.tasks[3].dependsOn = ['t-1']
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  // 1) 展开「加备注」后可填写前置依赖并随 add-task 提交
+  const addNoteBtn = buttons(tree).find((node) => textOf(node).trim() === '加备注')
+  assert.ok(addNoteBtn)
+  addNoteBtn.props.onClick()
+  let next = await instance.run()
+  const titleInput = collect(next).find((n) => n.type === 'input' && n.props['aria-label'] === '添加任务')
+  const depInput = collect(next).find((n) => n.type === 'input' && String(n.props['aria-label'] || '').includes('前置依赖'))
+  assert.ok(titleInput && depInput, '展开备注区后应渲染前置依赖输入框')
+  titleInput.props.onChange({ target: { value: '带前置依赖的新任务' } })
+  depInput.props.onChange({ target: { value: 't-1, t-2' } })
+  next = await instance.run()
+  const submitBtn = buttons(next).find((node) => textOf(node).trim() === '添加到待开始')
+  submitBtn.props.onClick()
+  await settle()
+  const addCall = harness.rpcCalls.find((call) => call.endpoint === 'add-task')
+  assert.ok(addCall)
+  assert.equal(addCall.payload.dependsOn, 't-1, t-2')
+
+  // 2) 点开带 dependsOn=['t-1'] 的 t-2 详情，渲染「前置依赖（0/1 已满足）」，点击条目跳到 t-1 详情
+  next = await instance.run()
+  const card2Title = nodesWithClass(next, 'tb-card-titlebtn').find((n) => textOf(n).includes('打通宿主 RPC'))
+  assert.ok(card2Title)
+  card2Title.props.onClick()
+  next = await instance.run()
+  let box = detailBox(next)
+  assert.ok(textOf(box).includes('前置依赖（0/1 已满足）'))
+  const depSection = nodesWithClass(box, 'tb-detail-depends')[0]
+  assert.ok(depSection)
+  const depJumpBtn = buttons(depSection)[0]
+  depJumpBtn.props.onClick()
+  next = await instance.run()
+  box = detailBox(next)
+  assert.ok(textOf(box).includes('梳理看板数据模型'), '点击前置依赖条目应跳转到该前置任务的详情')
+})

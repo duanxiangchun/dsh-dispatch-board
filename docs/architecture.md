@@ -2412,3 +2412,9 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   ② **轮询任务与终态 `workerRunState` 收敛**：`handleSubagentEnd` 对不带 `autoDispatch` 的轮询/人工任务仍不自动置 `done`，但会同步将其匹配的 `workerRunState:'running'` 收敛为 `'ended'` / `'failed'`；`applyTaskUpdate(done/archived)`、`archiveDoneTasks` 与 `normalizeTask` 读盘归一化同步将终态任务上残留的 `'running'` 收敛为 `'ended'`。
   ③ **失败子卡续做直接复用接管（消除僵尸 `doing` 子卡）**：`prepareLeadDispatch` 允许显式 `任务 id：t-子卡`（即使同时带 `父任务：t-N`）优先复用并覆盖接管失败子卡；`presets/taskboard.patch.yml` 补充「worker 会话爆上下文/报错不可恢复需换新 worker 续做时，行首写 `任务 id：t-子卡` 复用原卡或先归档废卡，且超大文件点名行区间读取」纪律。
   `package.json` 0.3.8 → 0.3.9。
+
+- v0.4.0（架构演进第一步：`dependsOn` 显式任务依赖 + 组长轻写快慢分流 + 失联 `doing` 卡自动巡检自愈）：
+  ① **显式任务依赖（`dependsOn: string[]`）**：任务模型、`taskBrief`、`taskboard_add` / `taskboard_update` / `add-task` / `update-task` 新增 `dependsOn`（最多 16 条，建/改时校验目标存在且用 `hasDependencyCycle` 拒绝自环与传递环 → `conflict`；已被归档自动淘汰清理的历史前置 id 视为已满足，不死锁后置任务）。`selectDispatchCandidates` 自动过滤存在未完成前置依赖（`todo` / `doing`）的任务，`dispatch-now` 指向未满足前置依赖的任务返回 `conflict`；客户端新建区、编辑框与详情浮层支持设置、展示并点击跳转前置依赖卡。
+  ② **组长轻写模式与快慢分流（Fast-path vs Worker-path）**：`presets/taskboard.patch.yml` 为 `taskboard-dispatch` 开放 `write: true, edit: true`（继续不挂 `pwsh`/`bash` 终端）；组长对 ≤2 个文件且无需终端测试/构建的纯文档/配置/胶水小活直接 `edit/write` 当轮置 `done`（直聊小活先 `taskboard_add` 建卡留痕），需跑命令验证或大范围改代码的重活物理强制走 `subagent` worker。
+  ③ **失联 `doing` 卡自动巡检自愈（`reconcileOrphanedDoingTasks`）**：启动期（`apply`）与轮询 `tick`（带 `ORPHAN_GRACE_MS = 60s` 启动宽限）巡检 `doing + workerRunState==='running'` 任务（启动期额外回收超时无 worker 的陈旧顶层 `doing` 卡）：发现执行会话已失联不存在时，**顶层任务自动回退 `todo` 重新排队接单**（保留原备注与结论），**内部切片子卡（`autoDispatch==='lead-dispatch' && parentTaskId` 非空）标 `workerRunState='failed'` + `lastError` 并在组长空闲时自动发恢复提醒交组长续做**。
+  `package.json` 0.3.9 → 0.4.0。
