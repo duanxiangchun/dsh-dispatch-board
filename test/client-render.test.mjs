@@ -4131,3 +4131,61 @@ test('全部派发：待开始列有多条任务时依次派发全部 todo 任�
   const rightRendered = await renderNarrow(rightHarness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
   assert.ok(buttonTexts(rightRendered.tree).includes('创建组长'), '仅含待你处理任务的工作区仍应显示组长条操作')
 })
+
+test('v0.3.5 父子卡联动：子卡带 data-subtask=true，父卡详情展示子任务进度并支持父子双向点击跳转', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 't-10',
+        title: '重构任务看板拆分逻辑',
+        status: 'doing',
+        cwd: WS_A,
+        updatedAt: minutesAgo(2),
+      },
+      {
+        id: 't-11',
+        title: 't-10 切片 A · Host 协议',
+        status: 'done',
+        parentTaskId: 't-10',
+        cwd: WS_A,
+        result: 'Host 已完成',
+        updatedAt: minutesAgo(1),
+      },
+      {
+        id: 't-12',
+        title: 't-10 切片 B · Client 视图',
+        status: 'doing',
+        parentTaskId: 't-10',
+        cwd: WS_A,
+        updatedAt: minutesAgo(1),
+      },
+    ],
+  })
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  // 1) 卡片层：子卡带 data-subtask="true"，顶层父卡不带，且保持标题 + 操作行两段结构不变
+  const cards = nodesWithClass(tree, 'tb-card')
+  assert.equal(cards.length, 3)
+  const subCards = cards.filter((card) => card.props['data-subtask'] === 'true')
+  assert.equal(subCards.length, 2, '两条切片子卡必须带 data-subtask=true')
+
+  // 2) 打开父卡详情：显示「拆分子任务（1/2 已完成）」及子任务条目，点击子任务条目跳到子卡详情
+  let next = await openDetailByTitle(instance, tree, '重构任务看板拆分逻辑')
+  let box = detailBox(next)
+  assert.ok(textOf(box).includes('拆分子任务（1/2 已完成）'), '父卡详情应显示子任务完成进度')
+  const subItemBtn = nodesWithClass(box, 'tb-subtask-item')[0]
+  assert.ok(subItemBtn, '父卡详情应列出可点击的子任务按钮')
+  subItemBtn.props.onClick()
+  next = await instance.run()
+  box = detailBox(next)
+  assert.ok(textOf(box).includes('t-10 切片 A · Host 协议'), '点击子任务条目应切换到该子卡详情')
+
+  // 3) 在子卡详情点击头部的「↳ 父任务 t-10」徽标按钮，跳回父卡详情
+  const parentChipBtn = nodesWithClass(box, 'tb-detail-parent')[0]
+  assert.ok(parentChipBtn, '子卡详情头部应渲染可点击的父任务跳转徽标')
+  parentChipBtn.props.onClick()
+  next = await instance.run()
+  box = detailBox(next)
+  assert.ok(textOf(box).includes('拆分子任务（1/2 已完成）'), '点击父任务徽标应跳回父卡详情')
+})

@@ -16,6 +16,7 @@ const clientSource = readFileSync(join(here, '..', 'lib', 'client.js'), 'utf8')
 
 test('t-92 回归守卫：needsUserTasks / answerDraft / answerError 在两份看板副本的 bind 回写里各出现 ≥2 次', () => {
   const fields = [
+    'boardBindRef.current.allTasks',
     'boardBindRef.current.needsUserTasks',
     'boardBindRef.current.answerDraft',
     'boardBindRef.current.answerError',

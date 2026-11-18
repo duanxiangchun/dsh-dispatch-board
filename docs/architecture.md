@@ -220,7 +220,9 @@ v0.2.0 的默认派发方式。目标不是「某个会话」，而是**任务�
 
 - **任务字段**：`reportedAt: string|null`（ISO 时间；`null` = 尚未推送回执）。UI / 快照可见，
   **绝不进工具输出 `taskBrief`**（§4.4 封闭 schema 硬规则）。
-- **候选**：`status === 'done' && reportedAt === null`；按 `updatedAt` 升序（相同按 id 数字序），
+- **候选**：`status === 'done' && reportedAt === null`，且排除 `autoDispatch === 'lead-dispatch'` 同时
+  `parentTaskId !== null` 的内部子卡（v0.3.5：组长 fan-out 切片 / 合并 / 验证子 Agent 卡只用于组长内部协调与进度留痕，
+  不单独向主会话发送完成回执，等父任务最终 `done` 时向主会话发一次汇总回执）；按 `updatedAt` 升序（相同按 id 数字序），
   **每批最多 10 条**，其余下一轮。
 - **前置条件**：`config.mainSessionId` 非空；主会话**未被归档**（不在 `workspaceRegistry.archivedSessionIds`
   里——归档门会拒绝它跑模型步进）；`agents.get(mainSessionId)` 拿得到 live agent；
@@ -323,12 +325,13 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 - **接管组长（v0.3.2）**：闸门在卡片准备成功之后、`next()` 之前调用 `adoptWorkspaceLead()`；工作区
   没有组长映射 / 映射指向的组长已归档时，把当前 `taskboard-dispatch` 会话登记为该工作区组长
   （§1.5 第 11 条），避免轮询下一轮再新建一个组长窗口。接管失败只告警，不阻断派发。
-- **fan-out 切片卡（v0.3.3）**：组长对一个可拆任务 fan-out 时，**每片 worker 各建一张宿主自动卡**
-  （`source='agent'` + `autoDispatch='lead-dispatch'`），父卡保持 `doing`；切片卡 title 由 worker
-  `description` 决定（组长应带父任务 id），note 是切片 prompt（**不应含父任务 id / 标题**，否则
-  lead-intent 会把父卡认领走）。切片卡由 `subagent/end` 自动 done；父卡由组长合并/验证后
-  `taskboard_update done`。切片卡各自会触发完成回执，**父卡结论才是最终汇报**（中间回执噪声后续可
-  用 batchParent 字段抑制）。
+- **fan-out 切片与子卡关联（v0.3.3；v0.3.5 起引入 `parentTaskId`）**：组长对一个可拆任务 fan-out（或派合并 /
+  验证子 Agent）时，**每片 worker 各建一张宿主自动子卡**（`source='agent'` + `autoDispatch='lead-dispatch'` +
+  `parentTaskId='<父卡 id>'`），父卡保持 `doing`；子卡 prompt 推荐在行首写 `父任务：t-N`（`description` 带
+  `t-N 切片 A · …`），宿主正向识别为子卡，跳过父卡认领、绝不误吞父卡，也不再依赖「prompt 严禁提父卡 id/标题」的
+  文字禁区。子卡由 `subagent/end` 同步完成 `done` 落盘，但**不单独触发主会话完成回执**（§1.6）；父卡由组长用
+  `taskboard_list {parentTaskId}` 核对子卡进度、完成合并与全量测试后 `taskboard_update done` 触发唯一一次汇总回执。
+  组长会话被归档触发 `requeueTasksOfLead` 时，旧组长名下未完成的内部自动子卡直接归档（不重排为独立 `todo`），只把顶层父任务重排回 `todo`。
 
 **闸门判定顺序（`prepareLeadDispatch`，worker 启动前）**
 
@@ -336,6 +339,8 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
    其它工具 / worker 预设 / 普通会话的 `subagent` 调用一律 `next()` 放行（不拦截、不建卡）。
 2. **一次性消费**「组长把轮询投递任务置 doing」的意图（`noteLeadDispatchIntent`，进程内 Map）：
    即使这次靠显式任务 id 认领也清掉——否则陈旧意图会在下一次无关的直聊派活里把旧任务认领走。
+2b. **显式子卡声明优先（v0.3.5）**：若 prompt 行首显式声明 `父任务：t-N` / `父卡：t-N`，且 `t-N` 在看板中存在且未归档，
+   本次派发直接判定为 `t-N` 的子卡（跳过第 3 / 3b / 4 步的父卡认领，进入第 5 步同参幂等去重或第 6 步新建带 `parentTaskId='t-N'` 的自动子卡）。
 3. prompt 行首显式声明 `任务 id：t-N` / `- 任务 id: \`t-N\``，且该任务存在、状态不是 `archived`
    → **复用**这条卡片（正常「轮询 → 组长 → worker」链路、返工重派都靠它）。
    **任务 id 行接受 markdown 强调 / 反引号 / 半角冒号等常见变体**（0.2.4，t-78 事故）：匹配前逐行归一
@@ -345,20 +350,21 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
    两个任务 id（`任务 id：t-3 或 t-4`）= 归属不明 → **不认领**；正文段落里顺带提到的 t-N
    （「上次那个 t-3」「见 t-7」）依旧不算。
 3b. prompt 以「看板任务：t-N」/「看板任务 \`t-N\`」形式引用卡片，且那张卡是 `todo` / `doing`、
+   **名下没有未归档子卡**（防止已拆片的父卡被后续合并/验证子 Agent 误抢占）、
    **当前没有 running 状态的 worker**（`workerRunState !== 'running'`）且**还没挂真实 worker 会话 id**
    （UUID / `session-…`；自由文本 `taskboard-worker` 不算）→ **复用**
    （组长直聊时先手动建卡、prompt 这么写：实测 t-70 的 worker prompt 就是「看板任务：**t-70…**」）。
    同样容忍 markdown 形态：`**看板任务：t-N**`、`` 看板任务：`t-N` ``、半角冒号，以及中间夹着 `任务 id：`
    标签的「看板任务：**任务 id：t-78**『标题』」（t-78 事故原话——行首是正文，行首规则不认，
    旧正则也不认中间夹的标签）。
-   已挂 running worker（含 v0.3.1 起 `assignee` 为 worker 名字、`workerRunState==='running'` 的卡）或真实会话 id 的卡不被引用认领——验证子 Agent / 第二个 worker 会拿到自己的卡片，原 worker 的
+   已拆出子卡、已挂 running worker（含 v0.3.1 起 `assignee` 为 worker 名字、`workerRunState==='running'` 的卡）或真实会话 id 的卡不被引用认领——验证子 Agent / 合并 worker / 第二个 worker 会拿到自己的子卡，原任务的
    `assignee` / `workerSessionId` 不被覆盖。
 4. 有意图（任务 `doing`、未挂 running worker 且 `needsUser !== true`）、且这次 prompt 真的提到意图任务
    （任务 id 出现在 prompt 里；或 `description` 未单独声明父任务 id 且标题出现在 prompt 里——若 `description`
-   带了父任务 id 而 prompt 没带，属于 v0.3.3 fan-out 切片，不按标题子串误认父卡）→ **复用**该卡片。
+   带了父任务 id 而 prompt 没带，属于 fan-out 切片，不按标题子串误认父卡）→ **复用**该卡片。
 5. 同一组长、同 title + note、`autoDispatch` 且还没挂 worker（`assignee === ''` 且 `workerRunState === null`）、创建时间在
    `LEAD_DISPATCH_DEDUPE_MS`（2 分钟）内的卡片 → **复用**（同一次派发被重复调用不重复建卡）。
-6. 以上都没命中 → **新建**一条 `doing` + `autoDispatch` 卡片并 `commitBoard` 同步写盘。
+6. 以上都没命中 → **新建**一条 `doing` + `autoDispatch` 卡片（若 `父任务：t-N`、`description` 中的 `t-N` 或未能复用的 `看板任务：t-N` 指向板内未归档任务，则自动写入 `parentTaskId='t-N'`）并 `commitBoard` 同步写盘。
 7. 同一个 `exec` 对象第二次进闸门（PTC 嵌套 / 重试）→ 直接返回第一次结果，不再建卡。
 
 **边界（有意收紧）**：组长在审核阶段派**验证子 Agent**（`subagent` 跑命令 / 取证）通常也会先建一张
@@ -598,6 +604,7 @@ DSH 的 Agent Teams（`team_task_create` / `team_task_get` / `team_task_list` / 
       "dispatchedSessionTitle": "",
       "reportedAt": "…ISO…" | null,      // v0.2.0：完成回执推给主会话的时间；null = 未推送
       "autoDispatch": "lead-dispatch" | null, // v0.2.0：宿主挂钩自动建的任务标记（§1.8）；null = 普通任务
+      "parentTaskId": "t-1" | null,      // v0.3.5：所属父任务 id（fan-out 切片 / 合并 / 验证子卡）；顶层任务为 null
       "needsUser": false,                // v0.2.2：等待用户回复（不新增 status，§1.9）
       "question": "",                    // needsUser=true 时必填（≤500）
       "questionOptions": [],             // 可选选项（≤4 个，每个 ≤80）
@@ -1047,8 +1054,8 @@ ctx.effect(() => ctx.webServer.register({
 
 | 工具 | 参数 | 行为 |
 | --- | --- | --- |
-| `taskboard_list` | `{status?}` | 返回文本清单（id / 状态 / 标题 / 备注 / assignee / result / 待回答的问题）+ 结构化 `tasks[]`；v0.2.2 起 `tasks[]` 额外带 `needsUser` / `question` / `questionOptions` |
-| `taskboard_add` | `{title, note?, workspace?}` | 新建任务（`source='agent'`，`sessionId=exec.agent.session.id`）；`workspace` v0.2.0 新增，见下 |
+| `taskboard_list` | `{status?, parentTaskId?}` | 返回文本清单（id / 状态 / 父任务 / 标题 / 备注 / assignee / result / 待回答的问题）+ 结构化 `tasks[]`；v0.2.2 起 `tasks[]` 带 `needsUser` / `question` / `questionOptions`，v0.3.5 起带 `parentTaskId` 并支持按 `parentTaskId` 过滤某父卡名下的全部子卡 |
+| `taskboard_add` | `{title, note?, workspace?, parentTaskId?}` | 新建任务（`source='agent'`，`sessionId=exec.agent.session.id`）；`workspace` v0.2.0 新增，`parentTaskId` v0.3.5 可选关联父任务 |
 | `taskboard_update` | `{id, status?, result?, assignee?, note?, lastError?, needsUser?, question?, questionOptions?}` | 更新任务（三个模型工具执行前均调 `reloadBoardIfStale` 对齐磁盘状态）；`status` 非法迁移返回错误文本；`lastError` 供组长记录故障或阻塞原因（派发失败 / 缺工作目录 / worker 异常；不写向用户的提问）；**`assignee` 语义（v0.2.9）**：写子 Agent 的 label / 名字（自由文本）即可，**不要写会话 id**——会话 id 由宿主记在 `workerSessionId`（宿主独占、模型不可写、不进 `taskBrief`，§2）；v0.2.2 起 `needsUser:true` + `question` 用来「问用户」（§1.9），`needsUser:false` 取消提问，`askedBy` 取 `exec.agent.session.id`（工具不暴露该参数；RPC 层单独传 `askedBy` 也不生效，见 §2）；任务已归档且未同时改 `status` 时设置 `needsUser:true` / `question` → 工具报 `conflict`（不写盘，§1.9）；v0.2.4 起**组长**（`taskboard-dispatch`）把轮询投递任务置 `doing` 时，宿主额外记一条一次性「即将派 worker」意图（进程内，不落盘；派发闸门据此复用原卡片，§1.8） |
 
 **`taskboard_add.workspace`（v0.2.0，可选）**：工作区 id / 名称 / 绝对路径，用于主会话往任意工作区派任务。
@@ -1078,8 +1085,9 @@ ctx.effect(() => ctx.webServer.register({
 - v0.2.0 新增的任务字段 `reportedAt` 是 UI / 回执记账字段：出现在 `board.json`、`Snapshot.tasks`
   与返回完整任务的 UI RPC 响应（`add-task` / `update-task` / `dispatch-now` / `answer-task`
   的 `value.task`），**绝不进 `taskBrief` / 模型工具输出**。
-- v0.2.2 起 `taskBrief` 有 **10 个已声明键**：id / title / status / note / assignee / result /
-  updatedAt + `needsUser` / `question` / `questionOptions`（flagged 任务必须在模型工具输出里可见，
+- v0.2.2 起 `taskBrief` 有 10 个已声明键，v0.3.5 起新增 `parentTaskId`（共 **11 个已声明键**）：
+  id / title / status / parentTaskId / note / assignee / result / updatedAt +
+  `needsUser` / `question` / `questionOptions`（`parentTaskId` 无父卡时为 `''`；flagged 任务必须在模型工具输出里可见，
   组长才能确认自己在等什么；`askedBy` / `askedAt` / `lastAnswer` / `answeredAt` 仍只出现在
   `board.json` 与 `Snapshot.tasks`，不进工具输出）。
 
@@ -2361,3 +2369,21 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
     `3px` 状态色条、新建区卡片化表面与亮/暗色主题自适应样式。
   测试：`test/host.test.mjs` **+4**、`test/client-render.test.mjs` **+1**，`node --test` **301 pass / 0 fail**
   （v0.3.3 基线 296 → 301）。`package.json` 0.3.3 → 0.3.4。
+
+- v0.3.5（重构组长任务拆分闭环：`parentTaskId` 子卡关联 + 抑制切片回执轰炸 + 只读探查与同目录隔离纪律）：
+  ① **子卡关系与正向识别（`parentTaskId`）**：任务模型与 `taskBrief` 新增 `parentTaskId`（顶层任务 `null` / `''`），
+    `taskboard_list` 支持 `{parentTaskId}` 过滤、`taskboard_add` 支持可选 `{parentTaskId}`。派发闸门新增
+    `父任务：t-N` / `父卡：t-N` 显式子卡前缀识别，并在新建自动卡时从 `父任务`、`description` 或未复用的
+    `看板任务：t-N` 自动关联 `parentTaskId`；已拥有未归档子卡的父卡不再被 `看板任务：t-N` 引用抢占，彻底移除
+    「切片 prompt 严禁出现父任务 id / 标题」的脆弱文字禁区。
+  ② **抑制切片回执轰炸 + 归档接管防重**：`selectReceiptTasks` 排除 `autoDispatch==='lead-dispatch' && parentTaskId`
+    非空的内部自动子卡，子卡完成不再反复唤醒主会话，只在父卡最终 `done` 时发一次汇总回执；`requeueTasksOfLead`
+    在组长归档失效时直接归档未完成的内部自动子卡，仅把顶层父任务重排回 `todo`，防止新组长把旧切片当独立任务重复执行。
+  ③ **消除唤醒竞态**：`registerLeadAutoHooks` 的 `subagent/end` 改为同步执行 `handleSubagentEnd` 前半段
+    （`done` 状态与落盘在事件发射期同步完成），消除父会话唤醒后 `taskboard_list` 读到旧 `doing` 状态导致漏收尾的竞态；
+    组长合并阶段通过 `parentTaskId` 子卡查询与父卡 `assignee='merging'` 幂等防重。
+  ④ **修正组长与 Worker 拆分纪律**：组长拆片前允许并要求先用只读工具摸清目录与共享契约文件，按依赖分波次（Wave）
+    并行同层无依赖切片；明确同目录并行切片禁止 git 写操作、禁止装依赖、禁止全仓格式化/全量构建（留给合并验证阶段）；
+    统一直聊 fan-out 先建总父卡再派切片的落账闭环。
+  ⑤ **看板 UI 父子联动**：子卡带虚线左缘次级卡片样式，详情浮层头部支持一键跳回父任务，父任务详情展示子任务完成进度与跳转列表。
+  `package.json` 0.3.4 → 0.3.5。

@@ -371,7 +371,8 @@ test('buildDispatchText carries the task facts and instructions', () => {
   assert.match(text, /C:\\work/)
   assert.match(text, /taskboard_update/)
   assert.match(text, /fan-out/)
-  assert.match(text, /不要出现父任务 id/)
+  assert.match(text, /父任务：t-1/)
+  assert.match(text, /parentTaskId/)
 })
 
 test('localStamp renders host-local wall clock with UTC offset', () => {
@@ -1047,6 +1048,7 @@ test('taskBrief output stays inside the closed tool output schemas', () => {
     'id',
     'needsUser',
     'note',
+    'parentTaskId',
     'question',
     'questionOptions',
     'result',
@@ -6588,4 +6590,163 @@ test('taskboard_update 支持写入与清空 lastError，且模型工具执行�
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+/* ------------------------------------------------------------------ *
+ * v0.3.5：组长拆片子卡关联（parentTaskId）+ 抑制切片回执轰炸 + 归档防重
+ * ------------------------------------------------------------------ */
+
+test('v0.3.5 fan-out 闭环：父任务：t-N 正向建子卡、不吞父卡、子卡完成不轰炸主会话、父卡完成发唯一汇总回执', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v035-fanout-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const state = createEmptyBoard()
+    const mainDelivered = []
+    const mainAgent = {
+      id: 'main-1',
+      status: 'idle',
+      session: { id: 'main-1', header: { cwd: 'C:\\work\\demo', title: '主会话' } },
+      followup: (msg) => mainDelivered.push(msg),
+    }
+    state.config = normalizeConfig({ mainSessionId: 'main-1', mainSessionTitle: '主会话' })
+    const parent = deliveredPolledTask(state, NOW, { title: '重构认证与权限系统' })
+
+    const base = leadFixture()
+    const lead = base.lead
+    const listeners = {}
+    const ctx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => {
+        if (name === 'agents') {
+          return {
+            get: (id) => (id === 'main-1' ? mainAgent : id === lead.id ? lead : undefined),
+            roots: () => [mainAgent, lead],
+          }
+        }
+        return base.ctx.get(name)
+      },
+    }
+    const rt = fakeRuntime(state, ctx, filePath)
+    rt.leadAuto = createLeadAutoState()
+    registerLeadAutoHooks(ctx, rt)
+    const registered = []
+    registerTools({ tools: { register: (definition) => registered.push(definition) } }, rt)
+    const listTool = registered.find((tool) => tool.name === 'taskboard_list')
+    const updateTool = registered.find((tool) => tool.name === 'taskboard_update')
+
+    // 组长先把父卡 t-1 置 doing（留下 leadDispatchIntent）
+    noteLeadDispatchIntent(rt, lead, parent.id, NOW + 10)
+
+    // 1) 切片 1：行首写「父任务：t-1」，即使正文自然提到父任务 id 和父任务标题，也绝不误占父卡 t-1
+    const slice1Args = {
+      description: 't-1 切片 A · 认证中间件',
+      prompt: '父任务：t-1\n背景：本切片属于看板任务：t-1「重构认证与权限系统」，只改 auth.js，不要跨写域。',
+    }
+    const exec1 = { callId: 'call-s1', name: 'subagent', agent: lead, arguments: slice1Args }
+    const prep1 = prepareLeadDispatch(rt, { agent: lead, exec: exec1, args: slice1Args }, NOW + 20)
+    assert.equal(prep1.created, true, '显式声明 父任务：t-1 时必须新建独立子卡')
+    assert.equal(prep1.taskId, 't-2')
+    assert.equal(taskById(rt.state, 't-2').parentTaskId, 't-1')
+    listeners['tools/result'](exec1, { isError: false, value: { kind: 'activation', subagentId: 'worker-s1' } })
+
+    // 2) 切片 2：兼容旧写法（description 带 t-1，prompt 未写任务 id），同样自动关联 parentTaskId='t-1'
+    const slice2Args = {
+      description: 't-1 切片 B · 权限校验器',
+      prompt: '只改 rbac.js 并做单文件语法检查。',
+    }
+    const exec2 = { callId: 'call-s2', name: 'subagent', agent: lead, arguments: slice2Args }
+    const prep2 = prepareLeadDispatch(rt, { agent: lead, exec: exec2, args: slice2Args }, NOW + 30)
+    assert.equal(prep2.created, true)
+    assert.equal(prep2.taskId, 't-3')
+    assert.equal(taskById(rt.state, 't-3').parentTaskId, 't-1')
+    listeners['tools/result'](exec2, { isError: false, value: { kind: 'activation', subagentId: 'worker-s2' } })
+
+    // 3) 两个切片先后完成：subagent/end 同步把子卡置 done，但**绝不**向主会话发送碎片化完成回执！
+    listeners['subagent/end']({
+      id: 'worker-s1',
+      parentSessionId: 'lead-1',
+      stopReason: 'completed',
+      lastAssistantMessage: [{ type: 'text', text: 'auth.js 已完成' }],
+    })
+    // 验证同步完成：无需 await 下一个宏任务，内存与盘上状态已在 subagent/end 发射栈内变为 done
+    assert.equal(taskById(rt.state, 't-2').status, 'done', 'subagent/end 发射期同步完成 done 状态迁移，消除唤醒竞态')
+
+    await handleSubagentEnd(
+      rt,
+      {
+        id: 'worker-s2',
+        parentSessionId: 'lead-1',
+        stopReason: 'completed',
+        lastAssistantMessage: [{ type: 'text', text: 'rbac.js 已完成' }],
+      },
+      NOW + 100,
+    )
+    assert.equal(taskById(rt.state, 't-3').status, 'done')
+    assert.equal(mainDelivered.length, 0, '内部切片子卡完成不得唤醒主会话发半成品回执')
+
+    // 4) 组长通过 taskboard_list {parentTaskId:'t-1'} 精准查出两条子卡都已 done
+    const subList = await listTool.execute({ parentTaskId: 't-1' })
+    assert.equal(subList.count, 2)
+    assert.deepEqual(
+      subList.tasks.map((t) => [t.id, t.status, t.parentTaskId]),
+      [
+        ['t-2', 'done', 't-1'],
+        ['t-3', 'done', 't-1'],
+      ],
+    )
+
+    // 5) 合并验证阶段：即使组长漏写「父任务：t-1」而顺手写了「看板任务：t-1」，因为 t-1 已有子卡，也不会抢占父卡 t-1
+    const mergeArgs = {
+      description: '合并与全量测试',
+      prompt: '对看板任务：t-1 的两片改动跑全量集成测试',
+    }
+    const execMerge = { callId: 'call-merge', name: 'subagent', agent: lead, arguments: mergeArgs }
+    const prepMerge = prepareLeadDispatch(rt, { agent: lead, exec: execMerge, args: mergeArgs }, NOW + 200)
+    assert.equal(prepMerge.created, true, '已有子卡的父卡 t-1 不得被合并验证 worker 误抢占')
+    assert.equal(prepMerge.taskId, 't-4')
+    assert.equal(taskById(rt.state, 't-4').parentTaskId, 't-1')
+    listeners['tools/result'](execMerge, { isError: false, value: { kind: 'activation', subagentId: 'worker-merge' } })
+    await handleSubagentEnd(
+      rt,
+      {
+        id: 'worker-merge',
+        parentSessionId: 'lead-1',
+        stopReason: 'completed',
+        lastAssistantMessage: [{ type: 'text', text: '全量测试 300/300 通过' }],
+      },
+      NOW + 300,
+    )
+    assert.equal(mainDelivered.length, 0, '合并验证子卡同样不单独打扰主会话')
+
+    // 6) 组长最终把父卡 t-1 置为 done：主会话此时且仅此时收到 1 条完整汇总回执！
+    await updateTool.execute({ id: 't-1', status: 'done', result: '## 汇总验收\n- 认证与权限全部通过' })
+    assert.equal(mainDelivered.length, 1, '父卡完成时向主会话发送唯一一次汇总回执')
+    assert.match(mainDelivered[0].content[0].text, /t-1 重构认证与权限系统/)
+    assert.doesNotMatch(mainDelivered[0].content[0].text, /切片 A/, '回执里不混入内部切片子卡')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('v0.3.5 requeueTasksOfLead：组长归档失效时直接归档内部自动子卡，仅把顶层父任务重排回 todo', () => {
+  const state = createEmptyBoard()
+  const parent = deliveredPolledTask(state, NOW, { title: '顶层大任务' })
+  const sub = addTask(
+    state,
+    { title: 't-1 切片 A', sessionId: 'lead-1', cwd: 'C:\\work\\demo', parentTaskId: parent.id },
+    NOW + 10,
+  )
+  Object.assign(sub, {
+    status: 'doing',
+    dispatchedSessionId: 'lead-1',
+    autoDispatch: LEAD_AUTO_MARK,
+    workerRunState: 'running',
+  })
+
+  const requeued = requeueTasksOfLead(state, 'lead-1', NOW + 100)
+  assert.equal(requeued, 1, '只把顶层父任务计入重排队列')
+  assert.equal(parent.status, 'todo', '父任务回到待开始交给新组长')
+  assert.equal(sub.status, 'archived', '旧组长派出的半截自动子卡直接归档，防止被轮询器当成独立 todo 再派一遍')
 })
