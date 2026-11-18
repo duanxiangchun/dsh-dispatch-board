@@ -2342,3 +2342,22 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   没有硬性的 `dependsOn` / `batchParent` 字段。真实验证：重启后拿一个可拆任务，确认组长在同一轮
   派 ≥2 个 worker、父卡保持 doing、切片各自 done、合并/验证后父卡 done；对比 1 vs 3 worker 的墙钟
   与合并耗时，再决定并发上限。
+
+- v0.3.4（逻辑加固 + 看板视觉与交互升级）：
+  ① **派发闸门防误认领**：`canReuseMentionedTask`、`noteLeadDispatchIntent` / `takeLeadDispatchIntent`、
+    `findPendingDispatchCard` 均增加 `workerRunState` 守卫（`workerRunState === 'running'` 或 `needsUser === true`
+    的任务不可被后续验证子 Agent 或其它派发抢占；`workerRunState === 'failed'` 重派仍允许复用原卡）。
+  ② **并发 fan-out 切片防误吞与精确结算**：`dispatchMentionsTask` 在 `description` 含 `t-N` 且 `prompt` 不含
+    `t-N` 时直接返回 `false`（防止短父标题子串触发 `lead-intent` 吞掉切片卡）；`backfillWorkerSessionId` 改为倒序
+    查找同名 child 并优先选未绑定的 `childId`；`handleSubagentEnd` 在 `workerSessionId` 尚未回填时先按
+    `info.name` 或 `subagents.listDescendants(parentId)` 反查 `workerName` 匹配 `candidate.assignee`，支持多张
+    并发切片自动卡各自精确置 `done`。
+  ③ **模型工具同步与 `lastError` 开放**：`taskboard_update` 开放 `lastError` 字段（传空串可清空）；三个模型工具
+    `execute()` 入口统一调用 `reloadBoardIfStale(rt)`；`deliverBoardTask`、`answerTask`、`flushReceipts`
+    在 `await` 之后重新按 ID 从 `rt.state` 取任务引用；对齐 `presets/taskboard.patch.yml` 中并发切片与
+    `team_task_*` 的提示词规则。
+  ④ **客户端交互与视觉优化**：待开始列「全部派发」支持依次派发列内全部 `todo` 任务；手动「刷新」按钮补齐
+    `busy='refresh'` 状态；右栏 `BoardTab` 组长条计入 `needsUser` 任务的工作区；升级看板泳道底槽、卡片左侧
+    `3px` 状态色条、新建区卡片化表面与亮/暗色主题自适应样式。
+  测试：`test/host.test.mjs` **+4**、`test/client-render.test.mjs` **+1**，`node --test` **301 pass / 0 fail**
+  （v0.3.3 基线 296 → 301）。`package.json` 0.3.3 → 0.3.4。

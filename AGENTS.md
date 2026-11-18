@@ -55,7 +55,9 @@ node --test            # test/*.test.mjs 纯函数单测
 真实设备验证（verifier 负责）：安装到测试 profile → 起 3099 端口 → Playwright 打开看板 →
 加任务 → 等轮询 → 观察主 Agent 是否派发 → 子 Agent 回报 → 看板状态变化。
 
-## 发布
+## 发布与本地升级
+
+- **升级即升版（硬约定）**：每次功能/修复/样式升级（无论是推远端发版还是同步到本地 `$DSH_HOME` 验证），**必须先升 `package.json` 版本号**（并同步 `lib/client.js` 的 `PLUGIN_VERSION` 兜底值与 `docs/architecture.md` §9「变更记录」），本地静态插件目录按新版本号独立落盘（如 `$DSH_HOME/local-plugins/dsh-dispatch-board-<version>`）并更新 profile 链接，绝不直接覆盖旧版本目录，方便从看板页脚版本号与目录名一眼区分。
 
 版本在 `package.json`；变更点记在 `docs/architecture.md` §9「变更记录」。
 推 GitHub 时默认同时创建并推送 annotated tag `v<version>`（与 dsh-ollama-statistical 的约定一致）。
