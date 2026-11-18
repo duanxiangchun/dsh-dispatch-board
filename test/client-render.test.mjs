@@ -1058,7 +1058,7 @@ test('待你处理卡片：问题最多两行（.tb-needs-card-q 带 -webkit-lin
 test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boardPath，且没有「派发给」选择器', async () => {
   const harness = createHarness({ snapshot: makeSnapshot() })
   const BoardTab = harness.componentOf('sidebar.right.pane.tab')
-  const { tree } = await renderWide(BoardTab, { sessionId: SESSION_A })
+  const { tree, instance } = await renderWide(BoardTab, { sessionId: SESSION_A })
 
   assert.equal(tree.props['data-narrow'], 'false')
   assert.equal(tree.props['data-layout'], 'wide')
@@ -1083,11 +1083,16 @@ test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boar
   assert.ok(includesText(tree, '看板数据保存在本机'))
   assert.ok(includesText(tree, 'v0.1.0'))
 
-  // 「派发给」（按会话选目标）已被删除；现在只有轮询间隔 + 派发方式（新对话/回发起/空闲）两个选择器
-  const selects = collect(tree).filter((node) => node.type === 'select')
-  assert.equal(selects.length, 2, 'poll-interval + dispatch-mode selects')
+  // v0.3.7：顶部栏不再直接放「间隔」「派发到」下拉，全部收进「设置」面板
+  assert.equal(collect(tree).filter((node) => node.type === 'select').length, 0, '设置面板收起时右栏看板无下拉框')
+  const settingsBtn = buttons(tree).find((node) => textOf(node).trim() === '设置')
+  assert.ok(settingsBtn, '顶部栏提供「设置」按钮')
+  settingsBtn.props.onClick()
+  const expanded = await instance.run()
+  const selects = collect(expanded).filter((node) => node.type === 'select')
+  assert.equal(selects.length, 2, 'poll-interval + dispatch-mode selects inside settings panel')
   const dispatchSelect = selects.find((node) => node.props['aria-label'] === '派发到')
-  assert.ok(dispatchSelect, 'dispatch-mode select must render')
+  assert.ok(dispatchSelect, 'dispatch-mode select must render inside settings panel')
   const modeValues = collect(dispatchSelect)
     .filter((node) => node.type === 'option')
     .map((node) => node.props.value)
@@ -1095,8 +1100,8 @@ test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boar
   assert.deepEqual(modeValues, ['workspace-lead', 'new', 'creator', 'auto'])
   assert.equal(dispatchSelect.props.value, 'workspace-lead', 'default dispatch mode is workspace-lead')
   assert.ok(includesText(dispatchSelect, '工作区组长（推荐）'))
-  assert.ok(!includesText(tree, '派发给'), 'the old per-session dispatch-target selector must be gone')
-  assert.ok(includesText(tree, '加进「待开始」后由主 Agent 自动接手'), 'composer shows the auto hint')
+  assert.ok(!includesText(expanded, '派发给'), 'the old per-session dispatch-target selector must be gone')
+  assert.ok(includesText(expanded, '加进「待开始」后由主 Agent 自动接手'), 'composer shows the auto hint')
 })
 
 test('BoardTab：工作区未知（无 sessionId / 历史会话）时给说明条并显示空看板', async () => {
@@ -3267,8 +3272,12 @@ test('组长条：workspace-lead 三个新 skip reason 有中文映射', async (
 
 test('派发模式：config 缺 dispatchMode 时选择器回退 workspace-lead，不是 new', async () => {
   const harness = createHarness({ snapshot: makeSnapshot({ config: { pollEnabled: true, pollIntervalMs: 15000 } }) })
-  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
-  const select = selectByAria(tree, '派发到')
+  const { tree, instance } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  const settingsBtn = buttons(tree).find((node) => textOf(node).trim() === '设置')
+  assert.ok(settingsBtn)
+  settingsBtn.props.onClick()
+  const expanded = await instance.run()
+  const select = selectByAria(expanded, '派发到')
   assert.ok(select)
   assert.equal(select.props.value, 'workspace-lead')
   assert.ok(includesText(select, '工作区组长（推荐）'))
