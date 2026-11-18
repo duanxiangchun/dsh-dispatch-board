@@ -3259,6 +3259,7 @@ test('组长条：leads 变化不 bump revision 也要在轮询后更新（运�
 test('组长条：workspace-lead 三个新 skip reason 有中文映射', async () => {
   const cases = [
     ['lead-busy', '工作区组长正在运行，等它空下来再派'],
+    ['lead-worker-busy', '本工作区已有任务正在执行或待组长验收，完成后再自动派发下一条'],
     ['lead-unavailable', '工作区组长不可用：稍后重试，或在看板点「创建组长」'],
     ['lead-no-workspace', '无法解析任务的工作区：请从目标工作区的会话里重新加这条任务'],
   ]

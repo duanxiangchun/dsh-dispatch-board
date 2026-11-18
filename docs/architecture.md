@@ -159,10 +159,11 @@ v0.2.0 的默认派发方式。目标不是「某个会话」，而是**任务�
    用工作区 id；否则用 `normalizePathForCompare(cwd)`。key 同时是 `config.workspaceLeads` 的键与
    `snapshot.leads.workspaces[].key`。
 4. **复用已有组长**：`config.workspaceLeads[key]` 存在 → 取 `sessionId`：
-   - `agents.get(sessionId)` 拿到 live agent 且 `status === 'idle'` → 投递；
+   - `agents.get(sessionId)` 拿到 live agent 且 `status === 'idle'`，同时该工作区**没有正在后台跑 worker 或待组长验收/合并的任务**（`hasActiveWorkspaceExecution` 为 `false`，v0.3.9；`needsUser` 挂起任务与已 `failed` 的孤立自动卡不阻塞）→ 投递；
    - live agent 但 `status === 'running'` → 跳过该任务（保持 `todo`、写 `lastError`、
      `poll.lastSkipReason='lead-busy'`），继续试下一条候选；
-   - 没有 live agent → 尝试 `sessionController.resolveAgent(sessionId)` 唤醒：成功则按上一条判忙闲；
+   - live agent `idle` 但该工作区仍有后台 worker 正在运行或待组长验收（`hasActiveWorkspaceExecution` 为 `true`，`options.force !== true`）→ 跳过该任务（保持 `todo`、写 `lastError`、`poll.lastSkipReason='lead-worker-busy'`），等前一条做完再自动派下一条，防止同工作区多任务连环撞车；
+   - 没有 live agent → 尝试 `sessionController.resolveAgent(sessionId)` 唤醒：成功则按上两条判忙闲；
      失败 → 跳过（`lead-unavailable`）。**tick 里不自动重建已有映射**，修复走 `ensure-workspace-lead`（§3.1.1）。
 5. **懒创建**：没有映射 → 先算 `workspaceId = workspaceIdForCwd(cwd)`，非空时
    `sessionController.create({workspaceId, agentPreset:'taskboard-dispatch'})`；**这次 create 抛错**
@@ -194,6 +195,7 @@ v0.2.0 的默认派发方式。目标不是「某个会话」，而是**任务�
 | reason | 场景 | `lastError` 文案（宿主写入，详情浮层「最近错误」显示） |
 | --- | --- | --- |
 | `lead-busy` | 组长会话正在跑 | `工作区组长正在运行，等它空下来再派` |
+| `lead-worker-busy` | 组长对话空闲，但该工作区已有任务正在跑后台 worker 或待组长验收/合并（v0.3.9） | `本工作区已有任务正在执行或待组长验收，完成后再自动派发下一条` |
 | `lead-unavailable` | 组长离线 / 唤醒失败 / 创建失败 | `工作区组长不可用：稍后重试，或在看板点「创建组长」` |
 | `lead-no-workspace` | 任务解析不出工作区 | `无法解析任务的工作区：请从目标工作区的会话里重新加这条任务` |
 
@@ -340,8 +342,7 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
    其它工具 / worker 预设 / 普通会话的 `subagent` 调用一律 `next()` 放行（不拦截、不建卡）。
 2. **一次性消费**「组长把轮询投递任务置 doing」的意图（`noteLeadDispatchIntent`，进程内 Map）：
    即使这次靠显式任务 id 认领也清掉——否则陈旧意图会在下一次无关的直聊派活里把旧任务认领走。
-2b. **显式子卡声明优先（v0.3.5）**：若 prompt 行首显式声明 `父任务：t-N` / `父卡：t-N`，且 `t-N` 在看板中存在且未归档，
-   本次派发直接判定为 `t-N` 的子卡（跳过第 3 / 3b / 4 步的父卡认领，进入第 5 步同参幂等去重或第 6 步新建带 `parentTaskId='t-N'` 的自动子卡）。
+2b. **显式子卡声明与失败子卡复用（v0.3.5；v0.3.9 加固）**：若 prompt 行首同时或单独显式声明 `任务 id：t-K`（且 `t-K` 不等于 `父任务：t-N`），说明组长明确指定复用/接管既有卡或失败子卡 `t-K` → 直接进入第 3 步复用 `t-K`（不另建僵尸卡）；否则若行首显式声明 `父任务：t-N` / `父卡：t-N` 且 `t-N` 存在未归档，本次派发判定为 `t-N` 的新建子卡（跳过第 3 / 3b / 4 步的父卡认领，进入第 5 步同参幂等去重或第 6 步新建带 `parentTaskId='t-N'` 的自动子卡）。
 3. prompt 行首显式声明 `任务 id：t-N` / `- 任务 id: \`t-N\``，且该任务存在、状态不是 `archived`
    → **复用**这条卡片（正常「轮询 → 组长 → worker」链路、返工重派都靠它）。
    **任务 id 行接受 markdown 强调 / 反引号 / 半角冒号等常见变体**（0.2.4，t-78 事故）：匹配前逐行归一
@@ -404,7 +405,7 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 | 其它 / 缺省 `stopReason`（`error` / `aborted` / `max-tokens` / `refusal` / 缺字段 / 未知值）且任务 `doing` | 任务**保持 `doing`**，`lastError` = `worker 结束（<stopReason>）：<结论首行或「没有返回结论」>`，交给组长 / 用户处理；**不写** `leadAuto.lastError`（那只记挂钩自身异常）。`stopReason` 缺失时文案里的 `<stopReason>` 写 `unknown`。v0.2.9 起**保留 `workerSessionId` 与 `assignee`**，只把 `workerRunState='failed'`——看板「对话」仍会先试这个 worker 会话，打不开时给可见回退提示（§5.3） |
 | 其它 / 缺省 `stopReason` 且任务已是 `done` | 不动（组长已审；worker 的失败不推翻结论），`leadAuto.skipped++` |
 | 任务 `archived` / `todo` | 不动（不改状态、不写结论），`leadAuto.skipped++` |
-| 任务没有 `autoDispatch === 'lead-dispatch'` 标记（= 轮询投递任务 / 人工任务，`notifiedAt` 非空） | **绝不自动置 `done`**：忽略（`reason='not-auto'` / `no-task`），组长审核后自己 `taskboard_update` |
+| 任务没有 `autoDispatch === 'lead-dispatch'` 标记（= 轮询投递任务 / 人工任务，`notifiedAt` 非空） | **绝不自动置 `done`**：返回 `reason='not-auto'` / `no-task`，组长审核后自己 `taskboard_update`；但若该卡 `workerRunState === 'running'` 且匹配结束的 worker（v0.3.9），宿主会同步将其 `workerRunState` 收敛为 `'ended'` / `'failed'`（任务进入 `done` / `archived` 或读盘归一化时同样将残留 `'running'` 收敛为 `'ended'`） |
 | 找不到任务（且 `parentSessionId` 兜底不唯一 / 没有 parent） | 忽略（无关子 Agent） |
 
 **找不到任务时的兜底（v0.3.1）**：worker 的 `workerSessionId` 可能还没回填（当前 dsh 的 activation
@@ -2405,3 +2406,9 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 - v0.3.8（精简顶部标题区：移除标题下方的轮询状态副标题）：
   移除右栏看板（`BoardTab`）与平台看板（`PlatformBoard`）顶部标题「任务看板」下方的 `.tb-sub` 轮询状态副标题（`· 工作区 · 每 15s 轮询 · 上次检查 ...`），使看板顶栏更加干净利落。
   `package.json` 0.3.7 → 0.3.8。
+
+- v0.3.9（修复实战派发串行度、轮询任务 `workerRunState` 残留与失败子卡接管）：
+  ① **同工作区后台执行串行保护（`hasActiveWorkspaceExecution` + `lead-worker-busy`）**：`routeWorkspaceLead` 在组长对话 `idle` 时继续检查该工作区是否已有 `doing` 任务正在跑后台 worker 或处于组长待验收/合并阶段（排除 `needsUser` 等待回复任务与已 `failed` 自动卡，带 30 分钟陈旧兜底）；若有则保持后续 `todo` 任务在待开始列排队（写 `lead-worker-busy`），防止组长一结束派单轮次就把同工作区多条任务连环强塞进 `doing` 撞车（手动「立即派发 `force:true`」仍可强插）。
+  ② **轮询任务与终态 `workerRunState` 收敛**：`handleSubagentEnd` 对不带 `autoDispatch` 的轮询/人工任务仍不自动置 `done`，但会同步将其匹配的 `workerRunState:'running'` 收敛为 `'ended'` / `'failed'`；`applyTaskUpdate(done/archived)`、`archiveDoneTasks` 与 `normalizeTask` 读盘归一化同步将终态任务上残留的 `'running'` 收敛为 `'ended'`。
+  ③ **失败子卡续做直接复用接管（消除僵尸 `doing` 子卡）**：`prepareLeadDispatch` 允许显式 `任务 id：t-子卡`（即使同时带 `父任务：t-N`）优先复用并覆盖接管失败子卡；`presets/taskboard.patch.yml` 补充「worker 会话爆上下文/报错不可恢复需换新 worker 续做时，行首写 `任务 id：t-子卡` 复用原卡或先归档废卡，且超大文件点名行区间读取」纪律。
+  `package.json` 0.3.8 → 0.3.9。

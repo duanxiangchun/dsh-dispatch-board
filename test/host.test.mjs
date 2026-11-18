@@ -69,6 +69,7 @@ import {
   handleHttp,
   handleSubagentDispatch,
   handleSubagentEnd,
+  hasActiveWorkspaceExecution,
   hostnameOfHostHeader,
   inspectPresets,
   isAbsoluteWorkspacePath,
@@ -6795,6 +6796,220 @@ test('v0.3.6 archiveRetentionMinutes：normalizeConfig 校验、0=不自动删�
     assert.equal(body.result.ok, true)
     assert.equal(body.result.value.config.archiveRetentionMinutes, 5)
     assert.equal(rt.state.tasks.length, 0, '调短保留分钟数后立即清理已过期的归档任务')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * v0.3.9：实战派发串行度、轮询任务 workerRunState 收敛与失败子卡接管
+ * ------------------------------------------------------------------ */
+
+test('v0.3.9 同工作区串行保护：组长 idle 但有后台 running worker / 待验收轮询卡时保持后续 todo 排队，不阻断其它工作区，force 可强插', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v039-serial-'))
+  try {
+    const baseNow = Date.now()
+    const state = createEmptyBoard()
+    state.config = normalizeConfig({
+      dispatchMode: 'workspace-lead',
+      workspaceLeads: {
+        'w-a': { sessionId: 'lead-a', title: '', cwd: 'C:\\work\\a', createdAt: new Date(baseNow).toISOString() },
+        'w-b': { sessionId: 'lead-b', title: '', cwd: 'C:\\work\\b', createdAt: new Date(baseNow).toISOString() },
+      },
+    })
+    const t1 = addTask(state, { title: '拆仓迁移先行', cwd: 'C:\\work\\a' }, baseNow)
+    const t2 = addTask(state, { title: '依赖迁移的后续任务', cwd: 'C:\\work\\a' }, baseNow + 1)
+    const tOtherWs = addTask(state, { title: '另一工作区任务', cwd: 'C:\\work\\b' }, baseNow + 2)
+
+    const deliveredA = []
+    const deliveredB = []
+    const leadA = {
+      id: 'lead-a',
+      status: 'idle',
+      session: { id: 'lead-a', header: { cwd: 'C:\\work\\a' } },
+      followup: (msg) => deliveredA.push(msg),
+    }
+    const leadB = {
+      id: 'lead-b',
+      status: 'idle',
+      session: { id: 'lead-b', header: { cwd: 'C:\\work\\b' } },
+      followup: (msg) => deliveredB.push(msg),
+    }
+    const agents = {
+      get: (id) => (id === 'lead-a' ? leadA : id === 'lead-b' ? leadB : undefined),
+      roots: () => [leadA, leadB],
+    }
+    const registry = {
+      list: () => [
+        { id: 'w-a', path: 'C:\\work\\a', title: 'a' },
+        { id: 'w-b', path: 'C:\\work\\b', title: 'b' },
+      ],
+    }
+    const ctx = {
+      get: (name) =>
+        name === 'agents'
+          ? agents
+          : name === 'workspaceRegistry'
+            ? registry
+            : name === 'agentPresets'
+              ? { presetForSession: () => 'taskboard-dispatch' }
+              : undefined,
+    }
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+
+    // 1) 首轮投递 t1 到工作区 A，组长派出后台 worker 后自身回到 idle，但 t1.workerRunState='running'
+    const tick1 = await tick(rt, {})
+    assert.equal(tick1.dispatched, true)
+    assert.equal(tick1.task.id, t1.id)
+    const exec1 = { callId: 'c1', name: 'subagent', agent: leadA, arguments: { prompt: '任务 id：' + t1.id } }
+    prepareLeadDispatch(rt, { agent: leadA, exec: exec1, args: exec1.arguments }, Date.now())
+    handleSubagentDispatch(rt, { agent: leadA, childId: 'worker-migrate', args: exec1.arguments, exec: exec1 }, Date.now())
+    assert.equal(t1.workerRunState, 'running')
+    assert.equal(hasActiveWorkspaceExecution(rt.state, 'lead-a', 'C:\\work\\a', Date.now()), true)
+
+    // 2) 第二轮 tick：leadA 虽然 idle，但 t1 后台 worker 仍在跑 → 跳过 t2（记 lead-worker-busy），继续投递空闲工作区 B 的任务
+    const tick2 = await tick(rt, {})
+    assert.equal(tick2.dispatched, true)
+    assert.equal(tick2.task.id, tOtherWs.id, 'A 工作区后台忙不应阻塞 B 工作区')
+    assert.equal(t2.status, 'todo', '同工作区后续任务保持在 todo 排队，不连环撞车')
+    assert.match(t2.lastError, /本工作区已有任务正在执行/)
+
+    // 3) t1 的后台 worker 完成（subagent/end 将轮询卡收敛为 ended），但组长尚未审核置 done → 仍保护不乱塞 t2
+    await handleSubagentEnd(rt, { id: 'worker-migrate', stopReason: 'completed' }, Date.now())
+    assert.equal(t1.status, 'doing')
+    assert.equal(t1.workerRunState, 'ended')
+    const tick3 = await tick(rt, {})
+    assert.equal(tick3.dispatched, false)
+    assert.equal(tick3.reason, 'lead-worker-busy')
+    assert.equal(t2.status, 'todo')
+
+    // 4) 孤立 failed 自动卡不会永久卡死工作区；组长把 t1 置 done 后，下一轮自动派发 t2
+    const deadSlice = addTask(state, { title: '历史失败切片', cwd: 'C:\\work\\a', source: 'agent' }, Date.now())
+    deadSlice.status = 'doing'
+    deadSlice.autoDispatch = LEAD_AUTO_MARK
+    deadSlice.dispatchedSessionId = 'lead-a'
+    deadSlice.workerRunState = 'failed'
+    applyTaskUpdate(rt.state, t1.id, { status: 'done', result: '迁移完成' }, Date.now())
+    assert.equal(hasActiveWorkspaceExecution(rt.state, 'lead-a', 'C:\\work\\a', Date.now()), false)
+
+    const tick4 = await tick(rt, {})
+    assert.equal(tick4.dispatched, true)
+    assert.equal(tick4.task.id, t2.id, 't1 验收完成后自动派发排队的 t2')
+    assert.equal(t2.status, 'doing')
+
+    // 5) 手动「立即派发」（force:true）仍可在工作区有后台 worker 时强行插队
+    t2.workerRunState = 'running'
+    const t3 = addTask(state, { title: '紧急强插任务', cwd: 'C:\\work\\a' }, Date.now())
+    const forced = await tick(rt, { taskId: t3.id, force: true })
+    assert.equal(forced.dispatched, true)
+    assert.equal(t3.status, 'doing')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('v0.3.9 轮询任务与终态 workerRunState 收敛：subagent/end、done/archived 与读盘自动收敛残留 running', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v039-worker-state-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+
+    // 1) 轮询任务通过 workerName 占位（尚未回填 workerSessionId）时，subagent/end 收敛 workerRunState 并回填 id，但不自动置 done
+    const polled = addTask(state, { title: '轮询任务状态收敛', cwd: 'C:\\work\\demo' }, NOW)
+    polled.status = 'doing'
+    polled.notifiedAt = new Date(NOW).toISOString()
+    polled.dispatchedSessionId = 'lead-1'
+    polled.assignee = 't111-questions'
+    polled.workerRunState = 'running'
+
+    const CHILD_UUID = 'da3c3358-51b8-44ce-96fb-f90c0c29b15b'
+    const endRes = await handleSubagentEnd(
+      rt,
+      { id: CHILD_UUID, parentSessionId: 'lead-1', name: 't111-questions', stopReason: 'completed' },
+      NOW + 100,
+    )
+    assert.equal(endRes.updated, false, '轮询任务仍不自动置 done')
+    assert.equal(polled.status, 'doing')
+    assert.equal(polled.workerSessionId, CHILD_UUID, '顺带回填 workerSessionId')
+    assert.equal(polled.workerRunState, 'ended', 'workerRunState 从 running 收敛为 ended')
+
+    // 2) applyTaskUpdate 置 done / archived 时，残留 running 自动收敛为 ended
+    const manualDone = addTask(state, { title: '手动收尾卡', cwd: 'C:\\work\\demo' }, NOW + 200)
+    applyTaskUpdate(state, manualDone.id, { status: 'doing' }, NOW + 201)
+    manualDone.workerRunState = 'running'
+    applyTaskUpdate(state, manualDone.id, { status: 'done', result: 'ok' }, NOW + 202)
+    assert.equal(manualDone.workerRunState, 'ended')
+
+    // 3) 读盘 normalizeBoard：历史 board.json 中 status='done' 但 workerRunState='running'（如 t-111）读入后自动收敛为 ended
+    const { state: loaded } = normalizeBoard({
+      version: 1,
+      tasks: [{ id: 't-111', title: '历史残留', status: 'done', workerSessionId: CHILD_UUID, workerRunState: 'running' }],
+    })
+    assert.equal(loaded.tasks[0].workerRunState, 'ended')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('v0.3.9 失败切片子卡续做接管：prompt 同时带「任务 id：t-子卡」与「父任务：t-父卡」时直接复用原失败子卡，不留僵尸卡', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v039-slice-takeover-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+    const parent = addTask(state, { title: 'CSV 参数化总任务', cwd: 'C:\\work\\demo' }, NOW)
+    applyTaskUpdate(state, parent.id, { status: 'doing' }, NOW + 1)
+
+    // 第一次派切片 B（t-2），worker 爆上下文报错中断（status='doing', workerRunState='failed'）
+    const args1 = {
+      description: parent.id + ' 切片 B · 主进程',
+      prompt: '父任务：' + parent.id + '\n负责 src/main/backend/**',
+    }
+    const exec1 = { callId: 'slice-b-1', name: 'subagent', agent: lead, arguments: args1 }
+    const gate1 = prepareLeadDispatch(rt, { agent: lead, exec: exec1, args: args1 }, NOW + 10)
+    assert.equal(gate1.created, true)
+    const sliceId = gate1.taskId
+    handleSubagentDispatch(rt, { agent: lead, childId: 'worker-b-dead', workerName: 'csv-b-1', args: args1, exec: exec1 }, NOW + 11)
+    await handleSubagentEnd(rt, { id: 'worker-b-dead', stopReason: 'error' }, NOW + 20)
+    const sliceCard = findTask(rt.state, sliceId)
+    assert.equal(sliceCard.status, 'doing')
+    assert.equal(sliceCard.workerRunState, 'failed')
+    assert.match(sliceCard.lastError, /worker 结束（error）/)
+
+    // 组长换新 worker 接手续做切片 B：prompt 同时写「任务 id：t-2」和「父任务：t-1」
+    const args2 = {
+      description: parent.id + ' 切片 B · 续做',
+      prompt: '任务 id：' + sliceId + '\n父任务：' + parent.id + '\n从上次中断处继续完成剩余部分',
+    }
+    const exec2 = { callId: 'slice-b-2', name: 'subagent', agent: lead, arguments: args2 }
+    const gate2 = prepareLeadDispatch(rt, { agent: lead, exec: exec2, args: args2 }, NOW + 30)
+    assert.equal(gate2.created, false, '必须复用失败子卡，绝不另建僵尸卡')
+    assert.equal(gate2.reused, 'task-id')
+    assert.equal(gate2.taskId, sliceId)
+    assert.equal(rt.state.tasks.length, 2, '看板上仍然只有 1 张父卡 + 1 张切片子卡')
+
+    handleSubagentDispatch(rt, { agent: lead, childId: '', workerName: 'csv-b-2', args: args2, exec: exec2 }, NOW + 31)
+    assert.equal(sliceCard.assignee, 'csv-b-2')
+    assert.equal(sliceCard.workerSessionId, null)
+    assert.equal(sliceCard.workerRunState, 'running')
+    assert.equal(sliceCard.lastError, '')
+
+    await handleSubagentEnd(
+      rt,
+      {
+        id: 'worker-b-ok',
+        parentSessionId: 'lead-1',
+        name: 'csv-b-2',
+        stopReason: 'completed',
+        lastAssistantMessage: [{ type: 'text', text: '续做完成并通过测试' }],
+      },
+      NOW + 40,
+    )
+    assert.equal(sliceCard.status, 'done')
+    assert.equal(sliceCard.workerSessionId, 'worker-b-ok')
+    assert.equal(sliceCard.workerRunState, 'ended')
+    assert.equal(sliceCard.parentTaskId, parent.id)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
