@@ -2580,3 +2580,11 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
     `test/client-bind-writeback.test.mjs` 去掉已删除的 `needsUserTasks` bind 字段；
     `node --test` **333 pass / 0 fail**（v0.5.3 基线 329 → 333）。
   ④ `package.json` 0.5.3 → 0.5.4（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）；README 同步一句。
+- v0.5.5（组长提示词补「复用优先」的 token 经济规则）：
+  ① `presets/taskboard.patch.yml` 增加一段：同一张卡的返工、补充要求、同一批文件的后续小步，优先 `send_message`
+    复用原 worker（省一次重读；本仓库对照实验：同一段代码的追问答，复用组成本约为新开组的 1/8，整条任务约省 40%）；
+    独立任务 / 并行切片 / 原 worker 上下文过载时才新开。
+  ② `package.json` 0.5.4 → 0.5.5（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。
+- v0.5.6（窄栏看板头部一行化）：右栏看板在窄布局（`data-narrow=true`）下不再把标题与操作按钮拆成两行——
+  `.tb-head` 保持单行 flex（`align-items:center`），`.tb-head-side` 按钮间距收紧到 6px，空间不够时自动折行；
+  平台看板头部不变。`package.json` 0.5.5 → 0.5.6（`PLUGIN_VERSION` 兜底值同步）。
