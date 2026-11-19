@@ -1066,6 +1066,7 @@ test('taskBrief output stays inside the closed tool output schemas', () => {
     'assignee',
     'dependsOn',
     'id',
+    'lastError',
     'needsUser',
     'note',
     'parentTaskId',
@@ -1091,6 +1092,8 @@ test('taskBrief output stays inside the closed tool output schemas', () => {
   assert.equal(brief.needsUser, true)
   assert.equal(brief.question, '选哪个方案？')
   assert.deepEqual(brief.questionOptions, ['方案 A', '方案 B'])
+  // v0.5.2：异常原因（worker aborted / 合入冲突）必须进工具输出，否则外部只看得到卡片卡在 doing。
+  assert.equal(brief.lastError, 'keep me', 'lastError 必须在 taskBrief 里可见（v0.5.2）')
 
   // 单任务输出（taskboard_add / taskboard_update）与列表输出（taskboard_list，含 items）
   assert.deepEqual(schemaProblems({ task: brief }, TASK_ONE_OUTPUT_SCHEMA), [])
@@ -7484,4 +7487,312 @@ test('v0.5.1 组长与 Worker 汇报风格约束：去除强制表格与八股�
   const dispatchMsg = buildDispatchText(task, NOW)
   assert.match(dispatchMsg, /必须简短说人话/)
   assert.doesNotMatch(dispatchMsg, /一段大白话在详情里很难读/)
+})
+
+
+/* ------------------------------------------------------------------ *
+ * v0.5.2：异常可见化（lastError 进工具输出）+ 卡住卡一次性提醒 +
+ *         兜底认领放宽 + 显式主工作区指令
+ * ------------------------------------------------------------------ */
+
+test('v0.5.2 taskBrief / taskboard_list / taskboard_update 都渲染「最近异常」，清空后不再出现', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v052-lasterror-render-'))
+  try {
+    const filePath = join(dir, 'board.json')
+    const state = createEmptyBoard()
+    const task = addTask(state, { title: '被中断的 worker', cwd: 'C:\\work' }, NOW)
+    task.status = 'doing'
+    task.autoDispatch = LEAD_AUTO_MARK
+    task.lastError = 'worker 结束（aborted）：没有返回结论'
+    commitBoard(state, filePath)
+    const { ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, filePath)
+    const registered = []
+    registerTools({ tools: { register: (definition) => registered.push(definition) } }, rt)
+    const listTool = registered.find((tool) => tool.name === 'taskboard_list')
+    const updateTool = registered.find((tool) => tool.name === 'taskboard_update')
+
+    const listed = await listTool.execute({})
+    assert.equal(listed.tasks[0].lastError, task.lastError)
+    assert.deepEqual(schemaProblems(listed, TASK_LIST_OUTPUT_SCHEMA), [])
+    assert.match(listTool.output.render({}, listed)[0].text, /最近异常：worker 结束（aborted）：没有返回结论/)
+
+    const updated = await updateTool.execute({ id: task.id, result: '仍在处理' })
+    assert.equal(updated.task.lastError, task.lastError)
+    assert.deepEqual(schemaProblems(updated, TASK_ONE_OUTPUT_SCHEMA), [])
+    assert.match(updateTool.output.render({}, updated)[0].text, /最近异常：worker 结束（aborted）/)
+
+    // 清空（组长 / 用户处理完）后，工具输出里不再出现这一行
+    await updateTool.execute({ id: task.id, lastError: '' })
+    const cleared = await listTool.execute({})
+    assert.equal(cleared.tasks[0].lastError, '')
+    assert.ok(!listTool.output.render({}, cleared)[0].text.includes('最近异常'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('v0.5.2 reconcileOrphanedDoingTasks：worker 已结束但卡片仍在 doing → 组长 idle 时一次性提醒，绝不自动改状态', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v052-stuck-'))
+  try {
+    const now = Date.now()
+    const state = createEmptyBoard()
+    const stuck = addTask(state, { title: '被中断的直聊任务', cwd: 'C:\\work\\a', source: 'agent' }, now - 120_000)
+    stuck.status = 'doing'
+    stuck.autoDispatch = LEAD_AUTO_MARK
+    stuck.sessionId = 'lead-stuck'
+    stuck.dispatchedSessionId = 'lead-stuck'
+    stuck.workerSessionId = 'w-stuck'
+    stuck.workerRunState = 'failed'
+    stuck.lastError = 'worker 结束（aborted）：没有返回结论'
+    stuck.updatedAt = new Date(now - 120_000).toISOString()
+
+    const alerts = []
+    const lead = {
+      id: 'lead-stuck',
+      status: 'idle',
+      session: { id: 'lead-stuck', header: { cwd: 'C:\\work\\a' } },
+      followup: (msg) => alerts.push(msg),
+    }
+    const ctx = {
+      get: (name) => {
+        if (name === 'agents') return { get: (id) => (id === 'lead-stuck' ? lead : undefined), roots: () => [lead] }
+        if (name === 'subagents') return { listDescendants: async () => [] }
+        return undefined
+      },
+    }
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+
+    const first = await reconcileOrphanedDoingTasks(rt, { startup: false, now })
+    assert.equal(first.reminded, 1)
+    assert.equal(stuck.status, 'doing', '卡住提醒绝不自动改状态')
+    assert.equal(stuck.workerRunState, 'failed', '卡住提醒不动 workerRunState')
+    assert.equal(alerts.length, 1, '组长 idle 时收到一条卡住提醒')
+    const text = alerts[0].content[0].text
+    assert.match(text, /【任务看板 · 卡住提醒】/)
+    assert.match(text, new RegExp(stuck.id))
+    assert.match(text, /worker 已结束（failed）/)
+    assert.match(text, /worker 结束（aborted）/)
+    assert.match(text, /taskboard_update/)
+    assert.match(text, /宿主不会自动改状态/)
+
+    // 同一次卡住状态不重复提醒（内存 Set 去重）
+    const second = await reconcileOrphanedDoingTasks(rt, { startup: false, now: now + 1000 })
+    assert.equal(second.reminded, 0)
+    assert.equal(alerts.length, 1, '同一次卡住状态只提醒一次')
+
+    // 组长忙 / 不在线时不发、也不标记已提醒；下次 idle 仍会提醒
+    lead.status = 'running'
+    const busy = await reconcileOrphanedDoingTasks(rt, { startup: false, now: now + 2000 })
+    assert.equal(busy.reminded, 0)
+    assert.equal(alerts.length, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('v0.5.2 shouldSkipWorktreeForDispatch：识别显式「主工作区」指令，且不误伤否定对象不同的句子', () => {
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '显式主工作区小活', cwd: 'C:\\work\\a' }, NOW)
+
+  const skip = [
+    '不建隔离工作树，直接改 src/a.js',
+    '不要建隔离工作树',
+    '不要隔离工作树',
+    '不要使用隔离工作树',
+    '这轮无需创建隔离工作树',
+    '直接改主工作区里的 src/a.js',
+    '直接修改主仓库',
+    '这条在主工作区执行',
+    '在主工作区里改 src/a.js',
+  ]
+  for (const prompt of skip) {
+    assert.equal(shouldSkipWorktreeForDispatch(state, task, { description: '', prompt }), true, '必须留在主工作区：' + prompt)
+  }
+  assert.equal(
+    shouldSkipWorktreeForDispatch(state, task, { description: '直接改主工作区', prompt: '普通任务' }),
+    true,
+    'description 里的显式指令同样生效',
+  )
+  assert.equal(
+    shouldSkipWorktreeForDispatch(state, task, { description: '[主工作区] 修一下', prompt: '' }),
+    true,
+    'description 的 [主工作区] 前缀照样跳过隔离',
+  )
+  assert.equal(
+    shouldSkipWorktreeForDispatch(state, task, { description: '', prompt: '[主工作区]\n改 src/a.js' }),
+    true,
+    'prompt 的 [主工作区] 前缀照样跳过隔离',
+  )
+
+  // 否定对象是「删除 / 装依赖」而不是「隔离工作树」→ 仍然隔离，不能把活拉回主工作区并发踩踏。
+  const isolate = [
+    '不要删除隔离工作树里的文件，只改 src/a.js',
+    '不要在隔离工作树里安装依赖',
+    '不要动隔离工作树里的 node_modules',
+    '普通重构任务，只改 src/b.js',
+  ]
+  for (const prompt of isolate) {
+    assert.equal(shouldSkipWorktreeForDispatch(state, task, { description: '', prompt }), false, '仍应隔离：' + prompt)
+  }
+})
+
+test('v0.5.2 handleSubagentEnd 兜底认领：workerRunState 为 null / ended 且 workerSessionId 未回填的自动卡也能收尾；认领失败留下告警', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-v052-claim-'))
+  try {
+    const state = createEmptyBoard()
+    const nullCard = addTask(state, { title: '运行态还是 null 的自动卡', cwd: 'C:\\work\\a', source: 'agent' }, NOW)
+    nullCard.status = 'doing'
+    nullCard.autoDispatch = LEAD_AUTO_MARK
+    nullCard.sessionId = 'lead-fb'
+    nullCard.dispatchedSessionId = 'lead-fb'
+    nullCard.assignee = 'wa'
+    nullCard.workerSessionId = null
+    nullCard.workerRunState = null
+
+    const endedCard = addTask(state, { title: '运行态已 ended 的自动卡', cwd: 'C:\\work\\a', source: 'agent' }, NOW + 1)
+    endedCard.status = 'doing'
+    endedCard.autoDispatch = LEAD_AUTO_MARK
+    endedCard.sessionId = 'lead-fb'
+    endedCard.dispatchedSessionId = 'lead-fb'
+    endedCard.assignee = 'wb'
+    endedCard.workerSessionId = ''
+    endedCard.workerRunState = 'ended'
+
+    const { ctx } = leadFixture()
+    const rt = fakeRuntime(state, ctx, join(dir, 'board.json'))
+
+    const first = await handleSubagentEnd(
+      rt,
+      { id: 'worker-a', name: 'wa', parentSessionId: 'lead-fb', stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: 'A 完成' }] },
+      NOW + 10,
+    )
+    assert.equal(first.updated, true)
+    assert.equal(nullCard.status, 'done', 'workerRunState=null 的自动卡兜底认领并置 done')
+    assert.equal(nullCard.result, 'A 完成')
+
+    // 名字对不上、且该组长名下还有多条 doing 自动卡 → 不猜，留下明确告警（不再静默）
+    const missed = await handleSubagentEnd(
+      rt,
+      { id: 'worker-x', name: 'nobody', parentSessionId: 'lead-fb', stopReason: 'completed' },
+      NOW + 20,
+    )
+    assert.equal(missed.reason, 'no-task')
+    assert.match(rt.leadAuto.lastError, /没有匹配到看板自动卡/)
+    assert.match(rt.leadAuto.lastError, /worker-x/)
+    assert.match(rt.leadAuto.lastError, /nobody/)
+    assert.match(rt.leadAuto.lastError, /lead-fb/)
+    assert.equal(endedCard.status, 'doing', '认领不到时绝不乱改卡片')
+
+    const second = await handleSubagentEnd(
+      rt,
+      { id: 'worker-b', name: 'wb', parentSessionId: 'lead-fb', stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: 'B 完成' }] },
+      NOW + 30,
+    )
+    assert.equal(second.updated, true)
+    assert.equal(endedCard.status, 'done', 'workerRunState=ended 的自动卡也能兜底认领')
+    assert.equal(endedCard.workerRunState, 'ended')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
+/* ------------------------------------------------------------------ *
+ * v0.5.2：隔离工作树合入「按文件粒度」判定（t-209）
+ *  前序切片 / 用户已改过的文件单独跳过，不再把整张卡判成冲突。
+ * ------------------------------------------------------------------ */
+
+function makeMergeFixture(prefix) {
+  clearGitRepoInfoCache()
+  const root = mkdtempSync(join(tmpdir(), prefix))
+  const repoDir = join(root, 'repo')
+  const storageDir = join(root, 'storage')
+  mkdirSync(storageDir, { recursive: true })
+  initTempGitRepo(repoDir)
+  const state = createEmptyBoard()
+  const task = addTask(state, { title: '按文件粒度合入测试卡', cwd: repoDir, source: 'agent' }, Date.now())
+  const rt = fakeRuntime(state, { get: () => undefined }, join(storageDir, 'board.json'))
+  const repoInfo = resolveGitRepoInfo(repoDir, { fresh: true })
+  const wt = ensureTaskWorktree(rt, task, repoInfo)
+  assert.ok(wt && wt.worktreePath, '隔离工作树必须创建成功')
+  return { root, repoDir, storageDir, task, rt }
+}
+
+test('v0.5.2 逐文件合入：全部文件已在主工作区 → 幂等成功、只回收工作树、不再留 doing', async () => {
+  const fx = makeMergeFixture('dsh-taskboard-v052-merge-all-')
+  try {
+    const { repoDir, task, rt } = fx
+    const wtPath = task.worktreePath
+    writeFileSync(join(wtPath, 'src', 'a.js'), 'export const a = 100\n')
+    writeFileSync(join(wtPath, 'src', 'b.js'), 'export const b = 200\n')
+    // 前序切片 / 用户已经把这几个文件改成了完全相同的内容
+    writeFileSync(join(repoDir, 'src', 'a.js'), 'export const a = 100\n')
+    writeFileSync(join(repoDir, 'src', 'b.js'), 'export const b = 200\n')
+
+    const result = mergeAndCleanupTaskWorktree(rt, task.id)
+    assert.deepEqual(schemaProblems(result, TASK_MERGE_WORKTREE_OUTPUT_SCHEMA), [])
+    assert.equal(result.merged, true, '全部已应用时视为成功合入')
+    assert.equal(result.conflict, false)
+    assert.equal(result.cleaned, true)
+    assert.equal(task.worktreePath, null, '成功后回收 worktreePath，卡片不会再停在 doing')
+    assert.equal(existsSync(wtPath), false, '临时工作树目录已删除')
+    assert.equal(readFileSync(join(repoDir, 'src', 'a.js'), 'utf8').replace(/\r\n/g, '\n'), 'export const a = 100\n')
+    assert.equal(readFileSync(join(repoDir, 'src', 'b.js'), 'utf8').replace(/\r\n/g, '\n'), 'export const b = 200\n')
+    assert.match(result.summary, /2 个文件已在主工作区存在/)
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true })
+  }
+})
+
+test('v0.5.2 逐文件合入：部分文件已应用 → 只补入未应用文件并成功回收', async () => {
+  const fx = makeMergeFixture('dsh-taskboard-v052-merge-partial-')
+  try {
+    const { repoDir, task, rt } = fx
+    const wtPath = task.worktreePath
+    writeFileSync(join(wtPath, 'src', 'a.js'), 'export const a = 100\n')
+    writeFileSync(join(wtPath, 'src', 'b.js'), 'export const b = 200\n')
+    // a.js 已由前序切片合入；b.js 仍是基线内容
+    writeFileSync(join(repoDir, 'src', 'a.js'), 'export const a = 100\n')
+
+    const result = mergeAndCleanupTaskWorktree(rt, task.id)
+    assert.deepEqual(schemaProblems(result, TASK_MERGE_WORKTREE_OUTPUT_SCHEMA), [])
+    assert.equal(result.merged, true)
+    assert.equal(result.conflict, false)
+    assert.equal(result.cleaned, true)
+    assert.equal(task.worktreePath, null)
+    assert.equal(readFileSync(join(repoDir, 'src', 'b.js'), 'utf8').replace(/\r\n/g, '\n'), 'export const b = 200\n')
+    assert.equal(readFileSync(join(repoDir, 'src', 'a.js'), 'utf8').replace(/\r\n/g, '\n'), 'export const a = 100\n')
+    assert.match(result.summary, /1 个文件已在主工作区存在，仅补入 1 个/)
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true })
+  }
+})
+
+test('v0.5.2 逐文件合入：子集仍有真冲突 → 保持冲突语义（主工作区不动、保留工作树），摘要标出已存在文件', async () => {
+  const fx = makeMergeFixture('dsh-taskboard-v052-merge-conflict-')
+  try {
+    const { repoDir, task, rt } = fx
+    const wtPath = task.worktreePath
+    writeFileSync(join(wtPath, 'src', 'a.js'), 'export const a = 100\n')
+    writeFileSync(join(wtPath, 'src', 'b.js'), 'export const b = 200\n')
+    // a.js 已应用；b.js 在主工作区是第三种内容（真实冲突）
+    writeFileSync(join(repoDir, 'src', 'a.js'), 'export const a = 100\n')
+    writeFileSync(join(repoDir, 'src', 'b.js'), 'export const b = 999\n')
+
+    const result = mergeAndCleanupTaskWorktree(rt, task.id)
+    assert.deepEqual(schemaProblems(result, TASK_MERGE_WORKTREE_OUTPUT_SCHEMA), [])
+    assert.equal(result.merged, false)
+    assert.equal(result.conflict, true)
+    assert.equal(result.cleaned, false)
+    assert.ok(result.conflictFiles.includes('src/b.js'), '冲突文件列表应包含真正冲突的 b.js，实际：' + result.conflictFiles.join(','))
+    assert.match(result.summary, /src\/b\.js/)
+    assert.match(result.summary, /1 个文件已在主工作区存在/, '摘要要标出已在主工作区的文件，方便组长核对')
+    assert.match(result.summary, /src\/a\.js/)
+    assert.ok(task.worktreePath && existsSync(task.worktreePath), '冲突时保留隔离工作树供排查')
+    assert.equal(readFileSync(join(repoDir, 'src', 'a.js'), 'utf8').replace(/\r\n/g, '\n'), 'export const a = 100\n', '主工作区不被改动')
+    assert.equal(readFileSync(join(repoDir, 'src', 'b.js'), 'utf8').replace(/\r\n/g, '\n'), 'export const b = 999\n', '冲突文件保持主工作区原样')
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true })
+  }
 })

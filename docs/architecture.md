@@ -315,7 +315,7 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 | --- | --- | --- |
 | `tools/pre-execute` | `@deepseek-ai/dsh-tools` 的**派发前** allow/deny 瀑布（`(exec, next)`） | **强制建卡闸门**：只拦 `exec.name === 'subagent'` 且调用方预设是 `taskboard-dispatch` 的调用；认领 / 新建卡片，失败返回 `{kind:'deny', reason, info:{name:'TaskboardDispatchError', code}}`（worker 不启动） |
 | `tools/result` | 工具调用结束后的**观察事件**（emit，监听器异常被宿主隔离） | worker 真的启动后把 worker 信息挂到闸门准备的卡片上：**总是**写 `workerRunState='running'` 和本次 worker 的 `assignee`；`workerSessionId` 有 `result.value.subagentId` 时直接写，没有时（当前 dsh 的 `subagent` 只返回 `{kind:'activation', name}`）按 `name` 从子 Agent 目录异步回填（§2）。**`kind==='activation'` 即视为已启动**——不再因为缺 `subagentId` 把卡片降级；只有非 activation / 错误 / 取消 / `post-execute` block / 返回形状不是 activation 时才降级为 `todo` + `lastError='派发未启动：…'`（不删卡） |
-| `subagent/end` | `@deepseek-ai/dsh-subagent` 生命周期事件（`{runId, provider, parentSessionId, id, local, stopReason, lastAssistantMessage}`） | worker 结束 → 给**带标记的自动任务**写回 `done` + `result`（轮询任务交给组长审核）；`id` 还没回填时按 `parentSessionId` + 唯一 running 自动卡兜底认领 |
+| `subagent/end` | `@deepseek-ai/dsh-subagent` 生命周期事件（`{runId, provider, parentSessionId, id, local, stopReason, lastAssistantMessage}`） | worker 结束 → 给**带标记的自动任务**写回 `done` + `result`（轮询任务交给组长审核）；`id` 还没回填时按 `parentSessionId` + doing 自动卡（`workerSessionId` 为空或等于本次 `childId`，不再要求 `workerRunState==='running'`，v0.5.2）+ `info.name` 精确匹配兜底认领 |
 
 - 监听器以 `{ global: true }` 注册：不受 scope 过滤（`tools/*` 的 carrier 按调用 Agent 过滤），
   宿主插件自身在 handler 里先按预设过滤，不会误伤别的 Agent。
@@ -402,19 +402,24 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 | --- | --- |
 | `stopReason === 'completed'` 且任务 `doing` | 置 `done`、`finishedAt`；`result` = `lastAssistantMessage` 里 `text` 块拼接（截 4000 字符，空则不写）；`leadAuto.completed++`（**只算这一次真正的 `doing→done`**）；随后 `flushReceipts()`（§1.6 链路不变，主会话照常收到「【任务看板 · 汇报】」） |
 | 任务已是 `done` 且 `stopReason === 'completed'`（组长先审完 / 同一 worker 再次结束） | 只更新 `result`（非空时），不改状态、**不计 `completed`**、不重发回执（`reportedAt` 不变）。注意：这会**覆盖**组长已审的 `result`——取的是最后一次回报（worker 返工后的最终结论）；组长若在 worker 完全结束前就写了结论，后续结束会以 worker 的汇报为准 |
-| 其它 / 缺省 `stopReason`（`error` / `aborted` / `max-tokens` / `refusal` / 缺字段 / 未知值）且任务 `doing` | 任务**保持 `doing`**，`lastError` = `worker 结束（<stopReason>）：<结论首行或「没有返回结论」>`，交给组长 / 用户处理；**不写** `leadAuto.lastError`（那只记挂钩自身异常）。`stopReason` 缺失时文案里的 `<stopReason>` 写 `unknown`。v0.2.9 起**保留 `workerSessionId` 与 `assignee`**，只把 `workerRunState='failed'`——看板「对话」仍会先试这个 worker 会话，打不开时给可见回退提示（§5.3） |
+| 其它 / 缺省 `stopReason`（`error` / `aborted` / `max-tokens` / `refusal` / 缺字段 / 未知值）且任务 `doing` | 任务**保持 `doing`**，`lastError` = `worker 结束（<stopReason>）：<结论首行或「没有返回结论」>`，交给组长 / 用户处理；**不写** `leadAuto.lastError`（那只记挂钩自身异常）。`stopReason` 缺失时文案里的 `<stopReason>` 写 `unknown`。v0.2.9 起**保留 `workerSessionId` 与 `assignee`**，只把 `workerRunState='failed'`——看板「对话」仍会先试这个 worker 会话，打不开时给可见回退提示（§5.3）。**v0.5.2 起这个 `lastError` 同时对模型与用户可见**：`taskBrief` 带 `lastError`（`taskboard_list` / `taskboard_update` 渲染成「最近异常：…」，§4.4），看板卡片挂小红点、详情浮层基本信息有「最近异常」行（§5.2） |
 | 其它 / 缺省 `stopReason` 且任务已是 `done` | 不动（组长已审；worker 的失败不推翻结论），`leadAuto.skipped++` |
 | 任务 `archived` / `todo` | 不动（不改状态、不写结论），`leadAuto.skipped++` |
 | 任务没有 `autoDispatch === 'lead-dispatch'` 标记（= 轮询投递任务 / 人工任务，`notifiedAt` 非空） | **绝不自动置 `done`**：返回 `reason='not-auto'` / `no-task`，组长审核后自己 `taskboard_update`；但若该卡 `workerRunState === 'running'` 且匹配结束的 worker（v0.3.9），宿主会同步将其 `workerRunState` 收敛为 `'ended'` / `'failed'`（任务进入 `done` / `archived` 或读盘归一化时同样将残留 `'running'` 收敛为 `'ended'`） |
 | 找不到任务（且 `parentSessionId` 兜底不唯一 / 没有 parent） | 忽略（无关子 Agent） |
 
-**找不到任务时的兜底（v0.3.1）**：worker 的 `workerSessionId` 可能还没回填（当前 dsh 的 activation
-没有 id）。`subagent/end` 先按 `workerSessionId → assignee` 找（`findTaskByWorker` 优先真实字段、
-老 board 回退 `assignee`）；找不到时，先在「`autoDispatch='lead-dispatch'` + `doing` +
-`workerRunState='running'` + `workerSessionId` 为空」（有 `info.parentSessionId` 时限定该父会话）的候选卡里，
-尝试用 `info.name`（或从 `subagents.listDescendants(parentSessionId)` 反查本次 `id` 对应的 `name`）匹配
-`candidate.assignee`（v0.3.3 fan-out 多切片并发时据此精确认领对应切片卡）；仍无法区分且
-`info.parentSessionId` 非空时，**只有恰好一条**候选才认领（多于一条不猜，交给组长审核）。
+**找不到任务时的兜底（v0.3.1；v0.5.2 放宽 + 不再静默）**：worker 的 `workerSessionId` 可能还没回填（当前 dsh 的
+activation 没有 id）。`subagent/end` 先按 `workerSessionId → assignee` 找（`findTaskByWorker` 优先真实字段、
+老 board 回退 `assignee`）；找不到时，在「`autoDispatch='lead-dispatch'` + `doing` + `sessionId` 等于
+`info.parentSessionId` + `workerSessionId` 为空**或等于本次 `childId`**」的候选卡里（v0.5.2 起**不再要求**
+`workerRunState === 'running'`——卡片可能已是 `'ended'` / `'failed'` / `null`，旧条件会让结束事件永远
+认领不到卡、卡片停在 `doing` 而外部毫无提示），尝试用 `info.name`（或从
+`subagents.listDescendants(parentSessionId)` 反查本次 `id` 对应的 `name`）匹配 `candidate.assignee`
+（v0.3.3 fan-out 多切片并发时据此精确认领对应切片卡）；仍无法区分时，只有「`info.name` 为空且恰好一条候选」
+或「名字对不上但只剩一条且 `assignee` 还没写」才认领（多于一条不猜，交给组长审核）。
+**认领不到、但该 `parentSessionId` 名下确实还有 `doing` 的自动卡** → **不再静默 return**：
+用 `recordLeadAutoError` 记一条明确告警（含 `childId` / `name` / `parentId` / `stopReason` 与仍停在
+`doing` 的卡 id，同时 `console.warn`，并进 `Snapshot.leadAuto.lastError` 供排障）。
 `backfillWorkerSessionId()` 从 `listDescendants` 按 `name` 回填时逆序优先最新且未被其它卡片占用的子会话。
 认领后照常按 `stopReason` 收尾；`workerSessionId` 缺则补本次 `id`。
 
@@ -462,8 +467,9 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 
 组长在派活 / 审核过程中遇到**必须由用户决策**的问题（选方案、确认范围、补凭据……）时，
 不应该把它塞进 `lastError`、也不应该只在聊天里问——聊天消息会被历史淹没，用户也看不到。
-改为在任务上打 `needsUser` 标记并写 `question`：看板把这条任务提升到「待你处理」区；
-用户回答后宿主把回答 followup 给组长会话，清掉标记，任务继续。**全程不新增 status。**
+改为在任务上打 `needsUser` 标记并写 `question`：看板把这条任务提升到「待处理」列的提问卡
+（v0.2.2 叫「待你处理」，v0.5.3 起同列还收阻塞卡）；用户回答后宿主把回答 followup 给组长会话，
+清掉标记，任务继续。**全程不新增 status。**
 
 **闭环**
 
@@ -481,8 +487,10 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
    - 任务 `status` 不变（`todo` / `doing` 都能 flag；`done` 后返工前也可以先问）。
 2. **轮询跳过**（§1.4）：`selectDispatchCandidates` / tick 过滤 `needsUser === true` 的任务；
    `dispatch-now` 也拒绝（`conflict`）。问题没回答前不重复投递，也不占用每轮 1 条的派发名额。
-3. **看板派生「待你处理」**：右栏看板顶部固定条 + 平台看板最左第五列；这些任务**不重复**出现在
-   普通四列（§5.1.1 / §5.2）。排序按 `askedAt` 升序（最旧优先），缺 `askedAt` 的排最后。
+3. **看板派生「待处理」**（v0.2.2 的「待你处理」；v0.5.3 扩成两类卡；v0.5.4 两块看板统一成列）：
+   平台看板最左列 + 右栏看板（wide 的 `.tb-board` 与窄的 `.tb-lanes`）最前一块都是「待处理」
+   （提问卡 + 阻塞卡，§5.1.1 / §5.2）；这些任务**不重复**出现在普通状态列。列内提问在前、阻塞在后，
+   各自按 `updatedAt` 倒序（v0.2.2 那条只在右栏顶部、按 `askedAt` 升序的固定条已在 v0.5.4 随列化删除）。
 4. **用户回答** → RPC `answer-task {id, answer}`（§3.1）：
    宿主按 `task.dispatchedSessionId` → `task.askedBy` → `task.sessionId` 依次找目标会话（去重、
    跳过空值；已归档的候选跳过），复用 `agents.get` / `sessionController.resolveAgent`，
@@ -515,7 +523,9 @@ patch 里设置提问（`needsUser:true`，或带 `question`）→ `conflict`「
 
 **与 `lastError` 的分工**：`lastError` 是故障（派发失败 / 组长不可用 / worker 异常），
 `needsUser` 是待决策。组长 persona 要求决策类问题必须走 `needsUser`（§6），
-不要把问题塞进 `lastError`——`lastError` 只写「为什么没做成」。
+不要把问题塞进 `lastError`——`lastError` 只写「为什么没做成」。反过来，`doing` + `lastError`
+非空的卡（合入冲突 / worker 结束异常 / 执行会话失联）会被看板自动收进「待处理」派生列
+（**不是**新 status、不改 `needsUser`、不迁移任务数据），给用户一个「这条卡卡住了」的入口（v0.5.3）。
 
 ### 1.10 与 Agent Teams 的分工（v0.2.8）
 
@@ -632,7 +642,7 @@ DSH 的 Agent Teams（`team_task_create` / `team_task_get` / `team_task_list` / 
       "archivedAt": "…ISO…" | null,
       "notifiedAt": "…ISO…" | null,
       "notificationCount": 0,
-      "lastError": ""            // 最近一次派发/失败原因，详情浮层显示
+      "lastError": ""            // 最近一次派发/失败原因：详情浮层 + 卡片小红点 + taskBrief（v0.5.2）都可见
     }
   ]
 }
@@ -699,9 +709,12 @@ worker 会话 id 由宿主单独记在 `workerSessionId`：有 `result.value.sub
 | `subagent/end` 且非 `completed`（`error` / `aborted` / 缺字段…） | 保留（缺则补） | `'failed'`（照旧写 `lastError`，**不清** `assignee`） |
 | `applyTaskUpdate` 的 `→todo` 迁移 / `requeueTasksOfLead`（组长归档重排） | `null` | `null` |
 
-`subagent/end` 找不到 worker 时（id 还没回填），按 `info.parentSessionId` 在该组长名下找唯一一条
-「`autoDispatch='lead-dispatch'` + `doing` + `workerRunState='running'` + `workerSessionId` 为空」的卡
-认领；多于一条不猜（§1.8 完成回写）。
+`subagent/end` 找不到 worker 时（id 还没回填），按 `info.parentSessionId` 在该组长名下找
+「`autoDispatch='lead-dispatch'` + `doing` + `workerSessionId` 为空**或等于本次 `childId`**」的卡，
+再用 `info.name` / `assignee` 精确匹配认领（v0.5.2 起不再要求 `workerRunState='running'`——`'ended'` /
+`'failed'` / `null` 的卡同样可被认领）；仍多于一条且无法区分时不猜（§1.8 完成回写）。
+认领不到、但该组长名下确实还有 `doing` 的自动卡时，宿主记一条含 `childId` / `name` / `parentId` /
+`stopReason` 的告警（`leadAuto.lastError` + `console.warn`），不再静默。
 
 两个字段都是**宿主独占**：不在 `taskboard_update` 的参数白名单里（`additionalProperties:false` 的封闭
 契约，模型传了会在入参校验阶段被拒），`applyTaskUpdate` / `update-task` 的 patch 也不读这两个键
@@ -1056,6 +1069,14 @@ ctx.effect(() => ctx.webServer.register({
 销毁并重建定时器。每次 tick 先读内存状态（不重读盘），异常只 `console.warn`。
 `dispatchMode='workspace-lead'` 的路由细节见 §1.5；完成回执的 flush 时机见 §1.6。
 
+**卡住自动卡提醒（v0.5.2）**：tick 的 `reconcileOrphanedDoingTasks` 巡检在原有「失联 running 卡」之外，
+还识别「worker 已经结束、卡片却还停在 `doing`」的自动卡（`doing` + `autoDispatch='lead-dispatch'` +
+`workerRunState ∈ {'ended','failed'}` + 超过 `ORPHAN_GRACE_MS` 未更新，例如 `aborted` 中断、
+隔离工作树合入冲突、兜底认领失败）：**绝不自动改状态**（收尾与合入必须由组长判断），只在所属组长会话
+在线且 `idle` 时发一条**一次性**「卡住提醒」（卡 id / 卡在哪一步 / `lastError` 摘要 / 提示
+`taskboard_update` 置 done 或先 `taskboard_merge_worktree` 处理合入）。用 rt 上的内存 Set
+（键 = 任务 id + `updatedAt`，不落盘）去重防刷屏；组长忙 / 离线时不发、也不标记已提醒，下次 idle 仍会提醒。
+
 ### 4.4 工具（模型侧，全局注册）
 
 全部用 `ctx.tools.register({ name, description, parameters, output: { schema, render }, execute })`
@@ -1064,10 +1085,10 @@ ctx.effect(() => ctx.webServer.register({
 
 | 工具 | 参数 | 行为 |
 | --- | --- | --- |
-| `taskboard_list` | `{status?, parentTaskId?}` | 返回文本清单（id / 状态 / 父任务 / 依赖 / 标题 / 备注 / assignee / worktreePath / result / 待回答的问题）+ 结构化 `tasks[]`；v0.2.2 起 `tasks[]` 带 `needsUser` / `question` / `questionOptions`，v0.3.5 起带 `parentTaskId` 并支持按 `parentTaskId` 过滤，v0.4.0 起带 `dependsOn`，v0.5.0 起带 `worktreePath` / `worktreeBranch` |
+| `taskboard_list` | `{status?, parentTaskId?}` | 返回文本清单（id / 状态 / 父任务 / 依赖 / 标题 / 备注 / assignee / worktreePath / result / 待回答的问题 / 最近异常）+ 结构化 `tasks[]`；v0.2.2 起 `tasks[]` 带 `needsUser` / `question` / `questionOptions`，v0.3.5 起带 `parentTaskId` 并支持按 `parentTaskId` 过滤，v0.4.0 起带 `dependsOn`，v0.5.0 起带 `worktreePath` / `worktreeBranch`，v0.5.2 起带 `lastError`（渲染为「最近异常：…」） |
 | `taskboard_add` | `{title, note?, workspace?, parentTaskId?, dependsOn?}` | 新建任务（`source='agent'`，`sessionId=exec.agent.session.id`）；`workspace` v0.2.0 新增，`parentTaskId` v0.3.5 可选关联父任务，`dependsOn` v0.4.0 可选声明前置依赖 |
 | `taskboard_update` | `{id, status?, result?, assignee?, note?, lastError?, needsUser?, question?, questionOptions?, dependsOn?}` | 更新任务（模型工具执行前均调 `reloadBoardIfStale` 对齐磁盘状态）；`status` 非法迁移返回错误文本；`lastError` 供组长记录故障或阻塞原因（派发失败 / 缺工作目录 / worker 异常；不写向用户的提问）；**`assignee` 语义（v0.2.9）**：写子 Agent 的 label / 名字（自由文本）即可，**不要写会话 id**——会话 id 由宿主记在 `workerSessionId`（宿主独占、模型不可写、不进 `taskBrief`，§2）；v0.2.2 起 `needsUser:true` + `question` 用来「问用户」（§1.9），`needsUser:false` 取消提问，`askedBy` 取 `exec.agent.session.id`；任务已归档且未同时改 `status` 时设置 `needsUser:true` / `question` → 工具报 `conflict`（不写盘，§1.9）；v0.2.4 起**组长**（`taskboard-dispatch`）把轮询投递任务置 `doing` 时，宿主额外记一条一次性「即将派 worker」意图（进程内，不落盘；派发闸门据此复用原卡片，§1.8） |
-| `taskboard_merge_worktree` | `{id, cleanup?, discardOnly?}` | **v0.5.0**：将任务关联的隔离 Git Worktree（`task.worktreePath`）改动无损合入主工作区并清理 Worktree 目录与临时分支 `taskboard/<id>`。先卸载所有依赖 Junction 软链，将 Worktree 内未提交文件快照提交至临时分支后，以 `git diff --binary --full-index -U1 <base>..<wtHead>` + `git apply --check` 原子预检并 `git apply` 应用到主工作区（兼容主工作区含未暂存改动，且不污染主分支提交历史）；若存在冲突则主工作区保持原状不变并返回 `{merged:false, conflict:true, conflictFiles}`；传 `discardOnly:true` 则不合入改动、直接卸载软链并回收 Worktree 与临时分支 |
+| `taskboard_merge_worktree` | `{id, cleanup?, discardOnly?}` | **v0.5.0**：将任务关联的隔离 Git Worktree（`task.worktreePath`）改动无损合入主工作区并清理 Worktree 目录与临时分支 `taskboard/<id>`。先卸载所有依赖 Junction 软链，将 Worktree 内未提交文件快照提交至临时分支后，以 `git diff --binary --full-index -U1 <base>..<wtHead>` + `git apply --check` 原子预检并 `git apply` 应用到主工作区（兼容主工作区含未暂存改动，且不污染主分支提交历史）；若存在冲突则主工作区保持原状不变并返回 `{merged:false, conflict:true, conflictFiles}`；传 `discardOnly:true` 则不合入改动、直接卸载软链并回收 Worktree 与临时分支。**v0.5.2（t-209）**：预检改为**逐文件粒度**——按 `diff --git` 头把补丁切成文件级补丁（保留 binary / rename 段），每个文件先跑 `git apply --check --reverse` 判定「主工作区已存在该改动」并跳过，其余文件拼成子集 `git apply --check` 通过才应用；全部已存在视为幂等成功（`merged:true`），子集仍有文件失败才返回 `conflict:true`，摘要标出哪些文件其实已在主工作区 |
 
 **`taskboard_add.workspace`（v0.2.0，可选）**：工作区 id / 名称 / 绝对路径，用于主会话往任意工作区派任务。
 
@@ -1096,10 +1117,14 @@ ctx.effect(() => ctx.webServer.register({
 - v0.2.0 新增的任务字段 `reportedAt` 是 UI / 回执记账字段：出现在 `board.json`、`Snapshot.tasks`
   与返回完整任务的 UI RPC 响应（`add-task` / `update-task` / `dispatch-now` / `answer-task`
   的 `value.task`），**绝不进 `taskBrief` / 模型工具输出**。
-- v0.2.2 起 `taskBrief` 有 10 个已声明键，v0.3.5 新增 `parentTaskId`，v0.4.0 新增 `dependsOn`，v0.5.0 新增 `worktreePath` / `worktreeBranch`（共 **14 个已声明键**）：
+- v0.2.2 起 `taskBrief` 有 10 个已声明键，v0.3.5 新增 `parentTaskId`，v0.4.0 新增 `dependsOn`，v0.5.0 新增
+  `worktreePath` / `worktreeBranch`，v0.5.2 新增 `lastError`（共 **15 个已声明键**）：
   id / title / status / parentTaskId / dependsOn / note / assignee / result / updatedAt +
-  `needsUser` / `question` / `questionOptions` + `worktreePath` / `worktreeBranch`（`parentTaskId`、`worktreePath`、`worktreeBranch` 为空时返回 `''`；flagged 任务与隔离工作树路径必须在模型工具输出里可见，
-  组长才能确认自己在等什么以及是否需要调 `taskboard_merge_worktree`；`askedBy` / `askedAt` / `lastAnswer` / `answeredAt` / `worktreeBaseCommit` / `worktreeLinks` 仍只出现在
+  `needsUser` / `question` / `questionOptions` + `worktreePath` / `worktreeBranch` + `lastError`
+  （`parentTaskId`、`worktreePath`、`worktreeBranch`、`lastError` 为空时返回 `''`；flagged 任务、
+  隔离工作树路径与最近异常必须在模型工具输出里可见——组长才能确认自己在等什么、是否需要调
+  `taskboard_merge_worktree`，以及「worker 结束了但卡片还在 doing」到底为什么；`taskboard_list` 渲染成
+  「最近异常：…」，`taskboard_update` 同样多一行「最近异常：…」。`askedBy` / `askedAt` / `lastAnswer` / `answeredAt` / `worktreeBaseCommit` / `worktreeLinks` 仍只出现在
   `board.json` 与 `Snapshot.tasks`，不进工具输出）。
 
 ### 4.5 模式状态（预设声明 + 读回）
@@ -1223,7 +1248,8 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 
 自上而下：
 
-1. **头部**：标题「任务看板」+ 轮询开关 + 立即刷新 + 一键归档已完成 + **设置按钮**；
+1. **头部**：标题「任务看板」+ 轮询开关 + 立即刷新 + 一键归档已完成 + **显示 / 隐藏归档开关**
+   （v0.5.4，见第 6 条）+ **设置按钮**；
    preset 异常 banner；页脚（数据文件路径 + 版本）；以及**组长条**（§5.5）。
    点击「设置」按钮展开 `.tb-settings` 设置面板，收纳低频配置项：轮询间隔选择（5s/15s/30s/60s）、「派发到」选择器
    （`workspace-lead` / `new` / `creator` / `auto`，默认 `workspace-lead`）与「归档任务自动删除时间」（快捷预设 + 自定义分钟数）。
@@ -1249,7 +1275,8 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
    选中注册表里的规范路径；字段缺失 / 脏值 → `全部工作区`；工作区列表为空（注册表还没就绪）→
    `null`，等下一条 snapshot 再判定；持久化路径已不在列表里（工作区被删 / 改名）→ 回退 `全部工作区`，
    **不把无效值当选中项**。写失败只 `console.warn`，不影响看板显示。
-4. **四列看板**：复用 `Col`（宽度足够时四列）；卡片显示**标题 + 一行工作区标签 + 操作按钮**
+4. **状态列看板**：复用 `Col`（宽度足够时按可见列数铺开：默认待开始 / 进行中 / 已完成三列，
+   点「显示归档」后追加「已归档」列）；卡片显示**标题 + 一行工作区标签 + 操作按钮**
    （v0.2.4；备注 / 结论 / 时间 / 组长 / 执行者仍在详情浮层）；
    `cwd=null` 的老任务也显示（详情里工作区为空）。
    **工作区标签**（`.tb-card-workspace`）：副标题位（标题之后、操作行之前）一行小字，单行省略、
@@ -1258,18 +1285,35 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
    `cwd` 为空（老任务 / 没归属）显示 `—` 占位（不抛错、不渲染 `undefined`）。
    标签只加在**平台看板**：`Col` / `NeedsColumn` 收到 `workspaceLabel` 才渲染，右栏看板不传，
    卡片结构仍是「标题 + 操作按钮」（§5.2）；≤1180px / ≤620px 降列时标签照常单行省略，
-   不换行、不挤压标题的 2 行高度。第五列「待你处理」的卡片同样带这一行标签（第五列也是全局视角）。
+   不换行、不挤压标题的 2 行高度。「待处理」列的两类卡（提问 / 阻塞）同样带这一行标签（这一列也是全局视角）。
    整卡因此比 t-33 时高约 20px（一行 10px 小字，行高 1.45 ≈ 15px + `gap:5px`），但**同列卡片仍等高**：
    每张平台看板卡片都有这一行，1 行 / 2 行标题的等高规则（标题块固定 2 行高度）不变。
-   **未归档的 `needsUser` 任务不在四列里重复显示**（见下一条）；已归档的 flagged 任务照常留在「已归档」列。
+   **未归档的 `needsUser` 任务不在状态列里重复显示**（见下一条）；已归档的 flagged 任务照常留在「已归档」列。
    但**不要挂在归档任务上提问**：Host 会拒绝（`conflict`，§1.9），归档任务上的历史残留 flag 在更新 / 读盘时清除。
-5. **「待你处理」第五列（v0.2.2，§1.9）**：有 flagged 任务时在「待开始」**之前**插入第五列
-   `待你处理 N`（`.tb-board[data-needs="true"]` 五列网格，`.tb-col[data-status="needsUser"]`）；
-   没有 flagged 任务时**整列不渲染**（仍是四列）。列内卡片（`.tb-needs-card`）显示
-   标题 + 问题**最多两行**（`.tb-needs-card-q` 的 `-webkit-line-clamp:2`，截断）+「处理」按钮：
-   点标题或按钮都打开详情浮层的「需要你处理」区。
-   列头带问题数量角标；列里只放 flagged 任务，按 `askedAt` 最旧优先。
-6. **空态**：「没有任务。选个工作区加一条，主 Agent 会自动接手。」
+   **v0.5.3**：`doing` 且 `lastError` 非空的阻塞卡同样只进「待处理」列、不在「进行中」列重复。
+   **v0.5.4**：「已归档」列默认不渲染，列数按可见状态列裁剪（见第 6 条）。
+5. **「待处理」列（v0.2.2「待你处理」，v0.5.3 扩成两类卡，v0.5.4 两块看板统一，§1.9）**：有提问卡或
+   阻塞卡时在「待开始」**之前**插入 `待处理 N` 列（`.tb-board[data-needs="true"]`，
+   `.tb-col[data-status="needsUser"]`）；两类都没有时**整列不渲染**。
+   列内两类卡，提问在前、阻塞在后，各自按 `updatedAt` 倒序：
+   - **提问卡**（`needsUser === true` 且未归档，`.tb-needs-card`）：标题 + 问题**最多两行**
+     （`.tb-needs-card-q` 的 `-webkit-line-clamp:2`，截断）+「处理」按钮：点标题或按钮都打开
+     详情浮层的「需要你处理」区（交互与 v0.2.2 完全一致）。
+   - **阻塞卡**（`status === 'doing'` 且 `lastError` 非空：合入冲突 / worker 结束异常 /
+     执行会话失联）：完整卡片（原有操作按钮不丢）+ `data-attention="blocked"` 警示色左缘 +
+     `attention.blocked`（阻塞）角标 + `lastError` **首行摘要**（`.tb-card-attn-text` 单行省略，
+     `title` 兜全文）；点标题 / 「详情」打开详情浮层，完整异常看基本信息「最近异常」行（§5.3）。
+   列头带总数角标；这两类卡都**不重复**出现在普通状态列（提问卡按 v0.2.2 语义、阻塞卡 v0.5.3 起）。
+   **v0.5.4**：右栏看板同样渲染这一列（wide 的 `.tb-board` 与窄的 `.tb-lanes` 都有，排在最前、
+   仅非空时渲染），v0.2.2 的顶部固定条 `.tb-needs`（只列提问卡）随之删除——提问卡只在「待处理」列里
+   处理（列内「处理」按钮与回答流程不变，§5.2）。
+6. **「已归档」列默认隐藏（v0.5.4）**：顶部操作栏提供「显示归档（N）」/「隐藏归档（N）」开关
+   （i18n `archive.show` / `archive.hide`，带当前归档条数，`aria-expanded` 表达展开状态；
+   状态只在本组件，**不写 config**）。默认只渲染「待处理? + 待开始 + 进行中 + 已完成」，
+   点开后追加「已归档」列（原有「重新打开 / 删除」照旧）。`.tb-board[data-archive="false"]`
+   驱动网格按可见列数收缩（无待处理 3 列 / 有待处理 4 列；展开后对应 4 / 5 列），
+   `.tb-platform` 窄屏仍按既有 2 列 / 1 列响应式降列，**不留空列、不横向溢出**。
+7. **空态**：「没有任务。选个工作区加一条，主 Agent 会自动接手。」
 
 派发：`workspace-lead`（默认）下平台任务按 `cwd` 投给该工作区的常驻组长（§1.5）；旧模式下
 宿主优先找同工作区的空闲会话（`workspace-session`），找不到就等（`workspace-offline` / `workspace-busy`），
@@ -1279,9 +1323,9 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 
 | 条件 | 布局 |
 | --- | --- |
-| `useTabInfo().sidebar.fullscreen === true` 或实测宽度 ≥ **900px** | 四列网格 `.tb-board`（待开始/进行中/已完成/已归档 横排） |
-| 宽度 560–900px | 两列网格 `.tb-board[data-layout="medium"]`（2×2） |
-| 更窄（普通右栏） | 纵向 lane `.tb-lanes`：四个状态区块依次堆叠，根节点 `data-layout="narrow"` |
+| `useTabInfo().sidebar.fullscreen === true` 或实测宽度 ≥ **900px** | 网格 `.tb-board`（待处理? / 待开始 / 进行中 / 已完成 / 已归档? 横排；v0.5.4 归档列默认不渲染） |
+| 宽度 560–900px | 两列网格 `.tb-board[data-layout="medium"]`（2×2，可见列数变化时自动换行） |
+| 更窄（普通右栏） | 纵向 lane `.tb-lanes`：可见状态区块依次堆叠（待处理? 在最前、归档默认隐藏），根节点 `data-layout="narrow"` |
 
 宽度用 `ResizeObserver` 量（`ResizeObserver` 不可用时按窄栏渲染，测试环境即此路径）。
 窄栏下隐藏：footer 的数据路径/说明（只留版本号）、轮询间隔标签、上次派发信息（`.tb-optional`）。
@@ -1289,7 +1333,8 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 自上而下内容（两种布局共用）：
 
 1. **头部**：标题「任务看板」+
-   轮询开关 + 「刷新」按钮 + **「设置」按钮** + **组长条**（§5.5）；点击「设置」展开 `.tb-settings` 面板（收纳间隔选择
+   轮询开关 + 「刷新」按钮 + **「显示归档（N）/ 隐藏归档（N）」开关**（v0.5.4，见第 4 条）+
+   **「设置」按钮** + **组长条**（§5.5）；点击「设置」展开 `.tb-settings` 面板（收纳间隔选择
    5s/15s/30s/60s、「派发到」选择器与归档自动删除保留期配置）。
    - 「派发到」选项：`workspace-lead`（显示「工作区组长（推荐）」，默认）/ `new`（新对话）/
      `creator`（回发起对话）/ `auto`（空闲会话）；值直接取 `snapshot.config.dispatchMode`，
@@ -1312,16 +1357,25 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
      （`uploading` 为计数，连续粘贴不会提前解除禁用）。提交前统计 note 里不同引用数 > 8 时给具体提示
      （与服务端同源，§2.1）。提交时只把含短引用的 note 交给 `add-task`，不传 base64。左侧栏平台看板
      用同一逻辑（§5.1.1 第 2 条）。
-3. **「待你处理」条（v0.2.2，§1.9）**：右栏看板顶部固定区（头部 / 新建行之后、看板主体之前），
-   **仅在 `needsUser` 任务非空时渲染**。标题「待你处理 N」+ 条目列表（`.tb-needs`）：每条显示
-   任务标题 + 问题（单行截断，`title` 属性兜全文），点条目打开该任务的详情浮层。
-   flagged 任务**不再出现在**下面四个 lane / 四列里（避免重复；已归档的 flagged 留在归档列，不进此条）；
-   空时整块不渲染。
+3. **「待处理」列（v0.2.2 顶部「待你处理」条 → v0.5.4 改成列，§1.9）**：右栏看板（wide 的
+   `.tb-board` 与窄的 `.tb-lanes` 两套布局）在「待开始」**之前**渲染 `NeedsColumn`
+   （`.tb-col[data-status="needsUser"]`，标题 `column.attention`「待处理 N」），**仅非空时渲染**：
+   提问卡（`needsUser`，带问题两行 + 「处理」按钮，点标题 / 按钮打开详情回答区）+ 阻塞卡
+   （`doing` + `lastError`，完整卡片 + 警示色左缘 + 首行异常摘要，`data-attention="blocked"`），
+   提问在前、阻塞在后。这两类卡**不重复**出现在状态 lane / 列里（已归档的 flagged 留在归档列）；
+   顶部固定条 `.tb-needs` 在 v0.5.4 删除（两块看板口径一致）。窄栏下这一列也是 compact lane。
 4. **看板主体**（布局见上）：待开始（蓝）/ 进行中（黄）/ 已完成（绿）/ 已归档（灰）。
+   **v0.5.4：归档列默认隐藏**——顶部「显示归档（N）」/「隐藏归档（N）」开关（`aria-expanded`，
+   状态只在组件内，不写 config）展开后才追加「已归档」块（原有重新打开 / 删除照旧）；
+   `.tb-lanes` 隐藏时整块不渲染，宽栏 `.tb-board` 用 `.tb-board[data-archive="false"]` 收缩网格
+   （3 / 4 列，与 `data-needs` 组合时 4 / 5 列）。
    - 每块头部：列名 + 计数 + 快捷动作（待开始：`全部派发`；已完成：`全部归档`）。
    - 卡片（t-33 起）：**只有标题 + 操作按钮**。标题可点打开**任务详情浮层**，2 行截断、`title` 兜全文；
      备注（note）/ result / 工作区 / `#t-3` / 相对时间 / 组长 / 执行者 / `lastError` 全部收进详情浮层，
-     看板上不再展示（宽度不足时靠标题辨认任务）。右栏看板**没有**卡片工作区标签：整块看板本来就绑定
+     看板上不再展示（宽度不足时靠标题辨认任务）。**v0.5.2 异常可见化**：`lastError` 非空时卡片挂
+     `data-lasterror="true"`，CSS 用 `.tb-card[data-lasterror=true]::after` 在右上角画一枚 6px 小红点
+     （`position:absolute`、`pointer-events:none`，**不改卡片结构 / 高度**）——异常全文仍只在详情浮层，
+     看板只给「这张卡有问题，去看详情」的一眼警示。右栏看板**没有**卡片工作区标签：整块看板本来就绑定
      单个工作区，重复标名没有信息量（工作区只出现在新建提示与详情浮层）；那一行标签只在平台看板出现，
      见 §5.1.1 第 4 条。
    - **卡片高度 / 等高（t-42）**：整卡**没有固定高度**——`.tb-card-fixed` 不再有 `min-height:108px`
@@ -1375,7 +1429,8 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
      （兜底会话是「派发到的会话」，语义上是组长会话，不冒充 worker，避免张冠李戴）。
    - **任务详情浮层**（`Detail`，两块看板共用）：点卡片标题或「详情」按钮打开，展示完整标题 / 状态 /
      工作区 / 创建·开始·完成·归档时间 / 组长 / 执行者 / 创建来源 / 任务 id / 完整备注 /
-     完整结论（含 done 但没写结论时的提示）/ 最近错误，并提供按状态的主操作（开始 / 完成 / 归档 / 重新打开）
+     完整结论（含 done 但没写结论时的提示）/ 最近错误（`detail.error`；v0.5.2 起基本信息里还多一行
+     「最近异常」`detail.lastError`，`lastError` 非空时才有），并提供按状态的主操作（开始 / 完成 / 归档 / 重新打开）
      与关闭；点遮罩或 × 关闭。备注 / 结论里的 `![alt](attachment://<id>)` 由 `renderRichText` 渲染为
      `<img class="tb-rich-img">`（打开浮层时按 id 调 `attachment` RPC，内存缓存，`max-width:100%;height:auto`），
      加载中 / 失败显示占位文本，不阻塞其它 Markdown 块。
@@ -1412,12 +1467,18 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 - 所有写操作：乐观更新不做，等 RPC 返回后用返回值替换该任务（简单、无回滚逻辑）。
 - 键盘可达：按钮有 focus ring；新建输入 Enter 提交、Esc 清空；编辑表单 Enter 保存、Esc 取消。
 - i18n：`ctx.get('locale')` 注册 `taskboard` 命名空间，zh/en 两套；locale 不可用则内置中文。
-  v0.2.2 新增「待你处理」文案：`column.needsUser`（待你处理 / Needs you）、`needsUser.title` /
+  v0.2.2 新增「待你处理」文案：`needsUser.title` /
   `needsUser.question` / `needsUser.answerPlaceholder` / `needsUser.submit` /
   `needsUser.badge` / `needsUser.open` / `needsUser.lastAnswer` / `needsUser.answerOk` /
   `needsUser.answerFailed` / `needsUser.answerEmpty` / `needsUser.answerTooLong` /
-  `needsUser.pickOption`，中英双份（没有空态文案键：条 / 列空时整块不渲染）；CSS 适配窄栏
-  （「待你处理」条在窄栏也固定显示在 lane 之前）。
+  `needsUser.pickOption`，中英双份（没有空态文案键：列空时整列不渲染）。
+  v0.5.2 新增 `detail.lastError`（最近异常 / Recent issue），中英双份（详情浮层基本信息行用；
+  卡片小红点不写字，靠 `data-lasterror` 属性 + CSS，无需新文案）。
+  v0.5.3 新增「待处理」列文案：`column.attention`（待处理 / Needs attention，列标题与
+  aria-label）与 `attention.blocked`（阻塞 / Blocked，阻塞卡警示角标），中英双份。
+  v0.5.4 新增归档开关文案 `archive.show` / `archive.hide`（显示归档（{n}） / 隐藏归档（{n}） /
+  Show archived ({n}) / Hide archived ({n})，带条数占位符，中英双份）；右栏顶部固定条删除后
+  `column.needsUser`（待你处理 / Needs you）已无引用，随组件一并移除（`needsUser.badge` 角标文案保留）。
 
 ### 5.4 样式
 
@@ -2443,3 +2504,79 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
     - 看板 `result` 统一改为 **「第 1 行一句话人话结论 + 3～5 条精炼要点」**（非必要不画表格，确保主会话回执前 200 字截取直接是清晰人话）。
   ② **Worker 回报限流减重**：`taskboard-worker` 回报限制在 5～10 行内（首行结果与测试通过数 + 改动文件与退出码），禁止贴整屏 PASS 日志与长篇推导，大幅降低多轮上下文 Token 消耗。
   `package.json` 0.5.0 → 0.5.1。
+
+- v0.5.2（修复「worker 结束但卡片没动、外部完全看不出原因」的完成回写可见性）：
+  ① **异常可见化**：`taskBrief` 新增 `lastError`（`TASK_LIST_OUTPUT_SCHEMA` / `TASK_ONE_OUTPUT_SCHEMA` 同步，
+    共 **15 个已声明键**），`taskboard_list` / `taskboard_update` 渲染「最近异常：…」；看板卡片在 `lastError` 非空时挂
+    `data-lasterror="true"` 小红点（纯 CSS `::after` 绝对定位，不改卡片结构 / 高度），详情浮层基本信息新增
+    「最近异常」行（i18n `detail.lastError`，中英双份）。aborted 中断、直聊卡合入冲突、兜底认领失败这类
+    「卡片停在 doing + 只有 lastError」的异常，从此对组长与用户都一眼可见。
+  ② **兜底认领放宽 + 不再静默**：`handleSubagentEnd` 的兜底候选不再要求 `workerRunState==='running'`，
+    改为「`autoDispatch='lead-dispatch'` + `doing` + `sessionId===parentSessionId` + `workerSessionId` 为空或等于
+    本次 `childId`」，再按 `info.name` / `assignee` 精确匹配（多候选无法区分时仍不猜）；匹配不到卡片、但该组长名下
+    确实还有 `doing` 的自动卡时，用 `recordLeadAutoError` 记一条含 `childId` / `name` / `parentId` / `stopReason` /
+    卡 id 的明确告警（`console.warn` + `Snapshot.leadAuto.lastError`），不再静默 return。
+  ③ **卡住自动卡一次性提醒**：`reconcileOrphanedDoingTasks` 新增识别「`doing` + `autoDispatch='lead-dispatch'` +
+    `workerRunState ∈ {'ended','failed'}` + 超过 `ORPHAN_GRACE_MS` 未更新」的自动卡；所属组长会话在线且 `idle` 时
+    发一条「卡住提醒」（卡 id / 卡在哪一步 / `lastError` 摘要 / 提示 `taskboard_update` 置 done 或先
+    `taskboard_merge_worktree` 处理合入），**绝不自动改状态**；rt 内存 Set（键 = 任务 id + `updatedAt`）去重防刷屏，
+    组长忙 / 离线时不发也不标记，下次 idle 仍会提醒。
+  ④ **尊重显式主工作区指令**：`shouldSkipWorktreeForDispatch` 识别 `不建隔离工作树` / `不要建隔离工作树` /
+    `不要隔离工作树` / `不要使用隔离工作树` / `直接改主工作区` / `在主工作区执行` / `[主工作区]` 等措辞（正则容错；
+    「不要删除隔离工作树里的文件」这类否定对象不同的句子不会误命中，仍按隔离执行）。
+  ⑤ **隔离工作树合入改为逐文件判定（t-209 事故根因：`pages/system-management.html` 被前序切片改过，整份补丁一次判定就误判冲突、卡片停在 doing）**：
+    `mergeAndCleanupTaskWorktree` 不再对整份补丁一次性 `git apply --check`，改为把补丁按 `diff --git` 头切成文件级
+    补丁（保留 binary / rename 段，空 diff / 单文件不退化），逐文件先跑 `git apply --check --reverse`：通过 = 主工作区
+    已存在该改动（alreadyApplied）→ 跳过、不重复应用；其余文件拼成子集补丁，`git apply --check` 通过才应用，成功
+    后照旧清理工作树并返回 `merged:true`，summary 注明「N 个文件已在主工作区存在，仅补入 M 个」；子集里仍有文件
+    失败 → 维持原冲突语义（主工作区不动、保留工作树、返回 `conflict:true` + `conflictFiles`），摘要标出哪些文件其实
+    已在主工作区；全部 alreadyApplied → 视为成功合入（`merged:true`）只回收工作树，卡片不再留在 doing。
+  测试：`test/host.test.mjs` **+7**（taskBrief/渲染 lastError、卡住一次性提醒、显式主工作区措辞、宽松兜底认领、
+  逐文件合入 3 条：全已应用 / 部分已应用 / 真冲突）、`test/client-render.test.mjs` **+1**（卡片小红点 + 详情「最近异常」行）；
+  `node --test` **325 pass / 0 fail**（v0.5.1 基线 317 → 325：`host.test.mjs` 204 → 211、`client-render.test.mjs` 98 → 99）。
+  `package.json` 0.5.1 → 0.5.2（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。
+
+- v0.5.3（「待处理」派生列：用户提问 + 阻塞卡，t-149）：
+  ① **看板「待你处理」第五列升级为「待处理」派生列**（`lib/client.js`；仍然不是 status，任务数据不迁移）：
+    判定集合 = 提问卡（`needsUser === true` 且未归档）+ 阻塞卡（`status === 'doing'` 且 `lastError` 非空：
+    合入冲突 / worker 结束异常 / 执行会话失联）。平台看板最左列标题改 `column.attention`
+    （待处理 / Needs attention，i18n 中英双份），`data-needs="true"` 仍驱动五列网格；两类都没有时
+    整列不渲染（看板回四列）。列内提问在前、阻塞在后，各自按 `updatedAt` 倒序。
+  ② **两类卡视觉可区分、交互不丢**：提问卡沿用 v0.2.2 的 `.tb-needs-card`（问题两行 + 「处理」按钮 +
+    红点），行为不变；阻塞卡复用 `Card`（原有操作按钮 / 「详情」/「对话」全保留），加
+    `data-attention="blocked"` 警示色左缘 + `attention.blocked`（阻塞）角标 + `lastError` 首行摘要
+    （`.tb-card-attn-text` 单行省略、`title` 兜全文；完整文本仍看详情「最近异常」行，v0.5.2 已实现）。
+    两类卡都不在普通四列里重复；右栏看板没有第五列，顶部固定条（`.tb-needs`）保持只列提问卡、
+    不混入阻塞卡，阻塞卡在右栏仍留在「进行中」并保留 v0.5.2 小红点。
+  ③ **纯函数**：`attentionTaskKind` / `attentionTasks` / `withoutAttention` / `lastErrorSummary`
+    （导出到 `__test`；`needsUserTasks` / `withoutNeedsUser` 行为不变，供右栏条 / 角标沿用）。
+  ④ **样式**：阻塞卡警示色左缘 + 摘要单行省略；`@media (max-width:1180px / 620px)` 沿用现有降列规则
+    （五列 → 2 列 → 1 列），不引入横向溢出。
+  测试：`test/client-render.test.mjs` **+4**（只有提问卡 / 只有阻塞卡 / 都没有 / 两类同时存在时
+  提问在前），并同步更新受影响的列数断言（默认夹具含 doing + `lastError` 的 t-3 → 平台看板 5 列）；
+  `node --test` **329 pass / 0 fail**。
+  `package.json` 0.5.2 → 0.5.3（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。
+
+- v0.5.4（看板 UI 精简：归档列默认隐藏 + 右栏看板接入「待处理」列）：
+  ① **「已归档」列默认隐藏**（`lib/client.js` / `docs/architecture.md` §5.1.1 第 6 条 / §5.2 第 4 条）：
+    两块看板顶部操作栏各加一个「显示归档（N）」/「隐藏归档（N）」开关（i18n `archive.show` /
+    `archive.hide`，中英双份、带当前归档条数，`aria-expanded` 表达展开状态），默认不渲染归档列
+    （含原有重新打开 / 删除操作，点开后照旧）；开关状态只存组件本地 state，**不写 config**。
+    网格按可见列数收缩：`.tb-board[data-archive="false"]` → 3 列，与 `data-needs="true"` 组合 → 4 列；
+    平台看板 `≤1180px` / `≤620px` 的 2 列 / 1 列响应式把新属性组合一并覆盖；右栏 `data-layout="medium"`
+    （560–900px）补一条同级 `.tb-page[data-layout=medium] .tb-board[data-needs=true][data-archive=false]`
+    保持 2 列——**不留空列、不横向溢出**。
+  ② **右栏看板「待处理」列**（§1.9 第 3 条 / §5.2 第 3 条）：`NeedsColumn` 接进右栏 `BoardTab` 的
+    wide `.tb-board` 与窄 `.tb-lanes` 两套布局，排在最前、仅非空时渲染；提问卡 + 阻塞卡
+    （`doing` + `lastError`）都不再出现在普通列——右栏原先用 `withoutNeedsUser`，改 `withoutAttention`。
+    顶部固定条 `NeedsBanner`（`.tb-needs`，唯一读 `bind.needsUserTasks` 的组件）随之删除，
+    提问卡统一在列内「处理」按钮 / 详情浮层处理（回答流程不变）；`column.needsUser` 文案键与
+    `bind.needsUserTasks` 字段一并移除（`needsUser.badge` 角标文案保留）。
+  ③ **列数组合**：平台看板最多 4 列（待处理 + 待开始 + 进行中 + 已完成，归档隐藏）/ 5 列（展开归档）；
+    右栏 wide 同口径，窄 `.tb-lanes` 最多 5 条 lane；列头仍是单行省略，不挤爆。
+    测试：`test/client-render.test.mjs` **+4**（归档开关默认隐藏→展开→收起、右栏待处理列/阻塞卡不在进行中、
+    无待处理卡时退回普通列、归档网格与中英开关文案），并同步更新受影响的列数 / 文案断言
+    （右栏 4→3 lane / wide 4→3 列、平台 5→4 列、归档卡默认不渲染等）；
+    `test/client-bind-writeback.test.mjs` 去掉已删除的 `needsUserTasks` bind 字段；
+    `node --test` **333 pass / 0 fail**（v0.5.3 基线 329 → 333）。
+  ④ `package.json` 0.5.3 → 0.5.4（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）；README 同步一句。

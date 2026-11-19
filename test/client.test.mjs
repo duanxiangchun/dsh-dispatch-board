@@ -545,10 +545,10 @@ test('v0.2.2 待你处理：i18n 文案中英齐全', () => {
   const zh = exported.__test.DICT_ZH
   const en = exported.__test.DICT_EN
 
-  assert.equal(zh['column.needsUser'], '待你处理')
-  assert.equal(en['column.needsUser'], 'Needs you')
+  // v0.5.4：右栏顶部「待你处理」固定条已删，提问卡统一进「待处理」列 → column.needsUser 键随之移除。
+  assert.equal(zh['column.needsUser'], undefined)
+  assert.equal(en['column.needsUser'], undefined)
   const keys = [
-    'column.needsUser',
     'needsUser.title',
     'needsUser.question',
     'needsUser.answerPlaceholder',

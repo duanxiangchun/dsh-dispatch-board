@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Task board + dispatcher mode",
-    "description": "Task board + workspace-lead dispatch: talk to the main session; leads dispatch workers and the four-column board tracks progress and results."
+    "description": "Task board + workspace-lead dispatch: talk to the main session; leads dispatch workers and the status-column board tracks progress and results (the archived column collapses)."
   }
 }

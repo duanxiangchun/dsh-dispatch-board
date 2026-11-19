@@ -14,13 +14,14 @@ const clientSource = readFileSync(join(here, '..', 'lib', 'client.js'), 'utf8')
  * 选项不填入、「回复并继续」恒禁用。v0.2.5 拆分双看板时侧边栏漏抄过一次。
  * ══════════════════════════════════════════════════════════════ */
 
-test('t-92 回归守卫：needsUserTasks / answerDraft / answerError 在两份看板副本的 bind 回写里各出现 ≥2 次', () => {
+test('t-92 回归守卫：answerDraft / answerError 等 bind 字段在两份看板副本的 bind 回写里各出现 ≥2 次', () => {
+  // v0.5.4：提问卡 + 阻塞卡统一进「待处理」列，顶部固定条（唯一读 needsUserTasks 的组件）已删，
+  // 该 bind 字段一并移除；回答框相关字段仍然必须两份副本都回写。
   const fields = [
     'boardBindRef.current.allTasks',
     'boardBindRef.current.config',
     'boardBindRef.current.showSettings',
     'boardBindRef.current.retentionDraft',
-    'boardBindRef.current.needsUserTasks',
     'boardBindRef.current.answerDraft',
     'boardBindRef.current.answerError',
   ]

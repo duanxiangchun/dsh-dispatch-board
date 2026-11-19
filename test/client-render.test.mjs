@@ -672,6 +672,8 @@ const TASK_TITLES = [
 
 const WS_A_TITLES = ['梳理看板数据模型', '打通宿主 RPC']
 const COLUMN_TITLES = ['待开始', '进行中', '已完成', '已归档']
+// v0.5.4：「已归档」列默认隐藏 → 默认可见的只有前三个状态列。
+const VISIBLE_COLUMN_TITLES = ['待开始', '进行中', '已完成']
 const CARD_BUTTONS = ['开始', '立即派发', '完成', '归档', '重新打开', '打回', '编辑', '删除']
 
 /* ══════════════════════════════════════════════════════════════
@@ -898,18 +900,19 @@ test('BoardTab（窄栏）：只显示本工作区任务，.tb-lanes + 新建提
   assert.equal(nodesWithClass(tree, 'tb-notice').length, 0, 'known workspace must not show the unknown notice')
 
   const columns = nodesWithClass(tree, 'tb-col')
-  assert.equal(columns.length, 4, 'four status lanes must render')
+  assert.equal(columns.length, 3, 'v0.5.4：归档 lane 默认隐藏，只渲染三个状态 lane')
   assert.deepEqual(
     columns.map((node) => node.props['data-status']),
-    ['todo', 'doing', 'done', 'archived'],
+    ['todo', 'doing', 'done'],
   )
   for (const column of columns) {
     assert.equal(column.props['data-compact'], 'true', 'narrow lanes are compact')
   }
   const columnText = columns.map((node) => textOf(node)).join('|')
-  for (const label of COLUMN_TITLES) {
+  for (const label of VISIBLE_COLUMN_TITLES) {
     assert.ok(columnText.includes(label), 'missing column title: ' + label)
   }
+  assert.ok(!columnText.includes('已归档'), '归档 lane 默认不渲染')
 
   // 只显示 cwd 属于工作区 A 的两条任务
   const cards = nodesWithClass(tree, 'tb-card')
@@ -1065,7 +1068,11 @@ test('BoardTab（宽栏）：fullscreen 时用 .tb-board 四列，页脚含 boar
   assert.equal(nodesWithClass(tree, 'tb-lanes').length, 0)
 
   const columns = nodesWithClass(tree, 'tb-col')
-  assert.equal(columns.length, 4)
+  assert.equal(columns.length, 3, 'v0.5.4：归档列默认隐藏')
+  assert.deepEqual(
+    columns.map((node) => node.props['data-status']),
+    ['todo', 'doing', 'done'],
+  )
   for (const column of columns) {
     assert.equal(column.props['data-compact'], 'false')
   }
@@ -1109,7 +1116,7 @@ test('BoardTab：工作区未知（无 sessionId / 历史会话）时给说明�
 
   assert.equal(tree.props['data-narrow'], 'true')
   assert.equal(nodesWithClass(tree, 'tb-card').length, 0, 'unknown workspace shows no tasks')
-  assert.equal(nodesWithClass(tree, 'tb-col').length, 4, 'empty board still renders the four lanes')
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 3, 'empty board still renders the three visible lanes (归档默认隐藏)')
   const notices = nodesWithClass(tree, 'tb-notice')
   assert.equal(notices.length, 1)
   assert.ok(includesText(notices[0], '无法确定当前工作区'))
@@ -1279,12 +1286,15 @@ test('PlatformBoard：默认显示全部工作区任务，可按工作区过滤�
   assert.ok(includesText(tree, '任务看板'))
   assert.ok(includesText(tree, '共 5 条'), 'header shows the total task count')
 
+  // v0.5.3：默认夹具里的 t-3 是 doing + lastError（阻塞卡），会多出最左「待处理」列；
+  // v0.5.4：「已归档」列默认隐藏 → 待处理 + 待开始 + 进行中 + 已完成 = 4 列。
   assert.equal(nodesWithClass(tree, 'tb-col').length, 4)
-  assert.equal(nodesWithClass(tree, 'tb-card').length, 5, 'all tasks render by default')
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 4, '默认只渲染未归档的 4 张卡（阻塞卡不重复）')
   const pageText = textOf(tree)
-  for (const title of TASK_TITLES) {
+  for (const title of TASK_TITLES.slice(0, 4)) {
     assert.ok(pageText.includes(title), 'missing task: ' + title)
   }
+  assert.ok(!pageText.includes('归档过期的旧任务'), 'v0.5.4：归档卡默认不渲染，点「显示归档」后才出现')
 
   // t-33：卡片 meta（含工作区 tag / note / result）整体移除，工作区只靠工具栏筛选和详情浮层表达
   assert.equal(nodesWithClass(tree, 'tb-card-tag').length, 0, 'workspace tags are gone with the card meta')
@@ -1323,9 +1333,9 @@ test('PlatformBoard：卡片显示一行工作区标签（title 优先 / 目录�
   const harness = createHarness({ snapshot: makeSnapshot() })
   const { tree } = await renderComponent(harness.componentOf('main'), {})
 
-  // 5 条任务（2 条 A、2 条 B、1 条无 cwd）：每张卡片都有一行 .tb-card-workspace
-  assert.equal(nodesWithClass(tree, 'tb-card').length, 5, 'all tasks render by default')
-  assert.equal(nodesWithClass(tree, 'tb-card-workspace').length, 5, '每张平台看板卡片都带工作区标签')
+  // 4 张可见卡（归档卡默认隐藏）：每张卡片都有一行 .tb-card-workspace
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 4, '默认渲染 4 张卡（归档列隐藏）')
+  assert.equal(nodesWithClass(tree, 'tb-card-workspace').length, 4, '每张平台看板卡片都带工作区标签')
 
   // cwd 命中 snapshot.workspaces → 用工作区 title（不是路径尾段）
   const cardA = cardByTitle(tree, '梳理看板数据模型')
@@ -1419,9 +1429,9 @@ test('PlatformBoard：恢复持久化的「工作区」过滤选择，切换后�
   // 打开看板即恢复：过滤器选中 B，只显示 B 的两条任务
   const filterSelect = selectByAria(tree, '工作区')
   assert.equal(filterSelect.props.value, WS_B, '上次选择的工作区必须被恢复')
-  assert.equal(nodesWithClass(tree, 'tb-card').length, 2)
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 1, 'B 的两条里归档那条默认隐藏')
   assert.ok(includesText(tree, '实现轮询自动派发'))
-  assert.ok(includesText(tree, '归档过期的旧任务'))
+  assert.ok(!includesText(tree, '归档过期的旧任务'), 'v0.5.4：归档卡默认隐藏')
   assert.ok(!includesText(tree, '梳理看板数据模型'))
   assert.ok(includesText(tree, '共 2 条'), 'toolbar count follows the restored filter')
 
@@ -1429,7 +1439,7 @@ test('PlatformBoard：恢复持久化的「工作区」过滤选择，切换后�
   filterSelect.props.onChange({ target: { value: '' } })
   const cleared = await instance.run()
   assert.equal(selectByAria(cleared, '工作区').props.value, '')
-  assert.equal(nodesWithClass(cleared, 'tb-card').length, 5)
+  assert.equal(nodesWithClass(cleared, 'tb-card').length, 4, '全部工作区 → 4 张未归档卡')
   let calls = harness.rpcCalls.filter((call) => call.endpoint === 'set-workspace-filter')
   assert.equal(calls.length, 1)
   assert.deepEqual(Object.assign({}, calls[0].payload), { path: '' }, '「全部工作区」也必须能被记住')
@@ -1452,7 +1462,7 @@ test('PlatformBoard：持久化的工作区已不存在（被删 / 改名）→ 
 
   assert.equal(selectByAria(tree, '工作区').props.value, '', '无效值不得被当成选中项')
   assert.deepEqual(optionTexts(selectByAria(tree, '工作区')), ['全部工作区', '工作区 A', 'b'])
-  assert.equal(nodesWithClass(tree, 'tb-card').length, 5, '回退「全部工作区」显示全部任务')
+  assert.equal(nodesWithClass(tree, 'tb-card').length, 4, '回退「全部工作区」显示全部未归档任务')
   assert.deepEqual(harness.sandboxErrors, [], '脏值不能让看板抛错 / 白屏')
 })
 
@@ -1625,7 +1635,7 @@ test('PlatformBoard：用户选 B 之后才返回的旧 snapshot（config.worksp
 
   // 旧 snapshot 确实被采用（工作区选项出现、任务渲染）……
   assert.deepEqual(optionTexts(selectByAria(next, '任务所属工作区')), ['选择工作区', '工作区 A', 'b'])
-  assert.equal(nodesWithClass(next, 'tb-card').length, 5, '旧 snapshot 的看板数据要正常落地')
+  assert.equal(nodesWithClass(next, 'tb-card').length, 4, '旧 snapshot 的看板数据要正常落地（归档列默认隐藏）')
   // ……但新建行「任务所属工作区」不能被它恢复成 A（否则用户刚选的 B 被旧值覆盖）。
   assert.equal(selectByAria(next, '任务所属工作区').props.value, WS_B, '晚到的旧 snapshot 不得覆盖用户刚选的 B')
   assert.equal(countCalls(harness, 'set-workspace-draft'), 1, '恢复被守卫拦下，不得把旧值 A 回写 Host')
@@ -1712,7 +1722,7 @@ test('PlatformBoard：快照为空时显示空态与空工作区下拉（不抛�
   const { tree } = await renderComponent(harness.componentOf('main'), {})
 
   assert.equal(nodesWithClass(tree, 'tb-card').length, 0)
-  assert.equal(nodesWithClass(tree, 'tb-col').length, 4, 'columns still render when empty')
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 3, 'columns still render when empty（归档默认隐藏）')
   assert.ok(includesText(tree, '没有任务。选个工作区加一条，主 Agent 会自动接手。'))
   assert.ok(includesText(tree, '共 0 条'))
 
@@ -1732,7 +1742,7 @@ test('PlatformBoard：RPC 报错时降级渲染（错误 banner + 四列仍在�
   const { tree } = await renderComponent(harness.componentOf('main'), {})
 
   assert.ok(hasClass(tree, 'tb-page'))
-  assert.equal(nodesWithClass(tree, 'tb-col').length, 4)
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 3)
   assert.equal(nodesWithClass(tree, 'tb-card').length, 0)
   const banners = nodesWithClass(tree, 'tb-banner')
   assert.equal(banners.length, 1)
@@ -1772,7 +1782,7 @@ test('BoardTab：RPC 报错时降级渲染（错误 banner + 四列仍在，不�
   const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
 
   assert.ok(hasClass(tree, 'tb-page'))
-  assert.equal(nodesWithClass(tree, 'tb-col').length, 4)
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 3)
   assert.equal(nodesWithClass(tree, 'tb-card').length, 0)
   const banners = nodesWithClass(tree, 'tb-banner')
   assert.equal(banners.length, 1)
@@ -1785,16 +1795,12 @@ test('BoardTab：snapshot 为空对象时降级渲染（四列空态，不抛异
   const harness = createHarness({ snapshot: {} })
   const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
 
-  assert.equal(nodesWithClass(tree, 'tb-col').length, 4)
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 3)
   assert.equal(nodesWithClass(tree, 'tb-card').length, 0)
-  for (const empty of [
-    '没有待开始的任务',
-    '没有正在执行的任务',
-    '还没有完成的任务',
-    '归档区是空的',
-  ]) {
+  for (const empty of ['没有待开始的任务', '没有正在执行的任务', '还没有完成的任务']) {
     assert.ok(includesText(tree, empty), 'missing empty state: ' + empty)
   }
+  assert.ok(!includesText(tree, '归档区是空的'), 'v0.5.4：归档 lane 默认隐藏，空态也不渲染')
   assert.ok(!includesText(tree, '上次检查'))
 })
 
@@ -2009,7 +2015,11 @@ test('PlatformBoard：详情主操作按状态映射，点击后发 update-task 
     { title: '归档过期的旧任务', id: 't-5', action: '重新打开', status: 'todo' },
   ]
 
-  let current = tree
+  // v0.5.4：归档列默认隐藏，先点「显示归档（1）」把归档卡切出来。
+  const archiveToggle = buttons(tree).find((node) => textOf(node).trim().startsWith('显示归档'))
+  assert.ok(archiveToggle, '默认必须提供「显示归档」开关')
+  archiveToggle.props.onClick()
+  let current = await instance.run()
   for (const item of cases) {
     current = await openDetailByTitle(instance, current, item.title)
     const primary = detailPrimaryButton(current)
@@ -2041,8 +2051,12 @@ test('两块看板都能打开详情浮层（右栏点标题 / 平台点「详�
   const platformHarness = createHarness({ snapshot: makeSnapshot() })
   const platform = await renderComponent(platformHarness.componentOf('main'), {})
   const detailButtons = buttons(platform.tree).filter((node) => textOf(node).trim() === '详情')
-  assert.ok(detailButtons.length >= 5, 'every platform card must expose a 详情 button')
-  detailButtons[0].props.onClick()
+  assert.ok(detailButtons.length >= 4, 'every visible platform card must expose a 详情 button')
+  // v0.5.3：最左「待处理」列的阻塞卡排在普通列之前，不能按全局顺序取第一个，按卡片标题定位。
+  const platformCard = cardByTitle(platform.tree, '梳理看板数据模型')
+  const platformDetailButton = buttons(platformCard).find((node) => textOf(node).trim() === '详情')
+  assert.ok(platformDetailButton, 'task card must expose 详情')
+  platformDetailButton.props.onClick()
   const platformTree = await platform.instance.run()
   assert.ok(detailBox(platformTree), 'platform board detail must render')
   const platformHeading = collect(detailBox(platformTree)).find((node) => node.type === 'h2')
@@ -3880,13 +3894,18 @@ function answerSubmitButton(tree) {
 }
 
 async function openNeedsDetail(instance, tree) {
-  const item = nodesWithClass(tree, 'tb-needs-item')[0]
-  assert.ok(item, '待你处理条必须渲染可点条目')
-  item.props.onClick()
+  // v0.5.4：右栏顶部固定条已删，提问卡统一在「待处理」列里，点卡上的「处理」按钮。
+  const needsCol = nodesWithClass(tree, 'tb-col').find((node) => node.props['data-status'] === 'needsUser')
+  assert.ok(needsCol, '右栏看板必须渲染「待处理」列')
+  const card = nodesWithClass(needsCol, 'tb-needs-card')[0]
+  assert.ok(card, '「待处理」列必须渲染提问卡')
+  const button = buttons(card).find((node) => textOf(node).trim() === '处理')
+  assert.ok(button, '提问卡必须带「处理」按钮')
+  button.props.onClick()
   return instance.run()
 }
 
-test('待你处理：flagged 任务出现在顶部条与第五列，且不在普通列', async () => {
+test('待处理：flagged 任务出现在两块看板的「待处理」列，且不在普通列', async () => {
   const snapshot = makeSnapshot({
     tasks: [
       needsTask(),
@@ -3896,15 +3915,19 @@ test('待你处理：flagged 任务出现在顶部条与第五列，且不在普
   const harness = createHarness({ snapshot, sessionCwd: WS_A })
   const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
 
-  const banner = nodesWithClass(tree, 'tb-needs')
-  assert.equal(banner.length, 1, '右栏顶部必须有「待你处理」条')
-  const bannerText = textOf(banner[0])
-  assert.ok(bannerText.includes('待你处理'), 'banner title')
-  assert.ok(bannerText.includes('需要你选方案'), 'banner lists the task title')
-  assert.ok(bannerText.includes('方案 A 还是方案 B？'), 'banner shows the question')
-  assert.equal(nodesWithClass(tree, 'tb-needs-item').length, 1)
-  assert.equal(cardTitleNode(tree, '需要你选方案'), null, 'flagged 任务不得出现在普通 lane 里')
-  assert.ok(cardTitleNode(tree, '普通待开始'), '普通任务照常渲染')
+  // v0.5.4：右栏看板也有「待处理」列（提问卡 + 阻塞卡），顶部固定条已删。
+  const rightNeeds = nodesWithClass(tree, 'tb-col').find((col) => col.props['data-status'] === 'needsUser')
+  assert.ok(rightNeeds, '右栏看板必须有「待处理」列')
+  const needsText = textOf(rightNeeds)
+  assert.ok(needsText.includes('待处理'), 'column title')
+  assert.ok(needsText.includes('需要你选方案'), 'column lists the task title')
+  assert.ok(needsText.includes('方案 A 还是方案 B？'), 'column shows the question')
+  assert.ok(needsText.includes('处理'), '提问卡带「处理」按钮')
+  assert.equal(nodesWithClass(tree, 'tb-needs').length, 0, 'v0.5.4：顶部固定条已删，不再重复')
+  const rightTodoLane = nodesWithClass(tree, 'tb-col').find((col) => col.props['data-status'] === 'todo')
+  assert.ok(!textOf(rightTodoLane).includes('需要你选方案'), 'flagged 任务不得出现在普通 lane 里')
+  assert.ok(textOf(rightTodoLane).includes('普通待开始'), '普通任务照常渲染')
+  assert.ok(!textOf(rightNeeds).includes('普通待开始'), '普通任务不进「待处理」列')
 
   // 平台看板：第五列在最左（待开始之前），flagged 不重复进普通四列
   const platform = createHarness({ snapshot })
@@ -3914,7 +3937,7 @@ test('待你处理：flagged 任务出现在顶部条与第五列，且不在普
   const cols = nodesWithClass(platformTree, 'tb-col')
   assert.equal(cols[0].props['data-status'], 'needsUser', '第五列放在最左（待开始之前）')
   const needsColText = textOf(cols[0])
-  assert.ok(needsColText.includes('待你处理'))
+  assert.ok(needsColText.includes('待处理'), 'v0.5.3 起列标题是「待处理」')
   assert.ok(needsColText.includes('需要你选方案'))
   assert.ok(needsColText.includes('方案 A 还是方案 B？'), '第五列卡片显示问题一行')
   assert.ok(needsColText.includes('处理'), '第五列卡片带「处理」按钮')
@@ -3923,19 +3946,430 @@ test('待你处理：flagged 任务出现在顶部条与第五列，且不在普
   assert.ok(textOf(todoCol).includes('普通待开始'))
 })
 
-test('待你处理：没有 flagged 任务时不渲染顶部条与第五列', async () => {
-  const snapshot = makeSnapshot()
+test('待处理：没有提问卡 / 阻塞卡时两块看板都不渲染「待处理」列', async () => {
+  // 显式给空任务列表：默认夹具里有 doing + lastError 的 t-3，在新语义下会进「待处理」列。
+  const snapshot = makeSnapshot({ tasks: [] })
   const harness = createHarness({ snapshot, sessionCwd: WS_A })
   const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
-  assert.equal(nodesWithClass(tree, 'tb-needs').length, 0, '空列表时整块不渲染')
+  assert.equal(
+    nodesWithClass(tree, 'tb-col').filter((col) => col.props['data-status'] === 'needsUser').length,
+    0,
+    '空列表时右栏整列不渲染',
+  )
 
   const platform = createHarness({ snapshot })
   const platformTree = (await renderComponent(platform.componentOf('main'), {})).tree
   const board = nodesWithClass(platformTree, 'tb-board')[0]
   assert.equal(board.props['data-needs'], 'false')
   const cols = nodesWithClass(platformTree, 'tb-col')
-  assert.equal(cols.length, 4, '没有 flagged 时仍是四列')
+  assert.equal(cols.length, 3, '没有待处理卡 + 归档默认隐藏 → 三列')
   assert.equal(cols.filter((col) => col.props['data-status'] === 'needsUser').length, 0)
+})
+
+/* ── v0.5.3「待处理」派生列：提问卡 + 阻塞卡（§5.1.1）──────────────── */
+
+test('待处理：只有提问卡时看板四列（归档默认隐藏），提问卡在最左列（updatedAt 倒序）且能回答', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      needsTask({
+        id: 't-q-old',
+        title: '先确认范围',
+        question: '范围选 A 还是 B？',
+        askedAt: minutesAgo(60),
+        updatedAt: minutesAgo(6),
+      }),
+      needsTask({
+        id: 't-q-new',
+        title: '再确认凭据',
+        question: '凭据用哪个账号？',
+        askedAt: minutesAgo(30),
+        updatedAt: minutesAgo(2),
+      }),
+      { id: 't-plain-1', title: '普通待开始', status: 'todo', cwd: WS_A, updatedAt: minutesAgo(5) },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  const board = nodesWithClass(tree, 'tb-board')[0]
+  assert.equal(board.props['data-needs'], 'true', '只有提问卡时也切出「待处理」列')
+  const cols = nodesWithClass(tree, 'tb-col')
+  assert.equal(cols.length, 4, '提问卡 + 三个状态列（归档默认隐藏）')
+  assert.deepEqual(
+    cols.map((col) => col.props['data-status']),
+    ['needsUser', 'todo', 'doing', 'done'],
+    '「待处理」列在最左（待开始之前）',
+  )
+  const needsCol = cols[0]
+  assert.equal(needsCol.props['data-attention'], 'true')
+  assert.ok(textOf(needsCol).includes('待处理'), '列标题是「待处理」')
+  assert.equal(textOf(nodesWithClass(needsCol, 'tb-colcount')[0]), '2')
+  const questionCards = nodesWithClass(needsCol, 'tb-needs-card')
+  assert.equal(questionCards.length, 2, '两条提问卡都在「待处理」列')
+  assert.deepEqual(
+    questionCards.map((card) => textOf(nodesWithClass(card, 'tb-card-title')[0])),
+    ['再确认凭据', '先确认范围'],
+    '提问卡按 updatedAt 倒序',
+  )
+  assert.equal(nodesWithClass(needsCol, 'tb-card-attn').length, 0, '没有阻塞卡时不出异常摘要')
+
+  const todoCol = cols.find((col) => col.props['data-status'] === 'todo')
+  assert.ok(!textOf(todoCol).includes('先确认范围'), '提问卡不重复进普通四列')
+
+  // 点「处理」打开详情浮层，回答区照常可用（交互与 v0.2.2 一致）
+  const openBtn = buttons(questionCards[0]).find((node) => textOf(node).trim() === '处理')
+  assert.ok(openBtn, '提问卡带「处理」按钮')
+  openBtn.props.onClick()
+  const opened = await instance.run()
+  assert.ok(detailMask(opened), '必须打开详情浮层')
+  assert.ok(nodesWithClass(opened, 'tb-detail-needs')[0], '详情里有「需要你处理」回答区')
+  assert.ok(includesText(opened, '凭据用哪个账号？'))
+  assert.ok(includesText(opened, '回复并继续'))
+})
+
+test('待处理：只有阻塞卡时看板四列（归档默认隐藏），阻塞卡显示 lastError 首行摘要且能打开详情', async () => {
+  const blockedError = 'worker 结束（error）：合入冲突\n冲突文件：lib/a.js、lib/b.js'
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 't-block-1',
+        title: '合入冲突的任务',
+        status: 'doing',
+        cwd: WS_A,
+        lastError: blockedError,
+        updatedAt: minutesAgo(1),
+      },
+      {
+        id: 't-block-2',
+        title: 'worker 异常的任务',
+        status: 'doing',
+        cwd: WS_B,
+        lastError: 'worker 结束（aborted）：没有返回结论',
+        updatedAt: minutesAgo(4),
+      },
+      { id: 't-doing-ok', title: '正常进行中的任务', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(6) },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree, instance } = await renderComponent(harness.componentOf('main'), {})
+
+  const board = nodesWithClass(tree, 'tb-board')[0]
+  assert.equal(board.props['data-needs'], 'true', '只有阻塞卡时也切出「待处理」列')
+  const cols = nodesWithClass(tree, 'tb-col')
+  assert.equal(cols.length, 4, '阻塞卡 + 三个状态列（归档默认隐藏）')
+  assert.equal(cols[0].props['data-status'], 'needsUser', '「待处理」列在最左')
+  const needsColText = textOf(cols[0])
+  assert.ok(needsColText.includes('待处理'))
+  assert.ok(needsColText.includes('阻塞'), '阻塞卡带「阻塞」警示标签')
+
+  const blockedCards = nodesWithClass(cols[0], 'tb-card').filter(
+    (card) => card.props['data-attention'] === 'blocked',
+  )
+  assert.equal(blockedCards.length, 2, '两条阻塞卡都在「待处理」列')
+  assert.deepEqual(
+    blockedCards.map((card) => textOf(nodesWithClass(card, 'tb-card-title')[0])),
+    ['合入冲突的任务', 'worker 异常的任务'],
+    '阻塞卡按 updatedAt 倒序',
+  )
+  const first = blockedCards[0]
+  assert.equal(first.props['data-lasterror'], 'true', '阻塞卡保留 v0.5.2 的异常小红点标记')
+  const summary = nodesWithClass(first, 'tb-card-attn-text')[0]
+  assert.ok(summary, '阻塞卡必须显示异常摘要')
+  assert.equal(textOf(summary), 'worker 结束（error）：合入冲突', '摘要只取 lastError 首行')
+  assert.equal(summary.props.title, blockedError, 'title 属性兜完整异常文本')
+  assert.ok(!textOf(first).includes('冲突文件'), '第二行不进卡片（完整文本看详情）')
+  // 原有操作不丢：阻塞卡仍是完整卡片（详情 / 完成 / 打回 / 编辑 / 对话）
+  const firstButtons = buttons(first).map((node) => textOf(node).trim())
+  for (const label of ['详情', '完成', '打回', '编辑']) {
+    assert.ok(firstButtons.includes(label), '阻塞卡保留原有操作：' + label)
+  }
+
+  // 点击标题打开详情：「最近异常」行给完整文本（含第二行）
+  const opened = await openDetailByTitle(instance, tree, '合入冲突的任务')
+  const { dts, dds } = detailLabels(opened)
+  assert.ok(dts.includes('最近异常'))
+  assert.ok(dds.includes(blockedError), '详情「最近异常」展示完整异常')
+
+  // 阻塞卡不重复进「进行中」，正常 doing 卡照旧
+  const doingCol = cols.find((col) => col.props['data-status'] === 'doing')
+  assert.ok(!textOf(doingCol).includes('合入冲突的任务'), '阻塞卡不重复进普通四列')
+  assert.ok(textOf(doingCol).includes('正常进行中的任务'))
+})
+
+test('待处理：提问卡与阻塞卡同时存在时提问在前、阻塞在后（即使阻塞卡更新）', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 't-mix-block',
+        title: '阻塞的新卡',
+        status: 'doing',
+        cwd: WS_A,
+        lastError: 'worker 结束（error）：合入冲突',
+        updatedAt: minutesAgo(1),
+      },
+      needsTask({ id: 't-mix-q', title: '提问的旧卡', askedAt: minutesAgo(9), updatedAt: minutesAgo(9) }),
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+
+  const needsCol = nodesWithClass(tree, 'tb-col')[0]
+  assert.equal(needsCol.props['data-status'], 'needsUser')
+  const cards = nodesWithClass(needsCol, 'tb-card')
+  assert.deepEqual(
+    cards.map((card) => textOf(nodesWithClass(card, 'tb-card-title')[0])),
+    ['提问的旧卡', '阻塞的新卡'],
+    '提问卡永远排在阻塞卡之前',
+  )
+  assert.deepEqual(
+    cards.map((card) => card.props['data-attention']),
+    ['question', 'blocked'],
+    '两类卡用 data-attention 区分（红点/可回答 vs 警示色+异常摘要）',
+  )
+  assert.equal(textOf(nodesWithClass(needsCol, 'tb-colcount')[0]), '2')
+})
+
+test('待处理：既没有提问卡也没有阻塞卡时回三列（done + lastError / 空 lastError 都不算阻塞）', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      { id: 't-c-todo', title: '普通待开始', status: 'todo', cwd: WS_A, updatedAt: minutesAgo(1) },
+      { id: 't-c-doing-ok', title: '正常进行中', status: 'doing', cwd: WS_A, lastError: '', updatedAt: minutesAgo(2) },
+      {
+        id: 't-c-done-err',
+        title: '已完成但带历史异常',
+        status: 'done',
+        cwd: WS_A,
+        lastError: '上一位 worker 结束（aborted）',
+        updatedAt: minutesAgo(3),
+      },
+      {
+        id: 't-c-arch-flagged',
+        title: '归档但残留提问标记',
+        status: 'archived',
+        cwd: WS_A,
+        needsUser: true,
+        question: '归档任务不该出现的问题',
+        updatedAt: minutesAgo(4),
+      },
+    ],
+  })
+  const platform = createHarness({ snapshot })
+  const { tree } = await renderComponent(platform.componentOf('main'), {})
+
+  const board = nodesWithClass(tree, 'tb-board')[0]
+  assert.equal(board.props['data-needs'], 'false', '没有待处理卡时不切「待处理」列')
+  const cols = nodesWithClass(tree, 'tb-col')
+  assert.deepEqual(
+    cols.map((col) => col.props['data-status']),
+    ['todo', 'doing', 'done'],
+    '两类卡都没有 + 归档默认隐藏 → 三列',
+  )
+  assert.equal(nodesWithClass(tree, 'tb-needs-card').length, 0, '没有提问卡')
+  assert.equal(
+    collect(tree).filter((node) => node.props && node.props['data-attention'] === 'blocked').length,
+    0,
+    '没有阻塞卡（done + lastError 不算、doing + 空 lastError 不算）',
+  )
+  // v0.5.2 行为不变：done 任务的 lastError 仍只在普通列挂小红点，不进「待处理」
+  assert.equal(cardByTitle(tree, '已完成但带历史异常').props['data-lasterror'], 'true')
+  assert.ok(!textOf(tree).includes('归档任务不该出现的问题'), '归档任务的问题不渲染')
+
+  // 右栏「待处理」列同样不渲染
+  const right = createHarness({ snapshot, sessionCwd: WS_A })
+  const rightTree = (await renderNarrow(right.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })).tree
+  assert.equal(
+    nodesWithClass(rightTree, 'tb-col').filter((col) => col.props['data-status'] === 'needsUser').length,
+    0,
+  )
+})
+
+/* ── v0.5.4：归档列默认隐藏 + 右栏看板接入「待处理」列（§5.1.1 / §5.2）────── */
+
+/** 看板顶部的归档开关（文案带条数：「显示归档（N）」/「隐藏归档（N）」）。 */
+function archiveToggle(tree) {
+  return buttons(tree).find((node) => /^(显示归档|隐藏归档)（\d+）$/.test(textOf(node).trim())) || null
+}
+
+test('v0.5.4 归档开关：两块看板默认隐藏「已归档」列，点开后出现（含重新打开），再点收起', async () => {
+  const harness = createHarness({ snapshot: makeSnapshot() })
+  const platform = await renderComponent(harness.componentOf('main'), {})
+
+  // 平台看板：默认待处理 + 三列，归档卡不渲染，开关写「显示归档（1）」
+  let tree = platform.tree
+  assert.equal(nodesWithClass(tree, 'tb-board')[0].props['data-archive'], 'false', '默认 data-archive=false')
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 4)
+  assert.equal(cardByTitle(tree, '归档过期的旧任务'), null, '归档卡默认不渲染')
+  let toggle = archiveToggle(tree)
+  assert.ok(toggle, '顶部必须有「显示归档（N）」开关')
+  assert.equal(textOf(toggle).trim(), '显示归档（1）', '开关带当前归档条数')
+  assert.equal(toggle.props['aria-expanded'], 'false')
+
+  // 点开 → 归档列插在最后（第 5 列），归档卡带「重新打开」操作
+  toggle.props.onClick()
+  tree = await platform.instance.run()
+  assert.equal(nodesWithClass(tree, 'tb-board')[0].props['data-archive'], 'true')
+  const cols = nodesWithClass(tree, 'tb-col')
+  assert.deepEqual(
+    cols.map((col) => col.props['data-status']),
+    ['needsUser', 'todo', 'doing', 'done', 'archived'],
+    '待处理 + 三个状态列 + 归档列',
+  )
+  const archivedCard = cardByTitle(tree, '归档过期的旧任务')
+  assert.ok(archivedCard, '展开后归档卡渲染')
+  const archivedButtons = buttons(archivedCard).map((node) => textOf(node).trim())
+  assert.ok(archivedButtons.includes('重新打开'), '归档列保留原有重新打开操作')
+  toggle = archiveToggle(tree)
+  assert.equal(textOf(toggle).trim(), '隐藏归档（1）')
+  assert.equal(toggle.props['aria-expanded'], 'true')
+
+  // 再点 → 收起，回到 4 列且归档卡消失
+  toggle.props.onClick()
+  tree = await platform.instance.run()
+  assert.equal(nodesWithClass(tree, 'tb-board')[0].props['data-archive'], 'false')
+  assert.equal(nodesWithClass(tree, 'tb-col').length, 4)
+  assert.equal(cardByTitle(tree, '归档过期的旧任务'), null)
+  assert.equal(textOf(archiveToggle(tree)).trim(), '显示归档（1）')
+
+  // 右栏看板（wide）：同一个开关，默认 3 列 + 隐藏归档；点开后 4 列
+  const rightSnapshot = makeSnapshot({
+    tasks: [
+      { id: 't-r-todo', title: '右栏待开始', status: 'todo', cwd: WS_A, updatedAt: minutesAgo(1) },
+      { id: 't-r-arch', title: '右栏归档卡', status: 'archived', cwd: WS_A, updatedAt: minutesAgo(2) },
+    ],
+  })
+  const right = createHarness({ snapshot: rightSnapshot })
+  const rightRendered = await renderWide(right.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  let rightTree = await rightRendered.tree
+  assert.equal(nodesWithClass(rightTree, 'tb-board')[0].props['data-archive'], 'false')
+  assert.deepEqual(
+    nodesWithClass(rightTree, 'tb-col').map((col) => col.props['data-status']),
+    ['todo', 'doing', 'done'],
+  )
+  assert.equal(cardByTitle(rightTree, '右栏归档卡'), null, '右栏归档卡默认不渲染')
+  const rightToggle = archiveToggle(rightTree)
+  assert.equal(textOf(rightToggle).trim(), '显示归档（1）')
+  rightToggle.props.onClick()
+  rightTree = await rightRendered.instance.run()
+  assert.deepEqual(
+    nodesWithClass(rightTree, 'tb-col').map((col) => col.props['data-status']),
+    ['todo', 'doing', 'done', 'archived'],
+    '右栏 wide 展开后 4 列',
+  )
+  assert.ok(cardByTitle(rightTree, '右栏归档卡'), '右栏展开后归档卡渲染')
+})
+
+test('v0.5.4 右栏看板：提问卡 + 阻塞卡进「待处理」列，阻塞卡不再混在「进行中」', async () => {
+  const blockedError = 'worker 结束（error）：合入冲突\n冲突文件：lib/a.js'
+  const snapshot = makeSnapshot({
+    tasks: [
+      needsTask({ id: 't-r-q', title: '右栏提问卡' }),
+      {
+        id: 't-r-block',
+        title: '右栏阻塞卡',
+        status: 'doing',
+        cwd: WS_A,
+        lastError: blockedError,
+        updatedAt: minutesAgo(1),
+      },
+      { id: 't-r-doing', title: '右栏正常进行中', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(2) },
+    ],
+  })
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const lanes = nodesWithClass(tree, 'tb-col')
+  assert.deepEqual(
+    lanes.map((lane) => lane.props['data-status']),
+    ['needsUser', 'todo', 'doing', 'done'],
+    '待处理 lane 在最前，归档 lane 默认隐藏',
+  )
+  const needsLane = lanes[0]
+  assert.equal(needsLane.props['data-compact'], 'true', '窄布局里「待处理」也是 compact lane')
+  assert.ok(textOf(needsLane).includes('待处理'))
+  const questionCard = nodesWithClass(needsLane, 'tb-needs-card')[0]
+  assert.ok(questionCard, '提问卡在「待处理」列')
+  assert.ok(textOf(questionCard).includes('右栏提问卡'))
+  const blockedCard = nodesWithClass(needsLane, 'tb-card').find(
+    (card) => card.props['data-attention'] === 'blocked',
+  )
+  assert.ok(blockedCard, '阻塞卡在「待处理」列')
+  assert.ok(textOf(blockedCard).includes('右栏阻塞卡'))
+  assert.equal(
+    nodesWithClass(blockedCard, 'tb-card-attn-text')[0].props.title,
+    blockedError,
+    '阻塞卡摘要的 title 兜完整异常',
+  )
+
+  const doingLane = lanes.find((lane) => lane.props['data-status'] === 'doing')
+  assert.ok(!textOf(doingLane).includes('右栏阻塞卡'), '阻塞卡不得重复出现在「进行中」lane')
+  assert.ok(textOf(doingLane).includes('右栏正常进行中'), '正常 doing 卡照旧')
+  const todoLane = lanes.find((lane) => lane.props['data-status'] === 'todo')
+  assert.ok(!textOf(todoLane).includes('右栏提问卡'), '提问卡不得重复出现在「待开始」lane')
+
+  // 右栏 wide 布局同样有「待处理」列
+  const wide = await renderWide(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+  const wideCols = nodesWithClass(wide.tree, 'tb-col')
+  assert.equal(wideCols[0].props['data-status'], 'needsUser')
+  assert.equal(nodesWithClass(wide.tree, 'tb-board')[0].props['data-needs'], 'true')
+  assert.ok(!textOf(wideCols.find((col) => col.props['data-status'] === 'doing')).includes('右栏阻塞卡'))
+})
+
+test('v0.5.4 右栏看板：没有待处理卡时退回普通列（不残留空「待处理」列）', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      { id: 't-c-todo', title: '只有普通待开始', status: 'todo', cwd: WS_A, updatedAt: minutesAgo(1) },
+      { id: 't-c-done', title: '只有普通已完成', status: 'done', cwd: WS_A, updatedAt: minutesAgo(2) },
+    ],
+  })
+  const harness = createHarness({ snapshot, sessionCwd: WS_A })
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const lanes = nodesWithClass(tree, 'tb-col')
+  assert.deepEqual(
+    lanes.map((lane) => lane.props['data-status']),
+    ['todo', 'doing', 'done'],
+  )
+  assert.equal(lanes[0].props['data-compact'], 'true', '待开始仍是第一条 lane')
+  assert.equal(nodesWithClass(tree, 'tb-needs-card').length, 0)
+  assert.equal(nodesWithClass(tree, 'tb-needs').length, 0, '没有残留的顶部固定条')
+})
+
+test('v0.5.4 归档列网格 + 文案：隐藏归档按可见列数收缩，中英开关文案齐备', () => {
+  const helpers = createHarness({ snapshot: makeSnapshot() }).exported.__test
+  // 隐藏归档：3 列；待处理 + 隐藏归档：4 列（都不留空列）
+  assert.match(clientSource, /\.tb-board\[data-archive=false\]\{grid-template-columns:repeat\(3,minmax\(0,1fr\)\)\}/)
+  assert.match(
+    clientSource,
+    /\.tb-board\[data-needs=true\]\[data-archive=false\]\{grid-template-columns:repeat\(4,minmax\(0,1fr\)\)\}/,
+  )
+  // 平台看板窄屏仍按 2 / 1 列响应式（新加的两个属性组合也要被覆盖）
+  assert.match(
+    clientSource,
+    /@media \(max-width:1180px\)\{\.tb-platform \.tb-board[^}]*\[data-archive=false\][^}]*repeat\(2,minmax\(0,1fr\)\)/,
+  )
+  assert.match(
+    clientSource,
+    /@media \(max-width:620px\)\{\.tb-platform \.tb-board[^}]*\[data-archive=false\][^}]*grid-template-columns:minmax\(0,1fr\)/,
+  )
+  // 右栏 medium（560–900px）两列布局不能被「待处理 + 隐藏归档」的 4 列规则顶掉
+  assert.match(
+    clientSource,
+    /\.tb-page\[data-layout=medium\] \.tb-board\[data-needs=true\]\[data-archive=false\]\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}/,
+  )
+  // 顶部固定条（v0.2.2 - v0.5.3）彻底删掉：组件 / 样式 / bind 字段都不该再出现
+  assert.ok(!clientSource.includes('function NeedsBanner'), 'NeedsBanner 组件已删')
+  assert.ok(!clientSource.includes("className: 'tb-needs-item'"), '顶部条样式类已删')
+  assert.equal(clientSource.split('boardBindRef.current.needsUserTasks').length - 1, 0)
+
+  // i18n：中英双份，带条数占位符
+  for (const dict of [helpers.DICT_ZH, helpers.DICT_EN]) {
+    assert.equal(typeof dict['archive.show'], 'string')
+    assert.equal(typeof dict['archive.hide'], 'string')
+    assert.ok(dict['archive.show'].includes('{n}'), '开关文案带归档条数')
+    assert.ok(dict['archive.hide'].includes('{n}'))
+  }
+  assert.equal(helpers.interpolate(helpers.DICT_ZH['archive.show'], { n: 3 }), '显示归档（3）')
+  assert.equal(helpers.interpolate(helpers.DICT_EN['archive.show'], { n: 3 }), 'Show archived (3)')
 })
 
 test('待你处理：点条目打开详情，选选项 + 回复并继续 调用 answer-task 并关闭浮层', async () => {
@@ -4326,4 +4760,51 @@ test('v0.5.0 Git Worktree UI：设置面板支持切换 Worktree 并发隔离开
   const box = detailBox(next)
   assert.ok(textOf(box).includes('隔离工作树'))
   assert.ok(textOf(box).includes('taskboard/t-4'))
+})
+
+
+/* ══════════════════════════════════════════════════════════════
+ * 用例：v0.5.2 异常可见化（卡片小红点 + 详情「最近异常」）
+ * ══════════════════════════════════════════════════════════════ */
+
+test('v0.5.2 异常可见化：lastError 非空时卡片挂小红点标记、详情基本信息出现「最近异常」行', async () => {
+  const snapshot = makeSnapshot({
+    tasks: [
+      {
+        id: 't-err',
+        title: '被中断的任务',
+        // v0.5.3 起 doing + lastError 是「待处理」列的阻塞卡（多一行摘要），
+        // 这条用例守的是 v0.5.2 的「普通列卡片只挂小红点、不展开异常」→ 用 done 卡。
+        status: 'done',
+        cwd: WS_A,
+        lastError: 'worker 结束（aborted）：没有返回结论',
+        updatedAt: minutesAgo(2),
+      },
+      { id: 't-ok', title: '正常任务', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(3) },
+    ],
+  })
+  const harness = createHarness({ snapshot })
+  const rendered = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const errCard = cardByTitle(rendered.tree, '被中断的任务')
+  const okCard = cardByTitle(rendered.tree, '正常任务')
+  assert.ok(errCard && okCard, '两张卡片都要渲染')
+  assert.equal(errCard.props['data-lasterror'], 'true', 'lastError 非空 → 卡片挂异常标记（小红点）')
+  assert.equal(okCard.props['data-lasterror'], undefined, '没有 lastError 的卡片不挂标记')
+  // 布局不变：卡片仍然是「标题 + 操作行」，异常全文只在详情浮层，不挤占卡片
+  for (const card of [errCard, okCard]) assert.equal(card.children.length, 2, '卡片结构保持标题 + 操作行')
+  assert.ok(!includesText(rendered.tree, '没有返回结论'), '异常全文不能出现在卡片上')
+
+  // 小红点走纯 CSS ::after 绝对定位，不改卡片高度 / 布局
+  assert.match(clientSource, /\.tb-card\[data-lasterror=true\]\{position:relative\}/)
+  assert.match(clientSource, /\.tb-card\[data-lasterror=true\]::after\{content:"";/)
+
+  const opened = await openDetailByTitle(rendered.instance, rendered.tree, '被中断的任务')
+  const { dts, dds } = detailLabels(opened)
+  assert.ok(dts.includes('最近异常'), '详情基本信息必须有「最近异常」行')
+  assert.ok(dds.includes('worker 结束（aborted）：没有返回结论'), '详情展示完整异常原因')
+
+  // 中英文案都在内置多语言表里
+  assert.ok(clientSource.includes("'detail.lastError': '最近异常'"))
+  assert.ok(clientSource.includes("'detail.lastError': 'Recent issue'"))
 })
