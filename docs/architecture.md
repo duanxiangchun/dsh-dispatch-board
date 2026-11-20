@@ -720,6 +720,8 @@ worker 会话 id 由宿主单独记在 `workerSessionId`：有 `result.value.sub
 契约，模型传了会在入参校验阶段被拒），`applyTaskUpdate` / `update-task` 的 patch 也不读这两个键
 （未知键静默忽略、不抛错）。它们**不进 `taskBrief()` / 模型工具输出**（§4.4），只出现在 `board.json`、
 `Snapshot.tasks` 与返回完整任务对象的 UI RPC 响应里；Client 的「对话」跳转优先读 `workerSessionId`（§5.3）。
+v0.5.7 起快照另带运行时视图 `runningSessions`（此刻 running 的会话 id，含 running 的 worker；§3.2 / §5.2），
+它**不落盘**、也不写进任务对象——只是给卡片「执行中」动画用的瞬时值。
 
 **任务字段 `needsUser` / `question` / `questionOptions` / `askedAt` / `askedBy` / `lastAnswer` / `answeredAt`（v0.2.2，§1.9）**：
 `needsUser` 只认 `true`（其它 → `false`）；`question` trim 截 500；`questionOptions` 过滤非字符串 /
@@ -907,6 +909,7 @@ LeadRef        = { key: string, cwd: string, sessionId: string, title: string, l
     { "sessionId": "…", "status": "idle"|"running", "cwd": "…"|null, "title": "…"|null,
       "preset": "taskboard-dispatch"|"standard"|…|null, "root": true }
   ],
+  "runningSessions": ["…"],                 // v0.5.7：此刻真正在跑的会话 id（根会话 + 任务的 worker 会话；纯运行时视图，不落盘）
   "leads": {                                // v0.2.0：组长 / 主会话运行时视图（client 组长条用）
     "main": { "sessionId": "…", "title": "…", "live": true, "busy": false, "archived": false },  // 未绑定 = null
     "workspaces": [                         // 按 config.workspaceLeads 的对象键顺序
@@ -948,6 +951,12 @@ LeadRef        = { key: string, cwd: string, sessionId: string, title: string, l
 `agents[].preset`：**`ctx.get('agentPresets').presetForSession(agent.session)`**（Session 的 agentPreset 投影，
 反映创建后切换过的模式；`session.header.agentPreset` 只是创建时的值，实测新建派单模式会话后仍是 `standard`，不能用作判据）。
 宿主用它决定「优先派给哪个空闲会话」，client 不再展示会话选择器。
+`runningSessions`（v0.5.7）= 此刻 status 为 `running` 的会话 id 去重列表，来源两处：
+① `agents.roots()` 里 running 的根会话；② 所有任务里 `workerSessionId` 非空、且
+`agents.get(workerSessionId).status === 'running'` 的 worker 会话（worker 是子 Agent，**不在**
+`agents[]` 里，只能按 id 查）。worker idle / 查不到 / 任务没 `workerSessionId` 时都不进列表；
+没装 agents 服务时是 `[]`。它**只**是快照顶层的运行时视图：不写进任务对象、不落盘、不改状态机，
+Client 用它给卡片渲染「执行中」动画（§5.2）。旧 Host 没有该字段时 Client 按空集处理。
 
 `Snapshot.config` 是 `normalizeConfig()` 的结果（含全部 config 字段）；`Snapshot.tasks` 是完整任务对象
 （含 `reportedAt`、`dispatchedSessionId`、v0.2.9 的 `workerSessionId` / `workerRunState` 等 UI 字段），
@@ -1388,6 +1397,14 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
      约 22px = 17.5px 预留行 + 5px gap；2 行标题的卡片就是 5px，即原来那块空行已消失）。
      窄栏下按钮换 2 行时卡片会自然变高（实测 5 按钮换 2 行时 81 → 106px，按钮不裁）——
      「不裁按钮」的取舍，**不为强行等高裁掉按钮**。
+    - **执行中动画（v0.5.7；v0.5.8 换六角星）**：任务的 worker 对话正在跑时，卡片标题文字前显示一枚旋转的六角星
+      （`.tb-card-spinner`，SVG 11px、`viewBox="0 0 16 16"`、`fill: currentColor`、
+      `animation:tb-spin 1.1s linear infinite`、`margin-right:5px`、`vertical-align:-2px`，
+      `role="status"` + `aria-label` = i18n `card.running`）。判定条件（两块看板同一口径）：
+      `task.status === 'doing'` **且** 宿主独占的 `task.workerSessionId` 非空 **且** 它在
+      `snapshot.runningSessions` 里；worker 对话停止后下一次 2s 轮询即消失。
+      **不活跃时完全不渲染**（不占位），动画只在标题行内、不改卡片高度 / 布局；
+      `prefers-reduced-motion: reduce` 下动画放慢到 3s（不停，仍能看出「在跑」）。
    - 卡片动作（按状态）：
      - todo：`开始`（→doing）、`立即派发`（`dispatch-now`）、`编辑`、`删除`
      - doing：`完成`（→done）、`打回`（→todo）、`编辑`
@@ -1479,6 +1496,8 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   v0.5.4 新增归档开关文案 `archive.show` / `archive.hide`（显示归档（{n}） / 隐藏归档（{n}） /
   Show archived ({n}) / Hide archived ({n})，带条数占位符，中英双份）；右栏顶部固定条删除后
   `column.needsUser`（待你处理 / Needs you）已无引用，随组件一并移除（`needsUser.badge` 角标文案保留）。
+  v0.5.7 新增 `card.running`（执行中 / Running），中英双份：卡片执行中转圈圆环的 `aria-label`（§5.2），
+  不写字、不占布局。
 
 ### 5.4 样式
 
@@ -2588,3 +2607,32 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
 - v0.5.6（窄栏看板头部一行化）：右栏看板在窄布局（`data-narrow=true`）下不再把标题与操作按钮拆成两行——
   `.tb-head` 保持单行 flex（`align-items:center`），`.tb-head-side` 按钮间距收紧到 6px，空间不够时自动折行；
   平台看板头部不变。`package.json` 0.5.5 → 0.5.6（`PLUGIN_VERSION` 兜底值同步）。
+- v0.5.7（卡片「执行中」加载动画）：
+  ① **Host**（`lib/index.js`）：`buildSnapshot()` 新增运行时字段 `runningSessions`（§3.2）——
+    `collectRunningSessions(agents, state)` 收集此刻 `status === 'running'` 的会话 id 去重列表：
+    `agents.roots()` 里 running 的根会话 + 所有任务里 `workerSessionId` 非空且
+    `agents.get(id)` 为 running 的 worker 会话（worker 不在 `agents[]` 里，必须按 id 查）。
+    纯运行时视图：不落盘、不改任务模型、不改状态机 / RPC 语义；无 agents 服务时是 `[]`。
+  ② **Client**（`lib/client.js`）：两块看板（`BoardTab` / `PlatformBoard`）把
+    `snapshot.runningSessions` 转成 Set 放进共享 `bind`，`Card` 判定
+    `status === 'doing' && task.workerSessionId 在 runningSessions 里` 时在标题文字前渲染
+    `span.tb-card-spinner`（`role="status"`、`aria-label` = `card.running`）；不活跃时**完全不渲染**
+    （不占位、不改卡片高度）。CSS：10px 圆环 + `.8s` 线性旋转，
+    `prefers-reduced-motion: reduce` 放慢到 2.4s。i18n 新增 `card.running`（执行中 / Running）。
+    旧 Host 没有该字段 → 空集，不渲染也不报错。
+  测试：`test/host.test.mjs` **+1**（根会话 running 进列表、worker running / idle / 查不到 /
+  无 `workerSessionId` / 同 worker 去重 / 无 agents 服务 / get 抛错降级）、
+  `test/client-render.test.mjs` **+2**（右栏看板与平台看板各一条：doing + worker 在 runningSessions
+  才有 spinner、不活跃不占位；`runningSessions` 为空 / 缺字段时都没有），
+  `node --test` **336 pass / 0 fail**（v0.5.4 基线 333 → 336）。
+  `package.json` 0.5.6 → 0.5.7（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。
+
+- v0.5.8（执行中动画换成旋转六角星）：
+  ① 卡片「执行中」指示从 10px 圆环改为 11px SVG 六角星（`viewBox="0 0 16 16"`、`fill: currentColor`、
+     `animation:tb-spin 1.1s linear infinite`）；`prefers-reduced-motion: reduce` 放慢到 3s。
+  ② 判定条件不变（`doing` + `workerSessionId` 在 `snapshot.runningSessions` 里）；测试同步更新 CSS 断言。
+  `package.json` 0.5.7 → 0.5.8（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。
+- v0.5.9（执行中六角星改为跟随文字色）：
+  ① `.tb-card-spinner` 的 `color` 从主题强调色改为 `currentColor`——浅色主题下是黑、深色主题下是白，跟卡片标题文字一致；
+     动画、尺寸、判定条件都不变。
+  ② `package.json` 0.5.8 → 0.5.9（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。

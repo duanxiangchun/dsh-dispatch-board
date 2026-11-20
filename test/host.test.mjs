@@ -520,6 +520,66 @@ test('buildSnapshot exposes board, poll, agents and preset status', () => {
   assert.equal(snapshot.pluginVersion.length > 0, true)
   assert.equal(snapshot.now, new Date(NOW).toISOString())
 })
+
+test('buildSnapshot.runningSessions: 根会话 running + 任务 worker 会话 running（其余一律不算）', () => {
+  const state = createEmptyBoard()
+  const runningRoot = { id: 'root-run', status: 'running', session: { header: {} } }
+  const idleRoot = { id: 'root-idle', status: 'idle', session: { header: {} } }
+  const runningWorker = { id: 'worker-run', status: 'running', session: { header: {} } }
+  const idleWorker = { id: 'worker-idle', status: 'idle', session: { header: {} } }
+  const liveAgents = {
+    'root-run': runningRoot,
+    'root-idle': idleRoot,
+    'worker-run': runningWorker,
+    'worker-idle': idleWorker,
+  }
+  const agents = { get: (id) => liveAgents[id], roots: () => [runningRoot, idleRoot] }
+
+  const runningTask = addTask(state, { title: 'worker 正在跑的任务', cwd: 'C:\\work\\a' }, NOW)
+  runningTask.status = 'doing'
+  runningTask.workerSessionId = 'worker-run'
+  // 同一个 worker 的第二条任务：去重后只出现一次
+  const secondRunningTask = addTask(state, { title: '同一个 worker 的返工', cwd: 'C:\\work\\a' }, NOW)
+  secondRunningTask.status = 'doing'
+  secondRunningTask.workerSessionId = 'worker-run'
+  const idleTask = addTask(state, { title: 'worker 空闲的任务', cwd: 'C:\\work\\a' }, NOW)
+  idleTask.status = 'doing'
+  idleTask.workerSessionId = 'worker-idle'
+  const goneTask = addTask(state, { title: 'worker 查不到的任务', cwd: 'C:\\work\\a' }, NOW)
+  goneTask.status = 'doing'
+  goneTask.workerSessionId = 'worker-gone'
+  const noWorkerTask = addTask(state, { title: '没有 workerSessionId 的任务', cwd: 'C:\\work\\a' }, NOW)
+  noWorkerTask.status = 'doing'
+  noWorkerTask.workerSessionId = null
+
+  const rt = {
+    ctx: { get: (name) => (name === 'agents' ? agents : undefined) },
+    state,
+    filePath: 'C:\\tmp\\board.json',
+    poll: { running: true },
+    presetInfo: null,
+  }
+  const snapshot = buildSnapshot(rt, NOW)
+  // 根会话按 roots() 顺序在前，worker 会话按任务顺序在后；running 之外的都不进列表。
+  assert.deepEqual(snapshot.runningSessions, ['root-run', 'worker-run'])
+
+  // 纯运行时视图：不写进任务对象、不改任务模型，也不进 board.json 字段
+  for (const task of snapshot.tasks) assert.equal(Object.prototype.hasOwnProperty.call(task, 'runningSessions'), false)
+
+  // 根会话全 idle、worker 也全停（含没回填的 workerSessionId）→ 空数组
+  runningRoot.status = 'idle'
+  runningWorker.status = 'idle'
+  runningTask.workerSessionId = 'worker-idle'
+  secondRunningTask.workerSessionId = 'worker-gone'
+  assert.deepEqual(buildSnapshot(rt, NOW).runningSessions, [])
+
+  // 没有 agents 服务（旧 Host / 非 Web profile）→ 空数组，不抛错
+  const noService = buildSnapshot({ ...rt, ctx: { get: () => undefined } }, NOW)
+  assert.deepEqual(noService.runningSessions, [])
+  // agents.get 抛错也降级（liveAgentOf 内部 catch）
+  const throwing = { get: () => { throw new Error('boom') }, roots: () => [] }
+  assert.deepEqual(buildSnapshot({ ...rt, ctx: { get: () => throwing } }, NOW).runningSessions, [])
+})
 test('status changes clear a stale dispatch error', () => {
   const state = boardWith('t')
   const task = state.tasks[0]

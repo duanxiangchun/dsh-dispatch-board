@@ -4808,3 +4808,107 @@ test('v0.5.2 异常可见化：lastError 非空时卡片挂小红点标记、详
   assert.ok(clientSource.includes("'detail.lastError': '最近异常'"))
   assert.ok(clientSource.includes("'detail.lastError': 'Recent issue'"))
 })
+/* ══════════════════════════════════════════════════════════════
+ * 用例：v0.5.7 卡片「执行中」转圈动画（snapshot.runningSessions）
+ * ══════════════════════════════════════════════════════════════ */
+
+/** 四条任务：worker 在跑 / worker 已停 / 没有 workerSessionId / 还没开始但挂着 worker 会话。 */
+function runningSnapshot(overrides = {}) {
+  return makeSnapshot(
+    Object.assign(
+      {
+        runningSessions: ['worker-live'],
+        tasks: [
+          {
+            id: 't-run',
+            title: 'worker 正在跑的任务',
+            status: 'doing',
+            cwd: WS_A,
+            workerSessionId: 'worker-live',
+            updatedAt: minutesAgo(1),
+          },
+          {
+            id: 't-idle',
+            title: 'worker 已停的任务',
+            status: 'doing',
+            cwd: WS_A,
+            workerSessionId: 'worker-idle',
+            updatedAt: minutesAgo(2),
+          },
+          { id: 't-noworker', title: '没有 worker 会话的任务', status: 'doing', cwd: WS_A, updatedAt: minutesAgo(3) },
+          {
+            id: 't-todo-worker',
+            title: '还没开始的任务',
+            status: 'todo',
+            cwd: WS_A,
+            workerSessionId: 'worker-live',
+            updatedAt: minutesAgo(4),
+          },
+        ],
+      },
+      overrides,
+    ),
+  )
+}
+
+test('v0.5.7 执行中动画：右栏看板只在「doing + worker 会话 running」的卡片标题前渲染 .tb-card-spinner', async () => {
+  const harness = createHarness({ snapshot: runningSnapshot(), sessionCwd: WS_A })
+  const { tree } = await renderNarrow(harness.componentOf('sidebar.right.pane.tab'), { sessionId: SESSION_A })
+
+  const spinners = nodesWithClass(tree, 'tb-card-spinner')
+  assert.equal(spinners.length, 1, '只有真正在跑的那张卡带转圈动画')
+  const runCard = cardByTitle(tree, 'worker 正在跑的任务')
+  assert.ok(runCard, 'running worker 的卡片必须渲染')
+  const spinner = nodesWithClass(runCard, 'tb-card-spinner')[0]
+  assert.ok(spinner, 'running worker 的卡片标题前必须有 .tb-card-spinner')
+  assert.equal(spinner.props.role, 'status')
+  assert.equal(spinner.props['aria-label'], '执行中')
+
+  // 动画挂在标题文字前，不改卡片结构：标题文本不变、卡片仍是「标题 + 操作行」
+  const titleNode = runCard.children[0]
+  assert.equal(textOf(titleNode), 'worker 正在跑的任务', '标题文本不受影响')
+  assert.equal(runCard.children.length, 2, '加动画不改卡片结构 / 高度')
+  assert.ok(hasClass(runCard.children[1], 'tb-card-actions'))
+  assert.equal(titleNode.children.length, 2, 'spinner + 标题文字')
+
+  // worker 空闲 / 没有 workerSessionId / 状态不是 doing → 完全不渲染（不占位）
+  for (const title of ['worker 已停的任务', '没有 worker 会话的任务', '还没开始的任务']) {
+    const card = cardByTitle(tree, title)
+    assert.ok(card, 'card must render: ' + title)
+    assert.equal(nodesWithClass(card, 'tb-card-spinner').length, 0, '不该有动画：' + title)
+    assert.equal(card.children[0].children.length, 1, '不活跃时完全不渲染 spinner（不占位）: ' + title)
+  }
+
+  // CSS：11px 六角星（SVG）+ 1.1s 旋转 + prefers-reduced-motion 放慢
+  assert.ok(
+    clientSource.includes('.tb-card-spinner{display:inline-block;width:11px;height:11px;'),
+    'spinner is an 11px inline-block star',
+  )
+  assert.ok(clientSource.includes("viewBox: '0 0 16 16'"), 'spinner is an svg six-point star')
+  assert.ok(clientSource.includes('animation:tb-spin 1.1s linear infinite;transform-origin:50% 50%}'))
+  assert.ok(clientSource.includes('color:currentColor;animation:tb-spin 1.1s linear infinite'), 'spinner inherits text color (currentColor)')
+  assert.ok(clientSource.includes('@keyframes tb-spin{to{transform:rotate(360deg)}}'))
+  assert.ok(clientSource.includes('@media (prefers-reduced-motion: reduce){.tb-card-spinner{animation-duration:3s}}'))
+  // i18n 中英双份
+  assert.ok(clientSource.includes("'card.running': '执行中'"))
+  assert.ok(clientSource.includes("'card.running': 'Running'"))
+})
+
+test('v0.5.7 执行中动画：平台看板同样生效；runningSessions 为空 / 缺字段时不渲染', async () => {
+  const harness = createHarness({ snapshot: runningSnapshot() })
+  const { tree } = await renderComponent(harness.componentOf('main'), {})
+
+  const spinners = nodesWithClass(tree, 'tb-card-spinner')
+  assert.equal(spinners.length, 1, '平台看板同样只有正在跑的卡带动画')
+  const runCard = cardByTitle(tree, 'worker 正在跑的任务')
+  assert.ok(runCard)
+  assert.equal(nodesWithClass(runCard, 'tb-card-spinner').length, 1, '平台看板与右栏看板同一口径')
+
+  // runningSessions 为空数组 / 旧 Host 没有这个字段 → 一张卡都不带动画，任务照常渲染（不报错）
+  for (const overrides of [{ runningSessions: [] }, { runningSessions: undefined }]) {
+    const emptyHarness = createHarness({ snapshot: runningSnapshot(overrides) })
+    const rendered = await renderComponent(emptyHarness.componentOf('main'), {})
+    assert.equal(nodesWithClass(rendered.tree, 'tb-card-spinner').length, 0)
+    assert.equal(nodesWithClass(rendered.tree, 'tb-card').length, 4, '任务照常渲染')
+  }
+})
