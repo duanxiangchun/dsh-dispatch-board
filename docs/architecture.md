@@ -314,7 +314,7 @@ doing 的一次性意图 / 同参数预建卡片」精确认领，认领不到�
 | 事件 | 来源 | 用途 |
 | --- | --- | --- |
 | `tools/pre-execute` | `@deepseek-ai/dsh-tools` 的**派发前** allow/deny 瀑布（`(exec, next)`） | **强制建卡闸门**：只拦 `exec.name === 'subagent'` 且调用方预设是 `taskboard-dispatch` 的调用；认领 / 新建卡片，失败返回 `{kind:'deny', reason, info:{name:'TaskboardDispatchError', code}}`（worker 不启动） |
-| `tools/result` | 工具调用结束后的**观察事件**（emit，监听器异常被宿主隔离） | worker 真的启动后把 worker 信息挂到闸门准备的卡片上：**总是**写 `workerRunState='running'` 和本次 worker 的 `assignee`；`workerSessionId` 有 `result.value.subagentId` 时直接写，没有时（当前 dsh 的 `subagent` 只返回 `{kind:'activation', name}`）按 `name` 从子 Agent 目录异步回填（§2）。**`kind==='activation'` 即视为已启动**——不再因为缺 `subagentId` 把卡片降级；只有非 activation / 错误 / 取消 / `post-execute` block / 返回形状不是 activation 时才降级为 `todo` + `lastError='派发未启动：…'`（不删卡） |
+| `tools/result` | 工具调用结束后的**观察事件**（emit，监听器异常被宿主隔离） | worker 真的启动后把 worker 信息挂到闸门准备的卡片上：**总是**写 `workerRunState='running'` 和本次 worker 的 `assignee`；`workerSessionId` 有 `result.value.subagentId` 时直接写，没有时（当前 dsh 的 `subagent` 只返回 `{kind:'activation', name}`）按 `name` 从子 Agent 目录异步回填（§2）。**`kind==='activation'` 即视为已启动**——不再因为缺 `subagentId` 把卡片降级；只有非 activation / 错误 / 取消 / `post-execute` block / 返回形状不是 activation 时才降级为 `todo` + `lastError='派发未启动：…'`（不删卡）。**v0.5.10 起同一监听器也观察 `send_message` 成功结果**（`{messageId}`）：组长复用 worker 对话处理新任务时，把目标会话写进新卡片的 `workerSessionId`（§2） |
 | `subagent/end` | `@deepseek-ai/dsh-subagent` 生命周期事件（`{runId, provider, parentSessionId, id, local, stopReason, lastAssistantMessage}`） | worker 结束 → 给**带标记的自动任务**写回 `done` + `result`（轮询任务交给组长审核）；`id` 还没回填时按 `parentSessionId` + doing 自动卡（`workerSessionId` 为空或等于本次 `childId`，不再要求 `workerRunState==='running'`，v0.5.2）+ `info.name` 精确匹配兜底认领 |
 
 - 监听器以 `{ global: true }` 注册：不受 scope 过滤（`tools/*` 的 carrier 按调用 Agent 过滤），
@@ -720,6 +720,26 @@ worker 会话 id 由宿主单独记在 `workerSessionId`：有 `result.value.sub
 契约，模型传了会在入参校验阶段被拒），`applyTaskUpdate` / `update-task` 的 patch 也不读这两个键
 （未知键静默忽略、不抛错）。它们**不进 `taskBrief()` / 模型工具输出**（§4.4），只出现在 `board.json`、
 `Snapshot.tasks` 与返回完整任务对象的 UI RPC 响应里；Client 的「对话」跳转优先读 `workerSessionId`（§5.3）。
+**v0.5.10：复用 worker 对话（`send_message`）的绑定口径**。v0.5.5 的「复用优先」提示词让组长用
+`send_message` 把同一批文件的后续小步发回原 worker；这条路径没有 `subagent` 调用、不经过派发闸门，
+以前新卡片的 `workerSessionId` 永远是空（卡片「对话」只能回退到组长会话）。现在：
+
+- **触发**：`tools/result` 观察到 `send_message` 成功（`{messageId}`），且调用方是 `taskboard-dispatch`
+  组长；目标名先用 `subagents.resolveName(caller, name)` 解析（与工具本身同一套，支持 `reviewer/checker`
+  路径），老 Host 回退 `listDescendants(parentSessionId)` 按 `name` / `path` 精确匹配。发给根（`lead`）/
+  自己 / 解析不到目标 → 不绑。
+- **选卡**（`findReusedWorkerCard`）：消息里的显式「任务 id：t-N」/「看板任务：t-N」→ 卡片
+  `assignee === 目标名字` → 消息正文包含卡片标题 → 该组长名下唯一可绑卡片 → 本次 send 之后新建的
+  唯一一张（覆盖先发消息、后建卡）。多个候选都对不上时**不绑**，绝不张冠李戴。
+- **可绑条件**：`doing` + `workerSessionId` 为空 + `workerRunState !== 'running'` + 没挂 `needsUser` +
+  属于该组长（`dispatchedSessionId` / `sessionId`）。只写宿主独占字段，**不覆盖已有 worker**。
+- **写什么**：`workerSessionId = targetId`、`workerRunState = 'running'`；`assignee` 为空时用目标名补齐
+  （仍是自由文本）；`dispatchedSessionId` 为空时补组长会话，worker 会话打不开时「对话」还能回退组长。
+- **时序**：`send_message` 先于建卡时记一条进程内意图（TTL `LEAD_SEND_BIND_TTL_MS = 10 分钟`），
+  `taskboard_add` / `taskboard_update` 置 doing / 轮询投递建卡后由 `applyLeadSendIntentToTask()` 补绑。
+- **收尾**：`subagent/end` 先按 `findDoingTaskByWorker()` 认领**还在 doing** 的同会话卡片（最新在前），
+  再回退原来的 auto 卡查找；避免同一个 `childId` 同时挂在旧 done 卡和新 doing 卡时，新结论覆盖旧卡。
+
 v0.5.7 起快照另带运行时视图 `runningSessions`（此刻 running 的会话 id，含 running 的 worker；§3.2 / §5.2），
 它**不落盘**、也不写进任务对象——只是给卡片「执行中」动画用的瞬时值。
 
@@ -1432,8 +1452,10 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
      不让整次点击失效（v0.2.4，t-71）。**v0.2.9：回退必须可见**——首选打不开、回退到别的会话时
      照样出 `tone:'warn'` 横幅（i18n `openSession.fallback`：「执行对话不可用（worker 会话已中断或丢失），
      已打开组长对话 · <尾8>」）；候选链里**只剩当前会话**时（`openSession` 是同步 void，打开当前会话 =
-     界面毫无变化）**不调用** `openSession`，直接出 `openSession.stale`「这条任务的执行对话已失效，
-     没有可跳转的会话」。整条链都打不开（会话已关闭 / 不存在）或
+     界面毫无变化）**不调用** `openSession`，出中性提示 `openSession.current`「这张任务就在当前对话里，
+     无需跳转」（v0.5.10：组长复用对话自己处理时这是正常状态，不再误报「执行对话已失效」）；
+     只有候选链为空时才出 `openSession.stale`「这条任务的执行对话已失效，没有可跳转的会话」。
+     整条链都打不开（会话已关闭 / 不存在）或
      `uiWorkspace` 未注入时，出 `tone:'warn'` 横幅（i18n `openSession.failed` /
      `openSession.unavailable`），`console.warn` 保留作诊断——**不再静默**。**详情浮层开着时横幅
      渲染在浮层内部**（`Detail` 的 `.tb-detail-banner`）：`.tb-detail-mask` 是
@@ -2636,3 +2658,20 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   ① `.tb-card-spinner` 的 `color` 从主题强调色改为 `currentColor`——浅色主题下是黑、深色主题下是白，跟卡片标题文字一致；
      动画、尺寸、判定条件都不变。
   ② `package.json` 0.5.8 → 0.5.9（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。
+- v0.5.10（组长复用 worker 对话时新卡片也能绑定对话）：
+  ① **Host 观察 `send_message`**（§1.8 / §2）：v0.5.5 的复用优先提示词让组长用 `send_message` 把后续小步发回原
+     worker；这条路径不经过 `subagent` 闸门，以前新卡片的 `workerSessionId` 永远为空，卡片「对话」只能回退到
+     组长会话（在组长对话里看板时更会报「执行对话已失效」）。现在 `tools/result` 在 `send_message` 成功后用
+     `subagents.resolveName` 解析目标会话，按「显式任务 id → assignee → 标题 → 唯一可绑卡 → send 后新建的唯一卡」
+     选一张 doing 卡绑定；多个候选含糊时不绑。`send_message` 先于建卡时记进程内意图
+     （`LEAD_SEND_BIND_TTL_MS = 10 分钟`），`taskboard_add` / `taskboard_update` 置 doing / 轮询投递后补绑。
+  ② **`subagent/end` 收尾优先级**：先认领还在 doing 的同会话卡片（`findDoingTaskByWorker`），再回退原来的
+     auto 卡查找；避免同一个 worker 既挂在旧 done 卡、又绑着新 doing 卡时，新结论把旧卡结论覆盖。
+  ③ **Client 当前会话提示**：候选链只剩当前会话时不再出 `openSession.stale`「执行对话已失效」，改为中性提示
+     `openSession.current`「这张任务就在当前对话里，无需跳转」（`data-tone=ok`）；只有候选链为空才是 stale。
+  ④ **提示词**：复用同一 worker 处理**新任务**时，要求组长先 `taskboard_add` 建新卡并置 doing、消息带
+     「任务 id：t-N」或卡片标题，宿主据此绑定复用的 worker 会话。
+  测试：`test/host.test.mjs` **+5**（send_message 绑定 / 显式任务 id 只绑指定卡 / 先发消息后建卡补绑 /
+  复用结束不污染旧卡 / 同级对话不误绑）；`test/client-render.test.mjs` 更新当前会话用例
+  （`openSession.current`，不再断言 stale）。`node --test` **341 pass / 0 fail**。
+  `package.json` 0.5.9 → 0.5.10（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。

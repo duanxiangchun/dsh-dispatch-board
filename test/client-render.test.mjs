@@ -2302,7 +2302,7 @@ test('宿主 workerSessionId 优先：assignee 是 subagent 名字时「对话�
   assert.equal(runner.props.title, HOST_WORKER)
 })
 
-test('卡片「对话」：唯一候选就是当前会话 → 不调用 openSession，给「执行对话已失效」提示（v0.2.9）', async () => {
+test('卡片「对话」：唯一候选就是当前会话 → 不调用 openSession，给「就在当前对话」中性提示（v0.5.10）', async () => {
   const snapshot = makeSnapshot({
     tasks: [
       {
@@ -2329,12 +2329,12 @@ test('卡片「对话」：唯一候选就是当前会话 → 不调用 openSess
   const next = await instance.run()
   const banners = noticeBanners(next)
   assert.equal(banners.length, 1, 'a no-op target must be reported, not silently ignored')
-  assert.equal(banners[0].props['data-tone'], 'warn')
+  assert.equal(banners[0].props['data-tone'], 'ok', '只剩当前会话不是失败：用中性色，不吓用户')
   assert.ok(
-    textOf(banners[0]).includes('执行对话已失效'),
-    'banner must say the worker conversation is gone, got: ' + textOf(banners[0]),
+    textOf(banners[0]).includes('就在当前对话'),
+    'banner must say the task is already in the current conversation, got: ' + textOf(banners[0]),
   )
-  assert.ok(textOf(banners[0]).includes('没有可跳转的会话'))
+  assert.ok(!textOf(banners[0]).includes('已失效'), 'the live current conversation must not be called stale')
   assert.deepEqual(harness.sandboxErrors, [])
 })
 

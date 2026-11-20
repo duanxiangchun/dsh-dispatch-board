@@ -17,6 +17,7 @@ import {
   LEAD_DISPATCH_DEDUPE_MS,
   LEAD_DISPATCH_INTENT_MS,
   LEAD_IN_FLIGHT_TTL_MS,
+  LEAD_SEND_BIND_TTL_MS,
   MAX_ANSWER_CHARS,
   MAX_ATTACHMENT_BYTES,
   MAX_BODY_BYTES,
@@ -31,6 +32,7 @@ import {
   TASK_ONE_OUTPUT_SCHEMA,
   addTask,
   answerTask,
+  applyLeadSendIntentToTask,
   applyTaskUpdate,
   archivedSessionIdSet,
   archiveDoneTasks,
@@ -66,6 +68,7 @@ import {
   ensureTaskWorktree,
   ensureWorkspaceLead,
   findDependencyCycle,
+  findDoingTaskByWorker,
   findLeadInFlightTask,
   findPendingDispatchCard,
   findTask,
@@ -3025,7 +3028,10 @@ test('a polled task whose assignee is the worker id is never auto-completed', as
     )
 
     assert.equal(outcome.updated, false, '轮询任务不能被宿主自动 done')
-    assert.equal(outcome.reason, 'no-task')
+    // v0.5.10：结束事件会先按 assignee 认出这张 doing 轮询卡（not-auto），仍然只收敛 workerRunState，
+    // 绝不自动 done / 写结论；语义与原来的 no-task 兜底一致，只是 reason 更准确。
+    assert.equal(outcome.reason, 'not-auto')
+    assert.equal(outcome.taskId, polled.id)
     assert.equal(polled.status, 'doing', '任务仍 doing，等组长取证审核')
     assert.equal(polled.result, '', '不替组长写结论')
     assert.equal(polled.reportedAt, null, '不发完成回执')
@@ -4343,6 +4349,250 @@ test('a current-dsh activation (name only) keeps the gate card doing and backfil
     assert.equal(card.status, 'done')
     assert.match(card.result, /name-only worker 完成/)
     assert.equal(card.workerRunState, 'ended')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('send_message 复用 worker 对话：投递成功后把新卡片的执行会话绑定到该对话（v0.5.10）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-send-reuse-bind-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx: baseCtx } = leadFixture()
+    const listeners = {}
+    const subagents = {
+      resolveName: async (_sender, name) => {
+        if (name === 'worker-reuse') return 'child-reuse'
+        throw new Error('unknown agent ' + name)
+      },
+    }
+    const hookCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => {
+        if (name === 'subagents') return subagents
+        if (name === 'agentPresets') {
+          return {
+            presetForSession: (session) =>
+              (session && session.header && session.header.agentPreset) || 'taskboard-dispatch',
+          }
+        }
+        return baseCtx.get(name)
+      },
+    }
+    const rt = fakeRuntime(state, hookCtx, join(dir, 'board.json'))
+    const card = addTask(state, { title: '平台层七页排查重复菜单', sessionId: lead.session.id, cwd: 'C:\\work\\demo' }, NOW)
+    applyTaskUpdate(state, card.id, { status: 'doing' }, NOW + 1)
+    assert.equal(card.workerSessionId, null, '建卡时还没有 worker 会话')
+    assert.equal(registerLeadAutoHooks(hookCtx, rt), true)
+
+    const exec = {
+      name: 'send_message',
+      callId: 'call-send-reuse',
+      agent: lead,
+      arguments: { agent: 'worker-reuse', message: '继续排查平台层七个页面' },
+    }
+    await listeners['tools/result'](
+      exec,
+      { isError: false, value: { messageId: 'message-1' }, content: [] },
+    )
+
+    assert.equal(card.workerSessionId, 'child-reuse', '复用对话的目标会话写进宿主独占字段')
+    assert.equal(card.workerRunState, 'running')
+    assert.equal(card.assignee, 'worker-reuse', '空 assignee 用 agent 名字补齐（仍只是自由文本）')
+    assert.equal(card.dispatchedSessionId, lead.session.id, '补齐组长会话，worker 打不开时「对话」可回退')
+    assert.equal(card.dispatchedSessionTitle, 'demo 组长')
+    assert.deepEqual(findDoingTaskByWorker(state, 'child-reuse'), card)
+    const saved = JSON.parse(readFileSync(join(dir, 'board.json'), 'utf8'))
+    assert.equal(saved.tasks[0].workerSessionId, 'child-reuse', '绑定结果落盘（刷新 8081 可见）')
+    assert.equal(saved.tasks[0].workerRunState, 'running')
+
+    // 非组长（普通会话）的 send_message 不绑定任何卡片。
+    const otherLead = {
+      ...lead,
+      id: 'lead-2',
+      session: { id: 'lead-2', header: { ...lead.session.header, id: 'lead-2', agentPreset: 'taskboard-worker' } },
+    }
+    const another = addTask(state, { title: '普通会话的任务', sessionId: 'lead-2' }, NOW + 2)
+    applyTaskUpdate(state, another.id, { status: 'doing' }, NOW + 3)
+    await listeners['tools/result'](
+      { name: 'send_message', callId: 'call-send-other', agent: otherLead, arguments: { agent: 'worker-reuse', message: 'hi' } },
+      { isError: false, value: { messageId: 'message-2' }, content: [] },
+    )
+    assert.equal(another.workerSessionId, null, '非 taskboard-dispatch 预设不参与绑定')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('send_message 目标不在组长子树（同级对话 / 根）时绝不绑卡片（v0.5.10）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-send-reuse-not-descendant-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx: baseCtx } = leadFixture()
+    const listeners = {}
+    const subagents = {
+      resolveName: async () => 'sibling-lead-session',
+      listDescendants: async () => [
+        { kind: 'child', id: 'own-worker', parentId: lead.session.id, name: 'own-worker', mode: 'continuable', depth: 1 },
+      ],
+    }
+    const hookCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => {
+        if (name === 'subagents') return subagents
+        if (name === 'agentPresets') return { presetForSession: () => 'taskboard-dispatch' }
+        return baseCtx.get(name)
+      },
+    }
+    const rt = fakeRuntime(state, hookCtx, join(dir, 'board.json'))
+    const card = addTask(state, { title: '不该被同级对话绑定', sessionId: lead.session.id }, NOW)
+    applyTaskUpdate(state, card.id, { status: 'doing' }, NOW + 1)
+    assert.equal(registerLeadAutoHooks(hookCtx, rt), true)
+    await listeners['tools/result'](
+      { name: 'send_message', callId: 'call-send-sibling', agent: lead, arguments: { agent: 'other-lead', message: '跨组长协调' } },
+      { isError: false, value: { messageId: 'message-sibling' }, content: [] },
+    )
+    assert.equal(card.workerSessionId, null, '同级 / 根会话不是 worker，不能写进执行会话字段')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('send_message 消息里带「任务 id」时只绑那张卡，多张 doing 卡不误绑（v0.5.10）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-send-reuse-explicit-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx: baseCtx } = leadFixture()
+    const listeners = {}
+    const subagents = { resolveName: async () => 'child-explicit' }
+    const hookCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'subagents' ? subagents : baseCtx.get(name)),
+    }
+    const rt = fakeRuntime(state, hookCtx, join(dir, 'board.json'))
+    const first = addTask(state, { title: '第一张进行中卡', sessionId: lead.session.id }, NOW)
+    const second = addTask(state, { title: '第二张进行中卡', sessionId: lead.session.id }, NOW + 1)
+    applyTaskUpdate(state, first.id, { status: 'doing' }, NOW + 2)
+    applyTaskUpdate(state, second.id, { status: 'doing' }, NOW + 3)
+    assert.equal(registerLeadAutoHooks(hookCtx, rt), true)
+
+    await listeners['tools/result'](
+      {
+        name: 'send_message',
+        callId: 'call-send-explicit',
+        agent: lead,
+        arguments: { agent: 'worker-explicit', message: '任务 id：t-2\n继续做第二张卡' },
+      },
+      { isError: false, value: { messageId: 'message-explicit' }, content: [] },
+    )
+    assert.equal(second.workerSessionId, 'child-explicit', '显式 t-2 只绑第二张')
+    assert.equal(first.workerSessionId, null, '其它 doing 卡不受影响')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('send_message 先于建卡：taskboard_update 置 doing 时补绑（v0.5.10）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-send-reuse-late-card-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx: baseCtx } = leadFixture()
+    const listeners = {}
+    const subagents = { resolveName: async () => 'child-late' }
+    const hookCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'subagents' ? subagents : baseCtx.get(name)),
+    }
+    const rt = fakeRuntime(state, hookCtx, join(dir, 'board.json'))
+    const registered = []
+    registerTools({ tools: { register: (definition) => registered.push(definition) } }, rt)
+    assert.equal(registerLeadAutoHooks(hookCtx, rt), true)
+
+    await listeners['tools/result'](
+      { name: 'send_message', callId: 'call-send-late', agent: lead, arguments: { agent: 'worker-late', message: '先发消息' } },
+      { isError: false, value: { messageId: 'message-late' }, content: [] },
+    )
+    assert.equal(state.tasks.length, 0, '消息先到、卡片还没建：不凭空建卡')
+
+    const addTool = registered.find((tool) => tool.name === 'taskboard_add')
+    const updateTool = registered.find((tool) => tool.name === 'taskboard_update')
+    const added = await addTool.execute({ title: '后建卡的新任务', note: '后建卡', cwd: 'C:\\work\\demo' }, { agent: lead })
+    assert.equal(added.task.status, 'todo')
+    assert.equal(state.tasks[0].workerSessionId, null, 'todo 阶段不绑定（还没开始执行）')
+
+    await updateTool.execute({ id: added.task.id, status: 'doing' }, { agent: lead })
+    assert.equal(
+      state.tasks[0].workerSessionId,
+      'child-late',
+      '置 doing 时消费 send_message 意图，补绑复用的 worker 会话',
+    )
+    assert.equal(state.tasks[0].workerRunState, 'running')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('复用 worker 对话后，subagent/end 只收尾 doing 新卡，不改同会话的旧 auto 卡（v0.5.10）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-taskboard-send-reuse-end-'))
+  try {
+    const state = createEmptyBoard()
+    const { lead, ctx: baseCtx } = leadFixture()
+    const listeners = {}
+    const subagents = { resolveName: async () => 'child-shared' }
+    const hookCtx = {
+      on: (name, listener) => {
+        listeners[name] = listener
+      },
+      get: (name) => (name === 'subagents' ? subagents : baseCtx.get(name)),
+    }
+    const rt = fakeRuntime(state, hookCtx, join(dir, 'board.json'))
+    assert.equal(registerLeadAutoHooks(hookCtx, rt), true)
+
+    // 旧卡：宿主自动派发，worker 早已结束、结论已审核 done；workerSessionId 仍保留供回看。
+    const oldCard = addTask(state, { title: '旧任务', sessionId: lead.session.id }, NOW)
+    applyTaskUpdate(state, oldCard.id, { status: 'doing' }, NOW + 1)
+    oldCard.autoDispatch = LEAD_AUTO_MARK
+    oldCard.workerSessionId = 'child-shared'
+    oldCard.workerRunState = 'ended'
+    applyTaskUpdate(state, oldCard.id, { status: 'done', result: '旧结论' }, NOW + 2)
+
+    // 新卡：组长复用同一个 worker 对话；send_message 成功后才应绑定到它。
+    const newCard = addTask(state, { title: '新任务', sessionId: lead.session.id }, NOW + 3)
+    applyTaskUpdate(state, newCard.id, { status: 'doing' }, NOW + 4)
+    await listeners['tools/result'](
+      { name: 'send_message', callId: 'call-send-shared', agent: lead, arguments: { agent: 'worker-shared', message: '复用同一对话做新任务' } },
+      { isError: false, value: { messageId: 'message-shared' }, content: [] },
+    )
+    assert.equal(newCard.workerSessionId, 'child-shared')
+    assert.equal(oldCard.workerSessionId, 'child-shared', '旧卡执行会话保留，用于回看旧结论')
+
+    // 复用后的 worker 结束：必须收尾 doing 新卡，而不是把新结论写进旧 done 卡。
+    listeners['subagent/end']({
+      runId: 'run-send-shared',
+      provider: 'spawn',
+      parentSessionId: lead.session.id,
+      id: 'child-shared',
+      local: true,
+      stopReason: 'completed',
+      lastAssistantMessage: [{ type: 'text', text: '新任务的结论' }],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    assert.equal(newCard.status, 'doing', '人工卡由组长审核后置 done，宿主不抢先收尾')
+    assert.equal(newCard.workerRunState, 'ended', 'worker 结束只收敛运行状态')
+    assert.equal(oldCard.status, 'done')
+    assert.equal(oldCard.result, '旧结论', '旧卡结论绝不能被新 worker 覆盖')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
