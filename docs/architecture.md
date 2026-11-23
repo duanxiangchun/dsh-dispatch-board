@@ -1117,7 +1117,7 @@ ctx.effect(() => ctx.webServer.register({
 | `taskboard_list` | `{status?, parentTaskId?}` | 返回文本清单（id / 状态 / 父任务 / 依赖 / 标题 / 备注 / assignee / worktreePath / result / 待回答的问题 / 最近异常）+ 结构化 `tasks[]`；v0.2.2 起 `tasks[]` 带 `needsUser` / `question` / `questionOptions`，v0.3.5 起带 `parentTaskId` 并支持按 `parentTaskId` 过滤，v0.4.0 起带 `dependsOn`，v0.5.0 起带 `worktreePath` / `worktreeBranch`，v0.5.2 起带 `lastError`（渲染为「最近异常：…」） |
 | `taskboard_add` | `{title, note?, workspace?, parentTaskId?, dependsOn?}` | 新建任务（`source='agent'`，`sessionId=exec.agent.session.id`）；`workspace` v0.2.0 新增，`parentTaskId` v0.3.5 可选关联父任务，`dependsOn` v0.4.0 可选声明前置依赖 |
 | `taskboard_update` | `{id, status?, result?, assignee?, note?, lastError?, needsUser?, question?, questionOptions?, dependsOn?}` | 更新任务（模型工具执行前均调 `reloadBoardIfStale` 对齐磁盘状态）；`status` 非法迁移返回错误文本；`lastError` 供组长记录故障或阻塞原因（派发失败 / 缺工作目录 / worker 异常；不写向用户的提问）；**`assignee` 语义（v0.2.9）**：写子 Agent 的 label / 名字（自由文本）即可，**不要写会话 id**——会话 id 由宿主记在 `workerSessionId`（宿主独占、模型不可写、不进 `taskBrief`，§2）；v0.2.2 起 `needsUser:true` + `question` 用来「问用户」（§1.9），`needsUser:false` 取消提问，`askedBy` 取 `exec.agent.session.id`；任务已归档且未同时改 `status` 时设置 `needsUser:true` / `question` → 工具报 `conflict`（不写盘，§1.9）；v0.2.4 起**组长**（`taskboard-dispatch`）把轮询投递任务置 `doing` 时，宿主额外记一条一次性「即将派 worker」意图（进程内，不落盘；派发闸门据此复用原卡片，§1.8） |
-| `taskboard_merge_worktree` | `{id, cleanup?, discardOnly?}` | **v0.5.0**：将任务关联的隔离 Git Worktree（`task.worktreePath`）改动无损合入主工作区并清理 Worktree 目录与临时分支 `taskboard/<id>`。先卸载所有依赖 Junction 软链，将 Worktree 内未提交文件快照提交至临时分支后，以 `git diff --binary --full-index -U1 <base>..<wtHead>` + `git apply --check` 原子预检并 `git apply` 应用到主工作区（兼容主工作区含未暂存改动，且不污染主分支提交历史）；若存在冲突则主工作区保持原状不变并返回 `{merged:false, conflict:true, conflictFiles}`；传 `discardOnly:true` 则不合入改动、直接卸载软链并回收 Worktree 与临时分支。**v0.5.2（t-209）**：预检改为**逐文件粒度**——按 `diff --git` 头把补丁切成文件级补丁（保留 binary / rename 段），每个文件先跑 `git apply --check --reverse` 判定「主工作区已存在该改动」并跳过，其余文件拼成子集 `git apply --check` 通过才应用；全部已存在视为幂等成功（`merged:true`），子集仍有文件失败才返回 `conflict:true`，摘要标出哪些文件其实已在主工作区 |
+| `taskboard_merge_worktree` | `{id, cleanup?, discardOnly?}` | 将任务关联的隔离 Git Worktree（`task.worktreePath`）改动**逐文件三方合并**进主工作区，成功后清理 Worktree 目录与临时分支 `taskboard/<id>`。先卸载所有依赖 Junction 软链，把 Worktree 内未提交文件快照提交至临时分支，且**快照后 `git status --porcelain --untracked-files=all` 必须为空**（软链没卸干净 / 快照后仍脏 → 放弃合入、保留工作树、返回 `conflict:true`）。**v0.5.11（误删事故根因：v0.5.2 的 `git diff` + 按文件 `git apply` 区分不了「用户未提交 WIP / 前序切片改动 / 工作树快照遗漏」，删除动作直接落到主工作区未提交文件上）**：合入改为**逐文件三方合并** —— base = `merge-base(主仓 HEAD, 工作树 HEAD)`（失败回退 `task.worktreeBaseCommit`），ours = **主工作区当前工作树文件内容**，theirs = 工作树快照 HEAD，改动清单 = `git diff --name-status -z --no-renames <base>..<theirs>`（含 A/M/D/T）；预检阶段算好全部动作，任一冲突 → 整次放弃、主工作区零写入：主工作区内容已与 theirs 逐字节相同 → alreadyApplied 跳过（摘要「N 个文件已在主工作区存在」）；worker 侧新增遇到主工作区同路径已有文件（内容不同）→ 冲突、绝不覆盖；worker 侧删除只在「主仓 HEAD 有该文件且主工作区仍逐字节等于 HEAD」时执行，主工作区有改动或是未跟踪文件 → 冲突、永不删除；双方都改 → `git merge-file -p` 文本三方合并（二进制 / `T` 类型变化 / merge-file 报错 → 冲突）；依赖软链目录（`task.worktreeLinks` 里的 `node_modules` / `.venv` / `venv`）下的路径一律冲突。只对本次 worker 改动路径定点 `writeFileSync` / `unlinkSync`（Buffer 原样写、best-effort 保留 `100755`），**绝不** `git apply` / `checkout` / `reset --hard` / `stash` / `clean`；删除 / 覆盖前再确认文件仍逐字节等于预检内容（被并发修改 → 放弃本次合入并回滚已写文件）。**v0.5.12（用户反馈：冲突应组长介入而不是整段放弃）**：存在冲突文件时**不整段放弃** —— 无冲突文件先合入（同样走写入前 drift 复核、失败回滚），冲突文件在主工作区保持原样绝不写入，**不做 cleanup、不删工作树、恢复依赖软链**，返回 `{merged:false, conflict:true, cleaned:false, conflictFiles}` + 摘要「已合入 N 个无冲突文件；M 个文件冲突需组长处理：…；冲突文件在主工作区保持原样，隔离工作树保留在 …」；一个文件都没写过时仍沿用旧句式「合入主工作区检测到冲突（主工作区未被修改）」；组长手工处理冲突文件后**重跑本工具**即可完成合入与回收；传 `discardOnly:true` 则不合入改动、直接卸载软链并回收 Worktree 与临时分支 |
 
 **`taskboard_add.workspace`（v0.2.0，可选）**：工作区 id / 名称 / 绝对路径，用于主会话往任意工作区派任务。
 
@@ -2675,3 +2675,69 @@ ctx.on('subagent/end', (info) => { … }, { global: true })
   复用结束不污染旧卡 / 同级对话不误绑）；`test/client-render.test.mjs` 更新当前会话用例
   （`openSession.current`，不再断言 stale）。`node --test` **341 pass / 0 fail**。
   `package.json` 0.5.9 → 0.5.10（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。
+
+- v0.5.11（合入改为逐文件三方合并：绝不覆盖或删除主工作区未提交文件）：
+  ① **事故背景**：`taskboard_merge_worktree` 旧实现（v0.5.0 → v0.5.2）用 `git diff <base>..<wtHead>` 生成补丁、
+    再按文件 `git apply` 盖到主工作区，区分不了「用户未提交 WIP / 前序切片改动 / 工作树快照遗漏」，
+    删除 hunk 会直接落到主工作区未提交文件上（用户两次被误删后手工恢复）。
+  ② **新算法（`mergeAndCleanupTaskWorktree` 重写为逐文件三方合并）**：
+    base = `git -C <repoRoot> merge-base <ours> <theirs>`（失败回退 `task.worktreeBaseCommit`，再失败按冲突）；
+    ours = 主仓 HEAD（仅用于判断主工作区是否仍等于 HEAD）；**合并的「我方内容」取主工作区当前工作树文件内容**
+    （前序合入改动与用户 WIP 都参与合并）；theirs = 工作树快照 HEAD；改动清单 =
+    `git -C <wtPath> diff --name-status -z --no-renames <base>..<theirs>`（含 A/M/D/T）。
+    预检阶段先算好全部动作，任一冲突 → 整次放弃、主工作区零写入：
+    - 主工作区文件内容与 theirs 逐字节相同 → alreadyApplied，跳过写入（摘要沿用「N 个文件已在主工作区存在」）；
+    - worker 侧新增：主工作区同路径已有文件且内容不同（用户未跟踪文件）→ 冲突、绝不覆盖，不存在才写入；
+    - worker 侧删除：仅当主仓 HEAD 有该文件、且主工作区该文件仍逐字节等于 HEAD（干净）才删除；
+      主工作区有改动或是未跟踪文件 → 冲突、永不删除（误删回归用例锁死）；
+    - 双方都改：`git merge-file -p`（临时文件：ours = 主工作区内容 / base / theirs）文本三方合并，exit 0 写结果；
+      冲突 / 二进制（含 NUL）/ `T` 类型变化 / merge-file 报错 → 冲突；
+    - 任何落在依赖软链目录（`task.worktreeLinks`，如 `node_modules/` / `.venv/`）下的路径一律按冲突处理，
+      绝不读写 / 删除；
+    - 写入用 Buffer 原样写（避免换行转换）、best-effort 保留 `100755` 可执行位；本次新增路径（worker 新建文件
+      落在主工作区还不存在的新目录，如 `src/newdir/deep.js`）在写入前 `mkdirSync(dirname, {recursive:true})`
+      补建父目录，回滚时按「由深到浅」`rmdirSync` best-effort 清掉本次新建的空目录；删除 / 覆盖前再确认文件仍等于
+      预检内容，若已变化则回滚已写文件并放弃本次合入（避免覆盖并发写入）。
+    严禁整体 `git checkout` / `reset --hard` / `stash` / `clean`，只对本次 worker 改动路径定点
+    `writeFileSync` / `unlinkSync`。
+  ③ **快照可靠性**：`git add -A` + commit 前确认所有 Junction 已卸载（`task.worktreeLinks` 里仍有 symlink →
+    放弃合入、返回 `conflict:true`）；快照提交后在 worktree 内跑 `git status --porcelain --untracked-files=all`，
+    非空 → 放弃合入、保留工作树、返回 `conflict:true` + 摘要；冲突 / 失败路径恢复
+    `linkWorktreeDependencies`，成功才 `cleanupTaskWorktree`。
+  ④ **清理加固（防再次误删）**：`cleanupTaskWorktree` 仅在能证明目录是本仓注册 Worktree 时才
+    `git worktree remove --force` / `rmSync`（凭 `<wt>/.git` 指向 `<repo>/.git/worktrees/<name>`
+    —— `inferRepoRootFromWorktreeDotGit`，或路径位于名为 `worktrees` 的目录下）；证明不了就只清任务字段
+    （`worktreePath` / `worktreeBranch` / `worktreeBaseCommit` / `worktreeLinks`），不删目录。
+  ⑤ **契约不变**：`TASK_MERGE_WORKTREE_OUTPUT_SCHEMA` 9 个字段不动，`merged` / `noChanges` / `conflict` /
+    `cleaned` / `branch` / `worktreePath` / `conflictFiles` / `summary` 语义不变；`discardOnly`、
+    `cleanup:false`、`options.commit!==false` 落盘、冲突时保留工作树全部保留；既有摘要片段
+    （「N 个文件已在主工作区存在，仅补入 M 个」、冲突摘要含冲突文件名与「主工作区未被修改」）保持不变。
+    工具描述改写为三方合并语义：逐文件三方合并、绝不覆盖 / 删除主工作区未提交文件、冲突时主工作区逐字节不变。
+  测试：新增 `test/worktree-merge.test.mjs` **+8**（自带临时 Git 仓库 fixture：无关未提交改动 + 未跟踪文件
+  合入后逐字节不变 / 同一文件不重叠改动三方合并两处都在 / 同一文件重叠 → conflict 且主工作区逐字节不变 +
+  工作树保留 / worker 删除撞上主工作区未提交改动 → 不删除、conflict（误删回归）/ worker 新增撞上同路径
+  未跟踪文件 → 不覆盖、conflict / 全新目录下新增 `src/newdir/deep.js` → 自动补建父目录并合入成功 /
+  成功后回收工作树并清空 board 字段 / 干净的已跟踪文件按意图删除）；
+  `node --test` **349 pass / 0 fail**（v0.5.10 基线 341 → 349）。
+  `package.json` 0.5.10 → 0.5.11（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。
+
+- v0.5.12（冲突改为「部分合入 + 组长介入」，不再整段放弃）：
+  ① **用户反馈**：只要有一个文件冲突就完全不写入，连无冲突文件也被挡掉——冲突应由组长介入处理冲突文件，
+    而不是整次放弃。
+  ② **新语义（`mergeAndCleanupTaskWorktree`）**：预检后若存在冲突，先把全部无冲突动作应用掉（同样做写入前
+    逐字节 drift 复核、写入失败回滚已写文件），冲突文件保持主工作区原样、绝不写入；冲突路径**绝不 cleanup**
+    （即使调用方 `cleanup !== false`）、不删工作树、恢复依赖软链，返回 `merged:false` / `conflict:true` /
+    `cleaned:false` / `conflictFiles=[...]` / `worktreePath=<wt>`。摘要两种句式：
+    - 已合入无冲突文件（N > 0）：`已合入 N 个无冲突文件；M 个文件冲突需组长处理：<列表>；冲突文件在主工作区
+      保持原样，隔离工作树保留在 <wt>（手工处理冲突文件后可重跑本工具，或直接 discardOnly:true 回收）`；
+    - 一个文件都没写过（N = 0，含「全部文件其实已在主工作区」）：保留原句式
+      `合入主工作区检测到冲突（主工作区未被修改）：…；隔离工作树保留在 …`。
+    写入失败 / drift 回滚后**不再声称「主工作区未被修改」**，改为「已合入 0 个无冲突文件」+「冲突文件保持原样」。
+    无冲突路径完全不变（apply → cleanup → `merged:true`）。组长处理完冲突文件后重跑本工具即可完成合入与回收
+    （文件内容已与工作树版本一致 → alreadyApplied → 幂等成功并回收工作树）。
+  ③ 工具描述与 §4.4 工具表同步为「冲突时无冲突文件先合入，冲突文件保持主工作区原样并保留工作树，交组长处理」。
+  测试：`test/worktree-merge.test.mjs` **+2**（一个文件干净 + 一个文件冲突 → 干净文件已合入、冲突文件逐字节不变、
+  `conflict:true` / `cleaned:false`、工作树保留、摘要含「已合入 1 个无冲突文件」与「冲突需组长处理」；
+  冲突后模拟组长处理冲突文件 → 重跑 `merged:true` / `cleaned:true` 并回收工作树）；
+  `node --test` **351 pass / 0 fail**（v0.5.11 基线 349 → 351）。
+  `package.json` 0.5.11 → 0.5.12（`lib/client.js` 的 `PLUGIN_VERSION` 兜底值同步）。
